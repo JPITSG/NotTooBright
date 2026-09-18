@@ -1640,6 +1640,50 @@ static BOOL WriteWorkerBrightness(HANDLE handle, WorkerMonitor* wm, int target, 
     return ok;
 }
 
+/* Performs queued brightness writes. During a probe job only monitors
+ * already probed in that job are written (the others stay queued), so a
+ * slider does not have to wait for a slow display at the end of the job. */
+static void DrainPendingWrites(WorkerSource* sources, int sourceCount,
+                               WorkerMonitor* monitors, int monitorCount, BOOL onlyProbed) {
+    for (;;) {
+        if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
+        int uid = -1, target = 0;
+        BOOL raw = FALSE;
+        WorkerMonitor* wm = NULL;
+        EnterCriticalSection(&g_ddcLock);
+        for (int i = 0; i < g_ddcSetCount; i++) {
+            if (!g_ddcSets[i].pending) continue;
+            WorkerMonitor* candidate = NULL;
+            for (int j = 0; j < monitorCount; j++) {
+                if (monitors[j].uid == g_ddcSets[i].uid) {
+                    candidate = &monitors[j];
+                    break;
+                }
+            }
+            if (onlyProbed && !candidate) continue;
+            uid = g_ddcSets[i].uid;
+            target = g_ddcSets[i].target;
+            raw = g_ddcSets[i].raw;
+            wm = candidate;
+            g_ddcSets[i].pending = FALSE;
+            break;
+        }
+        LeaveCriticalSection(&g_ddcLock);
+        if (uid < 0) break;
+
+        BOOL ok = FALSE;
+        if (wm && wm->supported) {
+            HANDLE handle = NULL;
+            if (WorkerMonitorHandle(sources, sourceCount, wm, &handle)) ok = WriteWorkerBrightness(handle, wm, target, raw);
+            else DebugPrint(L"[DDC] monitor %d: no handle for the write\n", uid);
+        } else {
+            DebugPrint(L"[DDC] monitor %d: write skipped (%s)\n", uid,
+                       wm ? L"not supported" : L"unknown to the worker");
+        }
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DDC_SET_RESULT, (WPARAM)uid, ok ? 1 : 0);
+    }
+}
+
 static DWORD WINAPI DdcWorkerThread(LPVOID param) {
     (void)param;
     WorkerSource sources[MAX_MONITORS];
@@ -1685,46 +1729,14 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
                 wm->max = 100;
                 ProbeWorkerMonitor(sources, &sourceCount, wm);
                 if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
+                /* Keep sliders responsive while the remaining displays probe. */
+                DrainPendingWrites(sources, sourceCount, monitors, monitorCount, TRUE);
             }
             CloseUnusedSources(sources, &sourceCount);
             DebugPrint(L"[DDC] probe job done; %d source(s) kept open\n", sourceCount);
         }
 
-        for (;;) {
-            if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
-            int uid = -1, target = 0;
-            BOOL raw = FALSE;
-            EnterCriticalSection(&g_ddcLock);
-            for (int i = 0; i < g_ddcSetCount; i++) {
-                if (g_ddcSets[i].pending) {
-                    uid = g_ddcSets[i].uid;
-                    target = g_ddcSets[i].target;
-                    raw = g_ddcSets[i].raw;
-                    g_ddcSets[i].pending = FALSE;
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_ddcLock);
-            if (uid < 0) break;
-
-            WorkerMonitor* wm = NULL;
-            for (int i = 0; i < monitorCount; i++) {
-                if (monitors[i].uid == uid) {
-                    wm = &monitors[i];
-                    break;
-                }
-            }
-            BOOL ok = FALSE;
-            if (wm && wm->supported) {
-                HANDLE handle = NULL;
-                if (WorkerMonitorHandle(sources, sourceCount, wm, &handle)) ok = WriteWorkerBrightness(handle, wm, target, raw);
-                else DebugPrint(L"[DDC] monitor %d: no handle for the write\n", uid);
-            } else {
-                DebugPrint(L"[DDC] monitor %d: write skipped (%s)\n", uid,
-                           wm ? L"not supported" : L"unknown to the worker");
-            }
-            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DDC_SET_RESULT, (WPARAM)uid, ok ? 1 : 0);
-        }
+        DrainPendingWrites(sources, sourceCount, monitors, monitorCount, FALSE);
     }
 
     ReleaseWorkerSources(sources, &sourceCount);
