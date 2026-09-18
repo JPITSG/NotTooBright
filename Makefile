@@ -38,7 +38,10 @@ CFLAGS ?= -O2
 CFLAGS += -mwindows -Wall -Wextra -I.
 # -static keeps the result a single self-contained executable with no
 # dependency on the compiler's runtime DLLs (libgcc, winpthread).
-LDFLAGS += -mwindows -static
+# --no-insert-timestamp makes the link reproducible: rebuilding unchanged
+# sources yields a byte-identical executable, so the tracked release binary
+# only changes when the program does.
+LDFLAGS += -mwindows -static -Wl,--no-insert-timestamp
 LIBS = -luser32 -lgdi32 -lshell32 -lshlwapi -ladvapi32 -lole32 -luuid
 
 .PHONY: all frontend icon clean clean-all
