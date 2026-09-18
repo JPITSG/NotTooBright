@@ -19,7 +19,7 @@
  * Other parts:
  *   - System tray icon with a context menu (Configure / Exit)
  *   - WebView2-hosted configuration dialog (React UI embedded as a resource)
- *   - Registry-persisted settings, optional start-at-sign-in registration
+ *   - Registry-persisted settings
  *   - Optional debug log in %LOCALAPPDATA%\NotTooBright\debug.log
  *
  * Cross-compiled with MinGW-w64. The WebView2 COM interfaces are declared
@@ -67,10 +67,6 @@
 #define REG_VALUE_MON_BRIGHTNESS L"Brightness"
 #define REG_VALUE_MON_SOFTWARE_ONLY L"SoftwareOnly"
 #define REG_VALUE_MON_NAME L"Name"
-/* Windows' per-user startup list; the value name is the entry Windows shows
- * in Task Manager > Startup apps. */
-#define REG_RUN_KEY_PATH L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
-#define REG_RUN_VALUE_NAME L"NotTooBright"
 
 #define TRAY_ICON_ID 100
 #define WM_TRAYICON (WM_APP + 1)
@@ -316,14 +312,11 @@ struct ICoreWebView2WebMessageReceivedEventHandler {
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
     LPCWSTR browserExecutableFolder, LPCWSTR userDataFolder, void* options,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* handler);
-typedef HRESULT (STDAPICALLTYPE *PFN_GetAvailableCoreWebView2BrowserVersionString)(
-    LPCWSTR browserExecutableFolder, LPWSTR* versionInfo);
 
 /* ── Configuration and monitor model ─────────────────────────────────────── */
 
 typedef struct {
     BOOL allowBelowMinimum;   /* let hardware monitors dim further in software */
-    BOOL startWithWindows;
     BOOL debugLogEnabled;
 } Configuration;
 
@@ -426,9 +419,7 @@ static BOOL g_cfgWindowShown = FALSE;
 static int g_cfgShowFallbackTries = 0;
 
 static PFN_CreateCoreWebView2EnvironmentWithOptions fnCreateEnvironment = NULL;
-static PFN_GetAvailableCoreWebView2BrowserVersionString fnGetAvailableBrowserVersion = NULL;
 static WCHAR g_extractedDllPath[MAX_PATH] = {0};
-static wchar_t g_webView2Version[128] = L"Unknown";
 
 /* GUID_CONSOLE_DISPLAY_STATE, declared locally so no GUID library is needed. */
 static const GUID kGuidConsoleDisplayState =
@@ -439,8 +430,6 @@ static const GUID kGuidConsoleDisplayState =
 static void DebugPrint(const wchar_t* format, ...);
 static BOOL LoadConfigFromRegistry(Configuration* config);
 static BOOL SaveConfigToRegistry(const Configuration* config);
-static BOOL IsStartupRegistered(void);
-static BOOL SetStartupRegistration(BOOL enabled);
 static void LoadMonitorSettings(Monitor* m);
 static void SaveMonitorSettings(const Monitor* m);
 static Monitor* FindMonitorByUid(int uid);
@@ -559,7 +548,6 @@ static BOOL WriteRegistryDword(HKEY hKey, const wchar_t* name, DWORD value) {
 
 static BOOL LoadConfigFromRegistry(Configuration* config) {
     ZeroMemory(config, sizeof(*config));
-    config->startWithWindows = IsStartupRegistered();
 
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -584,10 +572,6 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     if (!WriteRegistryDword(hKey, REG_VALUE_DEBUGLOG, config->debugLogEnabled ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_ALLOW_BELOW_MIN, config->allowBelowMinimum ? 1 : 0)) success = FALSE;
     RegCloseKey(hKey);
-
-    if (!SetStartupRegistration(config->startWithWindows)) {
-        success = FALSE;
-    }
     return success;
 }
 
@@ -641,53 +625,6 @@ static void SaveMonitorSettings(const Monitor* m) {
     RegCloseKey(hKey);
 }
 
-/* Quoted full path of the running executable, as stored in the Run key. */
-static BOOL GetStartupCommand(wchar_t* command, size_t commandCount) {
-    wchar_t exePath[MAX_PATH];
-    DWORD len = GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return FALSE;
-    return swprintf_s(command, commandCount, L"\"%s\"", exePath) > 0;
-}
-
-static BOOL IsStartupRegistered(void) {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
-        return FALSE;
-    }
-    DWORD dataType = 0;
-    LONG result = RegQueryValueExW(hKey, REG_RUN_VALUE_NAME, NULL, &dataType, NULL, NULL);
-    RegCloseKey(hKey);
-    return result == ERROR_SUCCESS && dataType == REG_SZ;
-}
-
-/* Adds or removes the per-user startup entry. When enabling, the stored
- * command always points at the executable currently running, so a moved or
- * updated executable re-registers itself on the next save. */
-static BOOL SetStartupRegistration(BOOL enabled) {
-    HKEY hKey;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, 0, NULL,
-                        REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey,
-                        NULL) != ERROR_SUCCESS) {
-        return FALSE;
-    }
-
-    LONG result;
-    if (enabled) {
-        wchar_t command[MAX_PATH + 2];
-        if (!GetStartupCommand(command, sizeof(command) / sizeof(wchar_t))) {
-            RegCloseKey(hKey);
-            return FALSE;
-        }
-        result = RegSetValueExW(hKey, REG_RUN_VALUE_NAME, 0, REG_SZ,
-                                (const BYTE*)command,
-                                (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
-    } else {
-        result = RegDeleteValueW(hKey, REG_RUN_VALUE_NAME);
-        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
-    }
-    RegCloseKey(hKey);
-    return result == ERROR_SUCCESS;
-}
 /* ── JSON helpers ────────────────────────────────────────────────────────── */
 
 static BOOL json_get_string(const char *json, const char *key, char *out, size_t outLen) {
@@ -1009,7 +946,7 @@ static HWND CreateOverlayWindow(const RECT* rc) {
 
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-        L"NotTooBrightOverlay", L"NotTooBright dimming overlay", WS_POPUP,
+        L"NotTooBrightOverlay", APP_DISPLAY_NAME_WSTRING L" dimming overlay", WS_POPUP,
         rc->left, rc->top, rc->right - rc->left, rc->bottom - rc->top,
         NULL, NULL, g_hInstance, NULL);
     if (!hwnd) {
@@ -1684,21 +1621,7 @@ static BOOL load_webview2_loader(void) {
     }
     fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)(void*)
         GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
-    fnGetAvailableBrowserVersion = (PFN_GetAvailableCoreWebView2BrowserVersionString)(void*)
-        GetProcAddress(hMod, "GetAvailableCoreWebView2BrowserVersionString");
     return fnCreateEnvironment != NULL;
-}
-
-static void RefreshWebView2VersionString(void) {
-    if (!fnGetAvailableBrowserVersion) return;
-
-    LPWSTR versionString = NULL;
-    if (SUCCEEDED(fnGetAvailableBrowserVersion(NULL, &versionString)) &&
-        versionString && versionString[0] != L'\0') {
-        wcscpy_s(g_webView2Version,
-                 sizeof(g_webView2Version) / sizeof(wchar_t), versionString);
-    }
-    CoTaskMemFree(versionString);
 }
 
 static void ReportWebView2Unavailable(void) {
@@ -1706,7 +1629,7 @@ static void ReportWebView2Unavailable(void) {
         L"Failed to load WebView2.\n\n"
         L"Please ensure the Microsoft Edge WebView2 Runtime is installed.\n"
         L"Download from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/",
-        APP_NAME, MB_ICONERROR | MB_OK);
+        APP_DISPLAY_NAME_WSTRING, MB_ICONERROR | MB_OK);
 }
 
 /* ── Config dialog WebView2 helpers ──────────────────────────────────────── */
@@ -1778,20 +1701,16 @@ static wchar_t* BuildMonitorsJson(void) {
 static void webview_push_init_config(void) {
     wchar_t* monitors = BuildMonitorsJson();
     if (!monitors) return;
-    wchar_t eWebView2Version[256];
-    json_escape_wstring(g_webView2Version, eWebView2Version,
-                        sizeof(eWebView2Version) / sizeof(wchar_t));
 
-    const size_t cap = wcslen(monitors) + 1024;
+    const size_t cap = wcslen(monitors) + 512;
     wchar_t* script = (wchar_t*)malloc(cap * sizeof(wchar_t));
     if (script) {
         int written = swprintf_s(script, cap,
-            L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"startWithWindows\":%s,"
-            L"\"debugLog\":%s},\"monitors\":%s,\"webView2Version\":\"%s\"})",
+            L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s},"
+            L"\"monitors\":%s})",
             g_config.allowBelowMinimum ? L"true" : L"false",
-            g_config.startWithWindows ? L"true" : L"false",
             g_config.debugLogEnabled ? L"true" : L"false",
-            monitors, eWebView2Version);
+            monitors);
         if (written > 0) webview_cfg_execute_script(script);
         free(script);
     }
@@ -1827,7 +1746,7 @@ static void CfgReportInitFailureAndClose(HRESULT hr) {
         L"The configuration window could not initialize WebView2 (0x%08X).\n\n"
         L"Please check the Microsoft Edge WebView2 Runtime installation.",
         (unsigned)hr);
-    MessageBoxW(NULL, msg, APP_NAME, MB_ICONERROR | MB_OK);
+    MessageBoxW(NULL, msg, APP_DISPLAY_NAME_WSTRING, MB_ICONERROR | MB_OK);
 }
 
 /* Content-driven sizing: the page reports its height (CSS pixels) whenever
@@ -2088,7 +2007,6 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         DebugPrint(L"[INFO] Rescan requested from the configuration dialog\n");
         RefreshMonitors();
     } else if (strcmp(action, "saveSettings") == 0) {
-        g_config.startWithWindows = json_get_bool(msg, "startWithWindows", FALSE);
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
         InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
         if (!SaveConfigToRegistry(&g_config)) {
@@ -2096,10 +2014,9 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             MessageBoxW(g_cfgHwnd,
                 L"Some settings could not be saved. Check that the current user "
                 L"can write to HKEY_CURRENT_USER.",
-                APP_NAME, MB_ICONWARNING | MB_OK);
+                APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
-        DebugPrint(L"[INFO] Settings saved (startWithWindows=%d, debugLog=%d)\n",
-                   g_config.startWithWindows, g_config.debugLogEnabled);
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d)\n", g_config.debugLogEnabled);
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
@@ -2473,14 +2390,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CloseHandle(g_hMutex);
         g_hMutex = NULL;
         MessageBoxW(NULL,
-            L"NotTooBright is already running.\n\nCheck your system tray for the application icon.",
+            APP_DISPLAY_NAME_WSTRING L" is already running.\n\nCheck your system tray for the application icon.",
             L"Already Running", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr)) {
-        MessageBoxW(NULL, L"COM initialization failed", APP_NAME, MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"COM initialization failed", APP_DISPLAY_NAME_WSTRING, MB_OK | MB_ICONERROR);
         if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
         return 1;
     }
@@ -2489,17 +2406,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
     DebugPrint(L"[INFO] " APP_DISPLAY_NAME_WSTRING L" " APP_VERSION_WSTRING L" starting\n");
 
-    /* Keep the startup entry pointing at wherever the executable lives now. */
-    if (g_config.startWithWindows && !SetStartupRegistration(TRUE)) {
-        DebugPrint(L"[WARNING] Could not refresh the startup registration\n");
-    }
-
     /* The loader is only needed for the configuration dialog; resolving it
-     * up front makes the WebView2 version available and surfaces a missing
-     * runtime immediately rather than on first use. */
-    if (load_webview2_loader()) {
-        RefreshWebView2VersionString();
-    } else {
+     * up front surfaces a missing runtime in the log immediately rather
+     * than on first use. */
+    if (!load_webview2_loader()) {
         DebugPrint(L"[WARNING] WebView2 loader unavailable; the configuration dialog will not open\n");
     }
 
@@ -2513,7 +2423,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     if (!RegisterClassExW(&wc)) {
-        MessageBoxW(NULL, L"Failed to register window class", APP_NAME, MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"Failed to register window class", APP_DISPLAY_NAME_WSTRING, MB_OK | MB_ICONERROR);
         CoUninitialize();
         if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
         return 1;
@@ -2523,7 +2433,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                              WS_OVERLAPPED, 0, 0, 0, 0,
                              NULL, NULL, hInstance, NULL);
     if (!g_hwnd) {
-        MessageBoxW(NULL, L"Failed to create window", APP_NAME, MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, L"Failed to create window", APP_DISPLAY_NAME_WSTRING, MB_OK | MB_ICONERROR);
         CoUninitialize();
         if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
         return 1;

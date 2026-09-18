@@ -1,4 +1,4 @@
-# NotTooBright
+# Not Too Bright
 
 A lightweight Windows system tray application for lowering the brightness of
 desktop monitors from software, for displays that have no native Windows
@@ -14,7 +14,6 @@ brightness control.
 - **Never Black** - Software dimming stops at 10% apparent brightness, and overlays vanish with the process, so a screen can never be left dark
 - **Screenshot Friendly** - Overlays are excluded from screen capture and screen sharing (Windows 10 2004+), so screenshots show the undimmed picture
 - **System Tray Integration** - Runs in the system tray with no main window; click the icon to open the brightness dialog
-- **Start at Sign-in** - Optionally registers itself in the current user's startup programs
 - **Registry Storage** - Settings persist in the Windows Registry (`HKCU\SOFTWARE\JPIT\NotTooBright`)
 - **Single Instance** - Only one instance can run at a time
 - **Single File** - The executable embeds its icon, manifest, WebView2 loader, and configuration UI; nothing else needs to be installed alongside it
@@ -29,7 +28,7 @@ Right-click the tray icon to access:
 
 ## How Brightness Control Works
 
-For every connected monitor NotTooBright first tries **DDC/CI**, the control
+For every connected monitor Not Too Bright first tries **DDC/CI**, the control
 channel monitors expose over their video cable. It reads and writes the
 standard VCP brightness code (0x10), so the change is the same one you would
 make with the monitor's own buttons: the backlight actually gets dimmer, with
@@ -71,11 +70,9 @@ brightness section applies immediately; the settings below it are saved with
 | Software dimming only | Shown for hardware-capable monitors. Uses the overlay instead of DDC/CI and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values. |
 | Rescan | Re-detects monitors and probes DDC/CI again, for example after enabling DDC/CI in a monitor's menu. |
 | Allow dimming below the hardware minimum | Extends hardware-controlled sliders below 0% into software dimming (down to -90%). Applies immediately. Disabled by default. |
-| Start NotTooBright when you sign in | Adds the application to the current user's startup programs (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) so brightness is restored after every sign-in. The entry is refreshed on every start so it keeps pointing at the executable's current location. Disabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (monitor detection, DDC/CI probe and write results, fallbacks, power events) to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
-The footer displays the application and WebView2 runtime versions together as
-`v<application version> / <WebView2 version>`.
+The footer displays the application version.
 
 Per-monitor values are stored under `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>`.
 

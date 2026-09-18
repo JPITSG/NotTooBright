@@ -43,11 +43,7 @@ export default function App() {
 
   return (
     <div ref={rootRef}>
-      <ConfigView
-        config={initData.config}
-        monitors={monitors}
-        webView2Version={initData.webView2Version ?? "Unknown"}
-      />
+      <ConfigView config={initData.config} monitors={monitors} />
     </div>
   );
 }

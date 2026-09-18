@@ -23,14 +23,12 @@ export interface MonitorData {
 
 export interface ConfigData {
   allowBelowMinimum: boolean;
-  startWithWindows: boolean;
   debugLog: boolean;
 }
 
 export interface InitData {
   config: ConfigData;
   monitors: MonitorData[];
-  webView2Version: string;
 }
 
 type InitCallback = (data: InitData) => void;
@@ -89,10 +87,9 @@ export function refreshMonitors() {
   post({ action: "refreshMonitors" });
 }
 
-export function saveSettings(config: Pick<ConfigData, "startWithWindows" | "debugLog">) {
+export function saveSettings(config: Pick<ConfigData, "debugLog">) {
   post({
     action: "saveSettings",
-    startWithWindows: config.startWithWindows,
     debugLog: config.debugLog,
   });
 }

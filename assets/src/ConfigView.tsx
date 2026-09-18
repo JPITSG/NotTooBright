@@ -19,7 +19,6 @@ import { Slider } from "./components/ui/slider";
 interface Props {
   config: ConfigData;
   monitors: MonitorData[];
-  webView2Version: string;
 }
 
 // Slider moves stream at display refresh rate; DDC/CI takes tens of
@@ -171,17 +170,10 @@ function MonitorCard({
   );
 }
 
-export default function ConfigView({
-  config,
-  monitors,
-  webView2Version,
-}: Props) {
+export default function ConfigView({ config, monitors }: Props) {
   const [values, setValues] = useState<Record<number, number>>({});
   const [allowBelowMinimum, setAllowBelowMinimumState] = useState(
     config.allowBelowMinimum ?? false
-  );
-  const [startWithWindows, setStartWithWindows] = useState(
-    config.startWithWindows ?? false
   );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const throttledSend = useThrottledSender();
@@ -229,7 +221,7 @@ export default function ConfigView({
   }
 
   function handleSave() {
-    saveSettings({ startWithWindows, debugLog });
+    saveSettings({ debugLog });
   }
 
   return (
@@ -313,25 +305,6 @@ export default function ConfigView({
 
       <div className="flex items-start gap-2 pt-1">
         <Checkbox
-          id="startWithWindows"
-          className="mt-0.5"
-          checked={startWithWindows}
-          onChange={(e) => setStartWithWindows(e.target.checked)}
-        />
-        <div className="space-y-0.5">
-          <Label htmlFor="startWithWindows" className="cursor-pointer">
-            Start NotTooBright when you sign in
-          </Label>
-          <p className="text-neutral-500 text-[11px] leading-snug">
-            Adds the application to your account's startup programs so your
-            brightness settings are restored after every sign-in. Only affects
-            the current Windows user.
-          </p>
-        </div>
-      </div>
-
-      <div className="flex items-start gap-2 pt-1">
-        <Checkbox
           id="debugLog"
           className="mt-0.5"
           checked={debugLog}
@@ -352,9 +325,9 @@ export default function ConfigView({
       <div className="flex items-center justify-between gap-3 pt-1">
         <span
           className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
-          title="Application version / WebView2 version"
+          title="Application version"
         >
-          v{__APP_VERSION__} / {webView2Version}
+          v{__APP_VERSION__}
         </span>
         <div className="flex items-center gap-2">
           <Button
