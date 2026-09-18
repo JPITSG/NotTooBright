@@ -1031,6 +1031,16 @@ static void KeepOverlaysOnTop(void) {
     }
 }
 
+/* Drops a monitor's overlay window entirely (used when the monitor is
+ * hidden: the application must own nothing on that display). */
+static void ReleaseMonitorOverlay(Monitor* m) {
+    if (m->overlay) {
+        DestroyWindow(m->overlay);
+        m->overlay = NULL;
+    }
+    m->overlayDim = 0;
+}
+
 static void DestroyAllOverlays(void) {
     for (int i = 0; i < g_monitorCount; i++) {
         if (g_monitors[i].overlay) {
@@ -1326,12 +1336,9 @@ static int ClampMonitorValue(const Monitor* m, int value) {
  * its minimum and add software dimming. Software monitors: the overlay
  * alone provides the whole range. */
 static void ApplyMonitor(Monitor* m) {
-    if (m->hidden) {
-        /* Hidden monitors are left alone: no overlay and no DDC/CI writes.
-         * The backlight simply stays where it last was. */
-        SetOverlayDim(m, 0);
-        return;
-    }
+    /* Hidden monitors are not controlled at all: no overlay, no DDC/CI
+     * writes. Whatever state the display is in stays that way. */
+    if (m->hidden) return;
     BrightnessMode mode = MonitorMode(m);
     if (mode == MODE_PROBING) return;   /* applied when the probe answers */
 
@@ -1357,6 +1364,7 @@ static void ApplyMonitor(Monitor* m) {
 }
 
 static void SetMonitorValue(Monitor* m, int value) {
+    if (m->hidden) return;
     value = ClampMonitorValue(m, value);
     if (!m->hasValue || m->value != value) {
         m->value = value;
@@ -1492,29 +1500,16 @@ static void RefreshMonitors(void) {
     memcpy(g_monitors, merged, sizeof(merged));
     g_monitorCount = freshCount;
 
-    /* Hiding the last visible monitor is refused, but unplugging the others
-     * can still leave only hidden ones behind; never present an empty list. */
-    if (g_monitorCount > 0 && VisibleMonitorCount() == 0) {
-        DebugPrint(L"[INFO] Only hidden monitors remain; showing them again\n");
-        for (int i = 0; i < g_monitorCount; i++) {
-            g_monitors[i].hidden = FALSE;
-            g_monitors[i].dirty = TRUE;
-        }
-        SchedulePersist();
-    }
-
     DdcProbeEntry probe[MAX_MONITORS];
     int probeCount = 0;
     for (int i = 0; i < g_monitorCount; i++) {
         Monitor* m = &g_monitors[i];
-        if (m->physicalIndex == 0) {
+        if (m->physicalIndex == 0 && !m->hidden) {
             if (!m->overlay) m->overlay = CreateOverlayWindow(&m->rect);
             else PositionOverlay(m);
-            if (m->overlayDim > 0 && !m->hidden) SetOverlayDim(m, m->overlayDim);
-            else if (m->hidden) SetOverlayDim(m, 0);
-        } else if (m->overlay) {
-            DestroyWindow(m->overlay);
-            m->overlay = NULL;
+            if (m->overlayDim > 0) SetOverlayDim(m, m->overlayDim);
+        } else {
+            ReleaseMonitorOverlay(m);
         }
         /* Hidden monitors are not even probed; they are left alone until a
          * rescan brings them back. */
@@ -2059,7 +2054,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     } else if (strcmp(action, "setMonitorSoftwareOnly") == 0) {
         int uid = -1;
         Monitor* m = json_get_int(msg, "uid", &uid) ? FindMonitorByUid(uid) : NULL;
-        if (m) {
+        if (m && !m->hidden) {
             m->forceSoftware = json_get_bool(msg, "softwareOnly", FALSE);
             m->failures = 0;
             m->error[0] = L'\0';
@@ -2091,8 +2086,10 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 m->hidden = TRUE;
                 m->dirty = TRUE;
                 SchedulePersist();
+                /* From here on the display is treated as if it did not
+                 * exist: the overlay window goes, nothing else is touched. */
+                ReleaseMonitorOverlay(m);
                 DebugPrint(L"[INFO] %s (%s): hidden until the next rescan\n", m->name, m->device);
-                ApplyMonitor(m);
             }
             PushMonitorsToDialog();
         }

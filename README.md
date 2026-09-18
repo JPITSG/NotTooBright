@@ -10,7 +10,7 @@ brightness control.
 - **Software Dimming Fallback** - Monitors that do not support DDC/CI (or that you switch to software mode) are dimmed with a click-through overlay that works on any display, GPU, dock, or remote session
 - **Below the Hardware Minimum** - Optionally continue below 0% on hardware-controlled monitors: the backlight stays at its minimum and software dimming is added on top
 - **One Slider per Monitor** - Plus an "All monitors" slider; changes apply immediately while dragging
-- **Hide Monitors** - Remove a monitor from the list (and leave it alone) until the next rescan; the last monitor can never be hidden
+- **Hide Monitors** - Remove a monitor from the list and stop controlling it entirely until the next rescan; the last monitor can never be hidden
 - **Remembered per Monitor** - Each monitor is identified by its EDID (model and serial), so settings follow the monitor and are re-applied after sleep, after the display turns back on, and after display changes
 - **Never Black** - Software dimming stops at 10% apparent brightness, and overlays vanish with the process, so a screen can never be left dark
 - **Screenshot Friendly** - Overlays are excluded from screen capture and screen sharing (Windows 10 2004+), so screenshots show the undimmed picture
@@ -69,7 +69,7 @@ brightness section applies immediately; the settings below it are saved with
 | All monitors | Sets every monitor to the same value (shown only with more than one monitor). |
 | Per-monitor slider | The brightness of that monitor. The badge shows how it is controlled: **Hardware (DDC/CI)**, **Software (no DDC/CI)**, or **Software (chosen)**. |
 | Software dimming only | Shown for hardware-capable monitors. Uses the overlay instead of DDC/CI and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values. |
-| Hide | Removes that monitor from the list. A hidden monitor is left alone: its dimming overlay is removed, no further brightness changes are sent, and its backlight stays where it last was. The last monitor in the list cannot be hidden. Hidden monitors stay hidden across restarts and display changes until you choose **Rescan**. |
+| Hide | Removes that monitor from the list and stops controlling it entirely, as if it were not connected: its dimming overlay is removed, it is no longer probed, and no further brightness changes are sent, so it simply stays in whatever state it is in. The last monitor in the list cannot be hidden. Hidden monitors stay hidden across restarts and display changes until you choose **Rescan**. |
 | Rescan | Re-detects monitors, probes DDC/CI again (for example after enabling DDC/CI in a monitor's menu), and shows every hidden monitor again. |
 | Allow dimming below the hardware minimum | Extends hardware-controlled sliders below 0% into software dimming (down to -90%). Applies immediately. Disabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (monitor detection, DDC/CI probe and write results, fallbacks, power events) to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |

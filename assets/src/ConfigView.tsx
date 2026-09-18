@@ -144,7 +144,7 @@ function MonitorCard({
             disabled={!canHide}
             title={
               canHide
-                ? "Remove this monitor from the list and leave it alone until the next rescan"
+                ? "Stop controlling this monitor and remove it from the list until the next rescan"
                 : "The last monitor in the list cannot be hidden"
             }
             aria-label={`Hide ${monitor.name}`}
@@ -270,7 +270,9 @@ export default function ConfigView({ config, monitors }: Props) {
 
       {visibleMonitors.length === 0 && (
         <p className="rounded-md border border-neutral-200 px-3 py-2 text-[11px] leading-snug text-neutral-500">
-          No monitors were detected. Connect a display and choose Rescan.
+          {monitors.length === 0
+            ? "No monitors were detected. Connect a display and choose Rescan."
+            : "Every connected monitor is hidden. Choose Rescan to show them again."}
         </p>
       )}
 
@@ -312,8 +314,8 @@ export default function ConfigView({ config, monitors }: Props) {
       {hiddenCount > 0 && (
         <p className="text-[11px] leading-snug text-neutral-500">
           {hiddenCount === 1
-            ? "1 monitor is hidden and left alone."
-            : `${hiddenCount} monitors are hidden and left alone.`}{" "}
+            ? "1 monitor is hidden and not controlled."
+            : `${hiddenCount} monitors are hidden and not controlled.`}{" "}
           Rescan shows hidden monitors again.
         </p>
       )}
