@@ -3,6 +3,7 @@ import {
   type ConfigData,
   type MonitorData,
   type ScheduleSettings,
+  type KeyboardSettings,
   SINGLE_COLUMN_WIDTH,
   TWO_COLUMN_WIDTH,
   saveSettings,
@@ -18,6 +19,7 @@ import {
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
+import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 import { Separator } from "./components/ui/separator";
 import { Slider } from "./components/ui/slider";
@@ -255,6 +257,10 @@ export default function ConfigView({ config, monitors }: Props) {
     config.allowBelowMinimum ?? false
   );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
+  const [keyboard, setKeyboard] = useState<KeyboardSettings>({
+    enabled: config.keyboardKeys ?? false,
+    step: config.keyboardStep ?? 5,
+  });
   const [schedule, setSchedule] = useState<ScheduleSettings>(() =>
     initialSchedule(config, monitors)
   );
@@ -326,7 +332,11 @@ export default function ConfigView({ config, monitors }: Props) {
       }
     }
     setScheduleError("");
-    saveSettings(debugLog, schedule);
+    saveSettings(
+      debugLog,
+      { enabled: keyboard.enabled, step: clamp(Math.round(keyboard.step) || 5, 1, 25) },
+      schedule
+    );
   }
 
   const minLevel = allowBelowMinimum ? -90 : 0;
@@ -452,6 +462,50 @@ export default function ConfigView({ config, monitors }: Props) {
       </div>
 
       <Separator />
+
+      <div className="space-y-1 pt-1">
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="keyboardKeys"
+            className="mt-0.5"
+            checked={keyboard.enabled}
+            onChange={(e) => setKeyboard({ ...keyboard, enabled: e.target.checked })}
+          />
+          <div className="space-y-0.5">
+            <Label htmlFor="keyboardKeys" className="cursor-pointer">
+              Use the keyboard's brightness keys
+            </Label>
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              The Brightness Up and Brightness Down keys found on many keyboards
+              step every monitor in the list up or down, wherever the keys are
+              pressed. Windows keeps handling a laptop's built-in display by
+              itself. Counts as a manual change for scheduled monitors. Saved
+              with the Save button.
+            </p>
+          </div>
+        </div>
+        {keyboard.enabled && (
+          <div className="ml-6 flex items-center gap-2">
+            <Label htmlFor="keyboardStep" className="text-[11px] font-normal text-neutral-600">
+              Step per key press
+            </Label>
+            <Input
+              id="keyboardStep"
+              type="number"
+              min={1}
+              max={25}
+              step={1}
+              className="h-7 w-16 text-[11px]"
+              value={keyboard.step}
+              onChange={(e) => setKeyboard({ ...keyboard, step: Number(e.target.value) })}
+              onBlur={() =>
+                setKeyboard((k) => ({ ...k, step: clamp(Math.round(k.step) || 5, 1, 25) }))
+              }
+            />
+            <span className="text-[11px] text-neutral-500">% (1–25)</span>
+          </div>
+        )}
+      </div>
 
       <div className="flex items-start gap-2 pt-1">
         <Checkbox

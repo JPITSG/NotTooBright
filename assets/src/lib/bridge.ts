@@ -44,7 +44,14 @@ export interface ScheduleData {
 export interface ConfigData {
   allowBelowMinimum: boolean;
   debugLog: boolean;
+  keyboardKeys: boolean;
+  keyboardStep: number;
   schedule: ScheduleData;
+}
+
+export interface KeyboardSettings {
+  enabled: boolean;
+  step: number;
 }
 
 export interface ScheduleSettings {
@@ -130,10 +137,16 @@ export function resumeSchedule(uid: number) {
   post({ action: "resumeSchedule", uid });
 }
 
-export function saveSettings(debugLog: boolean, schedule: ScheduleSettings) {
+export function saveSettings(
+  debugLog: boolean,
+  keyboard: KeyboardSettings,
+  schedule: ScheduleSettings
+) {
   post({
     action: "saveSettings",
     debugLog,
+    keyboardKeys: keyboard.enabled,
+    keyboardStep: keyboard.step,
     scheduleEnabled: schedule.enabled,
     latitude: schedule.latitude,
     longitude: schedule.longitude,

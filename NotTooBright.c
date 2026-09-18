@@ -41,6 +41,8 @@
 #include <dbt.h>
 #include <physicalmonitorenumerationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
+#include <hidusage.h>
+#include <hidpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +87,9 @@
 #define REG_VALUE_SCHEDULE_DUSK_START L"ScheduleDuskStartOffset"
 #define REG_VALUE_SCHEDULE_DUSK_END L"ScheduleDuskEndOffset"
 #define REG_VALUE_CYCLE_RESET L"CycleResetMinutes"
+/* Keyboard brightness keys (HID consumer control usages). */
+#define REG_VALUE_KEYBOARD_KEYS L"KeyboardBrightnessKeys"
+#define REG_VALUE_KEYBOARD_STEP L"KeyboardStepPercent"
 #define REG_VALUE_MON_NAME L"Name"
 
 #define TRAY_ICON_ID 100
@@ -145,6 +150,20 @@
 #define SCHEDULE_MAX_OFFSET (6 * 60)
 #define SCHEDULE_MIN_GAP 5
 #define SCHEDULE_DEFAULT_RESET_MINUTES (4 * 60)
+
+/* Keyboard brightness keys arrive as raw HID input on the Consumer Control
+ * collection; the usages are Display Brightness Increment/Decrement. A held
+ * key auto-repeats on a timer, with a cap in case a release is never seen. */
+#define HID_USAGE_CONSUMER_BRIGHTNESS_UP 0x6F
+#define HID_USAGE_CONSUMER_BRIGHTNESS_DOWN 0x70
+#define HID_PREPARSED_CACHE_MAX 8
+#define ID_TIMER_KEY_REPEAT 6
+#define KEY_REPEAT_DELAY_MS 400
+#define KEY_REPEAT_INTERVAL_MS 120
+#define KEY_REPEAT_MAX 40
+#define KEYBOARD_STEP_DEFAULT 5
+#define KEYBOARD_STEP_MIN 1
+#define KEYBOARD_STEP_MAX 25
 
 /* ── WebView2 COM interface definitions (minimal vtable approach) ─────── */
 
@@ -369,8 +388,16 @@ typedef struct {
 typedef struct {
     BOOL allowBelowMinimum;   /* let hardware monitors dim further in software */
     BOOL debugLogEnabled;
+    BOOL keyboardKeys;        /* react to the keyboard's brightness keys */
+    int keyboardStep;         /* percent per key press */
     Schedule schedule;
 } Configuration;
+
+/* Preparsed HID data per input device, needed to decode its reports. */
+typedef struct {
+    HANDLE device;
+    PHIDP_PREPARSED_DATA preparsed;
+} HidPreparsedEntry;
 
 /* Sunrise, sunset, and solar noon for one local date, in local minutes
  * since midnight (may fall outside 0..1439 near the date line). */
@@ -467,6 +494,14 @@ static int g_nextUid = 1;
 static HPOWERNOTIFY g_displayStateNotify = NULL;
 static LONG g_lastDisplayState = -1;
 
+/* Keyboard brightness keys. */
+static BOOL g_rawInputRegistered = FALSE;
+static HidPreparsedEntry g_hidPreparsed[HID_PREPARSED_CACHE_MAX];
+static int g_hidPreparsedCount = 0;
+static int g_brightnessKeyHeld = 0;          /* +1 up, -1 down, 0 none */
+static HANDLE g_brightnessKeyDevice = NULL;
+static int g_brightnessKeyRepeats = 0;
+
 /* DDC/CI worker thread and its shared request state (guarded by g_ddcLock). */
 static CRITICAL_SECTION g_ddcLock;
 static HANDLE g_ddcEvent = NULL;
@@ -527,6 +562,11 @@ static void UpdateScheduleTimer(void);
 static ULONGLONG NowFileTime(void);
 static BOOL IsSchedulePaused(const Monitor* m, ULONGLONG nowFt);
 static void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count);
+static void UpdateBrightnessKeyRegistration(void);
+static void HandleRawInput(HRAWINPUT hRawInput);
+static void ForgetHidDevice(HANDLE device);
+static void ReleaseBrightnessKey(void);
+static void StepAllMonitors(int direction);
 
 /* ── Debug logging ───────────────────────────────────────────────────────── */
 
@@ -697,6 +737,7 @@ static BOOL IsValidLongitude(double v) { return v >= -180.0 && v <= 180.0; }
 static BOOL LoadConfigFromRegistry(Configuration* config) {
     ZeroMemory(config, sizeof(*config));
     SetScheduleDefaults(&config->schedule);
+    config->keyboardStep = KEYBOARD_STEP_DEFAULT;
 
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -704,6 +745,8 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     }
     ReadRegistryBool(hKey, REG_VALUE_DEBUGLOG, &config->debugLogEnabled);
     ReadRegistryBool(hKey, REG_VALUE_ALLOW_BELOW_MIN, &config->allowBelowMinimum);
+    ReadRegistryBool(hKey, REG_VALUE_KEYBOARD_KEYS, &config->keyboardKeys);
+    ReadRegistryInt(hKey, REG_VALUE_KEYBOARD_STEP, &config->keyboardStep, KEYBOARD_STEP_MIN, KEYBOARD_STEP_MAX);
 
     Schedule* sc = &config->schedule;
     ReadRegistryBool(hKey, REG_VALUE_SCHEDULE_ENABLED, &sc->enabled);
@@ -739,6 +782,8 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     BOOL success = TRUE;
     if (!WriteRegistryDword(hKey, REG_VALUE_DEBUGLOG, config->debugLogEnabled ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_ALLOW_BELOW_MIN, config->allowBelowMinimum ? 1 : 0)) success = FALSE;
+    if (!WriteRegistryDword(hKey, REG_VALUE_KEYBOARD_KEYS, config->keyboardKeys ? 1 : 0)) success = FALSE;
+    WriteRegistryDword(hKey, REG_VALUE_KEYBOARD_STEP, (DWORD)config->keyboardStep);
 
     const Schedule* sc = &config->schedule;
     if (!WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_ENABLED, sc->enabled ? 1 : 0)) success = FALSE;
@@ -2178,6 +2223,162 @@ static void UpdateScheduleTimer(void) {
     }
 }
 
+/* ── Keyboard brightness keys ────────────────────────────────────────────── */
+
+/* Brightness keys have no virtual-key code: they are HID Consumer Control
+ * usages, so they are read through raw input (as an input sink, so the
+ * keys work whatever window is focused) and decoded with the device's
+ * preparsed HID data. Windows keeps handling a laptop's built-in panel on
+ * its own; this only adds the monitors in the list. */
+
+static void ClearHidPreparsedCache(void) {
+    for (int i = 0; i < g_hidPreparsedCount; i++) free(g_hidPreparsed[i].preparsed);
+    g_hidPreparsedCount = 0;
+}
+
+static void ForgetHidDevice(HANDLE device) {
+    for (int i = 0; i < g_hidPreparsedCount; i++) {
+        if (g_hidPreparsed[i].device == device) {
+            free(g_hidPreparsed[i].preparsed);
+            g_hidPreparsed[i] = g_hidPreparsed[--g_hidPreparsedCount];
+            break;
+        }
+    }
+    if (g_brightnessKeyDevice == device) ReleaseBrightnessKey();
+}
+
+static PHIDP_PREPARSED_DATA GetHidPreparsedData(HANDLE device) {
+    for (int i = 0; i < g_hidPreparsedCount; i++) {
+        if (g_hidPreparsed[i].device == device) return g_hidPreparsed[i].preparsed;
+    }
+    UINT size = 0;
+    if (GetRawInputDeviceInfoW(device, RIDI_PREPARSEDDATA, NULL, &size) != 0 || size == 0) return NULL;
+    PHIDP_PREPARSED_DATA data = (PHIDP_PREPARSED_DATA)malloc(size);
+    if (!data) return NULL;
+    if (GetRawInputDeviceInfoW(device, RIDI_PREPARSEDDATA, data, &size) == (UINT)-1) {
+        free(data);
+        return NULL;
+    }
+    if (g_hidPreparsedCount >= HID_PREPARSED_CACHE_MAX) {
+        /* Rare (more than eight consumer-control devices); recycle the oldest. */
+        free(g_hidPreparsed[0].preparsed);
+        memmove(&g_hidPreparsed[0], &g_hidPreparsed[1], sizeof(HidPreparsedEntry) * (HID_PREPARSED_CACHE_MAX - 1));
+        g_hidPreparsedCount = HID_PREPARSED_CACHE_MAX - 1;
+    }
+    g_hidPreparsed[g_hidPreparsedCount].device = device;
+    g_hidPreparsed[g_hidPreparsedCount].preparsed = data;
+    g_hidPreparsedCount++;
+    return data;
+}
+
+static void UpdateBrightnessKeyRegistration(void) {
+    if (!g_hwnd) return;
+    BOOL want = g_config.keyboardKeys;
+    if (want == g_rawInputRegistered) return;
+    RAWINPUTDEVICE rid;
+    rid.usUsagePage = HID_USAGE_PAGE_CONSUMER;
+    rid.usUsage = HID_USAGE_CONSUMERCTRL;
+    rid.dwFlags = want ? (RIDEV_INPUTSINK | RIDEV_DEVNOTIFY) : RIDEV_REMOVE;
+    rid.hwndTarget = want ? g_hwnd : NULL;
+    if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        g_rawInputRegistered = want;
+        DebugPrint(L"[INFO] Keyboard brightness keys %s\n", want ? L"enabled" : L"disabled");
+    } else {
+        DebugPrint(L"[WARNING] RegisterRawInputDevices failed (error %lu)\n", (unsigned long)GetLastError());
+    }
+    if (!g_rawInputRegistered) {
+        ReleaseBrightnessKey();
+        ClearHidPreparsedCache();
+    }
+}
+
+/* One key press: every listed monitor moves by the configured step from
+ * its own current value, so the differences between monitors are kept.
+ * This is a manual change, so scheduled monitors pause automation. */
+static void StepAllMonitors(int direction) {
+    BOOL changed = FALSE;
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        if (m->hidden || MonitorMode(m) == MODE_PROBING) continue;
+        int before = m->value;
+        SetMonitorValue(m, m->value + direction * g_config.keyboardStep);
+        NoteManualChange(m);
+        if (m->value != before) changed = TRUE;
+    }
+    DebugPrint(L"[INFO] Brightness key: %s by %d%%%s\n",
+               direction > 0 ? L"up" : L"down", g_config.keyboardStep,
+               changed ? L"" : L" (nothing to change)");
+    if (changed) PushMonitorsToDialog();
+}
+
+static void ReleaseBrightnessKey(void) {
+    g_brightnessKeyHeld = 0;
+    g_brightnessKeyDevice = NULL;
+    g_brightnessKeyRepeats = 0;
+    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_KEY_REPEAT);
+}
+
+static void HandleBrightnessKeyState(HANDLE device, int direction, BOOL pressed) {
+    if (pressed) {
+        if (g_brightnessKeyHeld == direction && g_brightnessKeyDevice == device) return;
+        g_brightnessKeyHeld = direction;
+        g_brightnessKeyDevice = device;
+        g_brightnessKeyRepeats = 0;
+        StepAllMonitors(direction);
+        SetTimer(g_hwnd, ID_TIMER_KEY_REPEAT, KEY_REPEAT_DELAY_MS, NULL);
+    } else if (g_brightnessKeyHeld == direction && g_brightnessKeyDevice == device) {
+        ReleaseBrightnessKey();
+    }
+}
+
+static void HandleBrightnessKeyRepeat(void) {
+    if (!g_brightnessKeyHeld) {
+        KillTimer(g_hwnd, ID_TIMER_KEY_REPEAT);
+        return;
+    }
+    if (++g_brightnessKeyRepeats > KEY_REPEAT_MAX) {
+        DebugPrint(L"[INFO] Brightness key repeat stopped (no release seen)\n");
+        ReleaseBrightnessKey();
+        return;
+    }
+    StepAllMonitors(g_brightnessKeyHeld);
+    if (g_brightnessKeyRepeats == 1) {
+        SetTimer(g_hwnd, ID_TIMER_KEY_REPEAT, KEY_REPEAT_INTERVAL_MS, NULL);
+    }
+}
+
+static void HandleRawInput(HRAWINPUT hRawInput) {
+    UINT size = 0;
+    if (GetRawInputData(hRawInput, RID_INPUT, NULL, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0) return;
+    BYTE stackBuffer[512];
+    BYTE* buffer = size <= sizeof(stackBuffer) ? stackBuffer : (BYTE*)malloc(size);
+    if (!buffer) return;
+    if (GetRawInputData(hRawInput, RID_INPUT, buffer, &size, sizeof(RAWINPUTHEADER)) == size) {
+        RAWINPUT* input = (RAWINPUT*)buffer;
+        if (input->header.dwType == RIM_TYPEHID) {
+            PHIDP_PREPARSED_DATA preparsed = GetHidPreparsedData(input->header.hDevice);
+            const BYTE* report = input->data.hid.bRawData;
+            for (DWORD i = 0; preparsed && i < input->data.hid.dwCount; i++, report += input->data.hid.dwSizeHid) {
+                /* Each report lists every consumer button currently down;
+                 * a report without the usage is the release. */
+                USAGE usages[32];
+                ULONG usageCount = sizeof(usages) / sizeof(usages[0]);
+                NTSTATUS status = HidP_GetUsages(HidP_Input, HID_USAGE_PAGE_CONSUMER, 0, usages, &usageCount,
+                                                 preparsed, (PCHAR)report, input->data.hid.dwSizeHid);
+                if (status != HIDP_STATUS_SUCCESS) continue;
+                BOOL up = FALSE, down = FALSE;
+                for (ULONG u = 0; u < usageCount; u++) {
+                    if (usages[u] == HID_USAGE_CONSUMER_BRIGHTNESS_UP) up = TRUE;
+                    else if (usages[u] == HID_USAGE_CONSUMER_BRIGHTNESS_DOWN) down = TRUE;
+                }
+                HandleBrightnessKeyState(input->header.hDevice, +1, up);
+                HandleBrightnessKeyState(input->header.hDevice, -1, down);
+            }
+        }
+    }
+    if (buffer != stackBuffer) free(buffer);
+}
+
 /* ── WebView2 loader ─────────────────────────────────────────────────────── */
 
 /* WebView2Loader.dll is embedded as a resource and extracted to a per-app
@@ -2313,6 +2514,7 @@ static void webview_push_init_config(void) {
     if (script) {
         int written = swprintf_s(script, cap,
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
+            L"\"keyboardKeys\":%s,\"keyboardStep\":%d,"
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
             L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
             L"\"dawnStartOffset\":%d,\"dawnEndOffset\":%d,\"duskStartOffset\":%d,"
@@ -2320,6 +2522,7 @@ static void webview_push_init_config(void) {
             L"\"monitors\":%s})",
             g_config.allowBelowMinimum ? L"true" : L"false",
             g_config.debugLogEnabled ? L"true" : L"false",
+            g_config.keyboardKeys ? L"true" : L"false", g_config.keyboardStep,
             sc->enabled ? L"true" : L"false", sc->hasLocation ? L"true" : L"false",
             sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
             sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset,
@@ -2743,6 +2946,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         }
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
+        g_config.keyboardKeys = json_get_bool(msg, "keyboardKeys", FALSE);
+        int keyboardStep;
+        if (json_get_int(msg, "keyboardStep", &keyboardStep)) {
+            g_config.keyboardStep = ClampInt(keyboardStep, KEYBOARD_STEP_MIN, KEYBOARD_STEP_MAX);
+        }
         SaveScheduleFromMessage(msg);
         InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
         if (!SaveConfigToRegistry(&g_config)) {
@@ -2752,7 +2960,9 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 L"can write to HKEY_CURRENT_USER.",
                 APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d)\n", g_config.debugLogEnabled);
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, keyboardKeys=%d, step=%d)\n",
+                   g_config.debugLogEnabled, g_config.keyboardKeys, g_config.keyboardStep);
+        UpdateBrightnessKeyRegistration();
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
@@ -3045,8 +3255,19 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case ID_TIMER_SCHEDULE:
                     EvaluateSchedule();
                     return 0;
+                case ID_TIMER_KEY_REPEAT:
+                    HandleBrightnessKeyRepeat();
+                    return 0;
             }
             break;
+
+        case WM_INPUT:
+            if (g_rawInputRegistered) HandleRawInput((HRAWINPUT)lParam);
+            break;   /* DefWindowProc must still see WM_INPUT for cleanup */
+
+        case WM_INPUT_DEVICE_CHANGE:
+            if (wParam == GIDC_REMOVAL) ForgetHidDevice((HANDLE)lParam);
+            return 0;
 
         /* Monitors come and go, change resolution, or wake up: re-enumerate
          * after the burst of notifications settles. */
@@ -3201,6 +3422,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RefreshMonitors();
     SetTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST, OVERLAY_TOPMOST_INTERVAL_MS, NULL);
     UpdateScheduleTimer();
+    UpdateBrightnessKeyRegistration();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -3213,6 +3435,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST);
     KillTimer(g_hwnd, ID_TIMER_PERSIST);
     KillTimer(g_hwnd, ID_TIMER_SCHEDULE);
+    g_config.keyboardKeys = FALSE;
+    UpdateBrightnessKeyRegistration();
     PersistDirtyMonitors();
     DestroyAllOverlays();
     StopDdcWorker();
