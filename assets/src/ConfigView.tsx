@@ -6,6 +6,8 @@ import {
   type UpdateResult,
   SINGLE_COLUMN_WIDTH,
   TWO_COLUMN_WIDTH,
+  TRAY_TARGET_NONE,
+  TRAY_TARGET_ALL,
   saveSettings,
   closeDialog,
   checkForUpdate,
@@ -29,6 +31,7 @@ import {
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
 import { Label } from "./components/ui/label";
+import { Select } from "./components/ui/select";
 import { Separator } from "./components/ui/separator";
 import { Slider } from "./components/ui/slider";
 import ScheduleSection, { parseCoordinate } from "./ScheduleSection";
@@ -284,6 +287,7 @@ export default function ConfigView({
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true
   );
+  const [trayTarget, setTrayTarget] = useState(config.trayTarget ?? TRAY_TARGET_NONE);
   const [updateChecking, setUpdateChecking] = useState(
     config.updateCheckPending ?? false
   );
@@ -463,7 +467,7 @@ export default function ConfigView({
       }
     }
     setScheduleError("");
-    saveSettings(debugLog, autoCheckForUpdates, schedule);
+    saveSettings(debugLog, autoCheckForUpdates, trayTarget, schedule);
   }
 
   const minLevel = allowBelowMinimum ? -90 : 0;
@@ -589,6 +593,34 @@ export default function ConfigView({
       </div>
 
       <Separator />
+
+      <div className="space-y-1 pt-1">
+        <Label htmlFor="trayTarget">Tray menu brightness control</Label>
+        <Select
+          id="trayTarget"
+          value={trayTarget}
+          onChange={(e) => setTrayTarget(e.target.value)}
+        >
+          <option value={TRAY_TARGET_NONE}>None</option>
+          <option value={TRAY_TARGET_ALL}>All monitors</option>
+          {visibleMonitors.map((m) => (
+            <option key={m.uid} value={m.key}>
+              {m.name}
+            </option>
+          ))}
+          {trayTarget !== TRAY_TARGET_NONE &&
+            trayTarget !== TRAY_TARGET_ALL &&
+            !visibleMonitors.some((m) => m.key === trayTarget) && (
+              <option value={trayTarget}>Selected monitor (not available right now)</option>
+            )}
+        </Select>
+        <p className="text-neutral-500 text-[11px] leading-snug">
+          Adds Increase brightness and Decrease brightness to the tray icon's
+          menu, stepping the chosen monitor (or every listed monitor) by 10%
+          per click. Counts as a manual change for scheduled monitors. Choose
+          None to keep the menu short. Saved with the Save button.
+        </p>
+      </div>
 
       <div className="flex items-start gap-2 pt-1">
         <Checkbox

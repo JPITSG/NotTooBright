@@ -52,8 +52,14 @@ export interface ConfigData {
   autoCheckForUpdates: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
+  // Tray menu Increase/Decrease target: "" (items hidden), "*" (all
+  // visible monitors), or a monitor key.
+  trayTarget: string;
   schedule: ScheduleData;
 }
+
+export const TRAY_TARGET_NONE = "";
+export const TRAY_TARGET_ALL = "*";
 
 export interface ScheduleSettings {
   enabled: boolean;
@@ -217,12 +223,14 @@ export function dismissUpdateConfirmation() {
 export function saveSettings(
   debugLog: boolean,
   autoCheckForUpdates: boolean,
+  trayTarget: string,
   schedule: ScheduleSettings
 ) {
   post({
     action: "saveSettings",
     debugLog,
     autoCheckForUpdates,
+    trayTarget,
     scheduleEnabled: schedule.enabled,
     latitude: schedule.latitude,
     longitude: schedule.longitude,

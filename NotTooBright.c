@@ -119,6 +119,18 @@
 #define WM_APP_UPDATE_PROGRESS (WM_APP + 5)
 #define ID_TRAY_MENU_CONFIGURE 1
 #define ID_TRAY_MENU_EXIT 2
+#define ID_TRAY_MENU_BRIGHTER 3
+#define ID_TRAY_MENU_DIMMER 4
+/* Step applied by the tray menu's Increase/Decrease brightness items. */
+#define TRAY_STEP_PERCENT 10
+/* Which monitor the tray menu items control: "" for none (items hidden),
+ * "*" for every visible monitor, otherwise a monitor identity key. */
+#define REG_VALUE_TRAY_TARGET L"TrayMenuTarget"
+#define TRAY_TARGET_ALL L"*"
+/* The tray tooltip lists every visible monitor; rebuilding it is deferred
+ * briefly so a slider drag does not rewrite it dozens of times a second. */
+#define ID_TIMER_TOOLTIP 9
+#define TOOLTIP_UPDATE_DELAY_MS 200
 
 /* The config dialog is normally shown by its first resize message; the
  * fallback timer keeps waiting while WebView2 is still initializing and
@@ -409,6 +421,7 @@ typedef struct {
     BOOL allowBelowMinimum;   /* let hardware monitors dim further in software */
     BOOL debugLogEnabled;
     BOOL autoCheckForUpdates;
+    wchar_t trayTarget[128];  /* "", "*", or a monitor key */
     Schedule schedule;
 } Configuration;
 
@@ -627,6 +640,8 @@ static void CfgSendUpdateProgress(DWORD speedKbps);
 static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted, BOOL* reopenSettings);
 static void PushMonitorsToDialog(void);
 static void CreateTrayIcon(HWND hwnd);
+static void ScheduleTooltipUpdate(void);
+static void UpdateTrayTooltip(void);
 static void RefreshTrayIcon(void);
 static void RemoveTrayIcon(void);
 static void ShowContextMenu(HWND hwnd);
@@ -818,7 +833,15 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     ReadRegistryBool(hKey, REG_VALUE_AUTO_UPDATE, &config->autoCheckForUpdates);
 
     DWORD dataType = 0;
-    DWORD dataSize = sizeof(g_ignoredUpdateVersion);
+    DWORD dataSize = sizeof(config->trayTarget) - sizeof(wchar_t);
+    if (RegQueryValueExW(hKey, REG_VALUE_TRAY_TARGET, NULL, &dataType,
+                         (LPBYTE)config->trayTarget, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_SZ) {
+        config->trayTarget[0] = L'\0';
+    }
+    config->trayTarget[(sizeof(config->trayTarget) / sizeof(wchar_t)) - 1] = L'\0';
+
+    dataSize = sizeof(g_ignoredUpdateVersion);
     if (RegQueryValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, NULL,
                          &dataType, (LPBYTE)g_ignoredUpdateVersion,
                          &dataSize) != ERROR_SUCCESS ||
@@ -863,6 +886,8 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     if (!WriteRegistryDword(hKey, REG_VALUE_DEBUGLOG, config->debugLogEnabled ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_ALLOW_BELOW_MIN, config->allowBelowMinimum ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_AUTO_UPDATE, config->autoCheckForUpdates ? 1 : 0)) success = FALSE;
+    RegSetValueExW(hKey, REG_VALUE_TRAY_TARGET, 0, REG_SZ, (const BYTE*)config->trayTarget,
+                   (DWORD)((wcslen(config->trayTarget) + 1) * sizeof(wchar_t)));
     RegSetValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
                    (const BYTE*)g_ignoredUpdateVersion,
                    (DWORD)((wcslen(g_ignoredUpdateVersion) + 1) * sizeof(wchar_t)));
@@ -1940,6 +1965,7 @@ static void ApplyMonitor(Monitor* m) {
                mode == MODE_HARDWARE ? (wrote ? L"write " : L"unchanged ") : L"n/a ",
                mode == MODE_HARDWARE ? (value < 0 ? 0 : value) : 0, dim);
     SetOverlayDim(m, dim);
+    ScheduleTooltipUpdate();
 }
 
 static void SetMonitorValue(Monitor* m, int value) {
@@ -4190,9 +4216,10 @@ static void webview_push_init_config(void) {
     if (!monitors) return;
 
     const Schedule* sc = &g_config.schedule;
-    wchar_t eUpdateCompletedVersion[64];
+    wchar_t eUpdateCompletedVersion[64], eTrayTarget[256];
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_WSTRING : L"",
                         eUpdateCompletedVersion, 64);
+    json_escape_wstring(g_config.trayTarget, eTrayTarget, 256);
     BOOL updateCheckPending =
         InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE ||
         InterlockedCompareExchangePointer((PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL;
@@ -4202,6 +4229,7 @@ static void webview_push_init_config(void) {
         int written = swprintf_s(script, cap,
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
             L"\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
+            L"\"trayTarget\":\"%s\","
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
             L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
             L"\"dawnStartOffset\":%d,\"dawnEndOffset\":%d,\"duskStartOffset\":%d,"
@@ -4212,6 +4240,7 @@ static void webview_push_init_config(void) {
             g_config.autoCheckForUpdates ? L"true" : L"false",
             updateCheckPending ? L"true" : L"false",
             g_updateNoticeTask ? L"true" : L"false",
+            eTrayTarget,
             sc->enabled ? L"true" : L"false", sc->hasLocation ? L"true" : L"false",
             sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
             sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset,
@@ -4226,6 +4255,7 @@ static void webview_push_init_config(void) {
 /* Live update of the monitor list while the dialog is open (probe results,
  * display changes, mode switches). */
 static void PushMonitorsToDialog(void) {
+    ScheduleTooltipUpdate();
     if (!g_cfgWebView) return;
     wchar_t* monitors = BuildMonitorsJson();
     if (!monitors) return;
@@ -4690,6 +4720,12 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
         g_config.autoCheckForUpdates = json_get_bool(msg, "autoCheckForUpdates", TRUE);
+        char trayTarget[256] = {0};
+        json_get_string(msg, "trayTarget", trayTarget, sizeof(trayTarget));
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, trayTarget, -1, g_config.trayTarget,
+                                sizeof(g_config.trayTarget) / sizeof(wchar_t)) == 0) {
+            g_config.trayTarget[0] = L'\0';
+        }
         SaveScheduleFromMessage(msg);
         InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
         if (!SaveConfigToRegistry(&g_config)) {
@@ -4699,8 +4735,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 L"can write to HKEY_CURRENT_USER.",
                 APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d)\n",
-                   g_config.debugLogEnabled, g_config.autoCheckForUpdates);
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, trayTarget=\"%s\")\n",
+                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.trayTarget);
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
@@ -4938,6 +4974,82 @@ static void CreateTrayIcon(HWND hwnd) {
     DebugPrint(L"[INFO] Tray icon created (%dx%d)\n", iconSize, iconSize);
 }
 
+static void ScheduleTooltipUpdate(void) {
+    if (g_hwnd) SetTimer(g_hwnd, ID_TIMER_TOOLTIP, TOOLTIP_UPDATE_DELAY_MS, NULL);
+}
+
+/* "Not Too Bright" followed by one "name: NN%" line per visible monitor.
+ * szTip holds 128 characters, so long names are shortened and, if the list
+ * still does not fit, the tail is replaced by an ellipsis. */
+static void UpdateTrayTooltip(void) {
+    if (!g_nid.hWnd) return;
+    const size_t cap = sizeof(g_nid.szTip) / sizeof(wchar_t);
+    wchar_t tip[128];
+    wcscpy_s(tip, cap, APP_DISPLAY_NAME_WSTRING);
+    for (int i = 0; i < g_monitorCount; i++) {
+        const Monitor* m = &g_monitors[i];
+        if (m->hidden) continue;
+        wchar_t name[40];
+        wcsncpy_s(name, 40, m->name, _TRUNCATE);
+        if (wcslen(m->name) > 39) wcscpy_s(name + 36, 4, L"...");
+        wchar_t line[64];
+        if (m->hasValue && MonitorMode(m) != MODE_PROBING) {
+            swprintf_s(line, 64, L"\n%s: %d%%", name, m->value);
+        } else {
+            swprintf_s(line, 64, L"\n%s: ...", name);
+        }
+        if (wcslen(tip) + wcslen(line) >= cap - 1) {
+            /* Out of room: mark the list as cut and stop. */
+            if (wcslen(tip) + 4 < cap) wcscat_s(tip, cap, L"\n...");
+            break;
+        }
+        wcscat_s(tip, cap, line);
+    }
+    if (wcscmp(tip, g_nid.szTip) == 0) return;
+    wcscpy_s(g_nid.szTip, cap, tip);
+    NOTIFYICONDATAW nid = g_nid;
+    nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+/* The monitor the tray menu's brightness items act on; NULL with allVisible
+ * set means every visible monitor, NULL without it means the items are off. */
+static Monitor* TrayTargetMonitor(BOOL* allVisible) {
+    *allVisible = FALSE;
+    if (!g_config.trayTarget[0]) return NULL;
+    if (wcscmp(g_config.trayTarget, TRAY_TARGET_ALL) == 0) {
+        *allVisible = TRUE;
+        return NULL;
+    }
+    for (int i = 0; i < g_monitorCount; i++) {
+        if (!g_monitors[i].hidden && wcscmp(g_monitors[i].key, g_config.trayTarget) == 0) {
+            return &g_monitors[i];
+        }
+    }
+    return NULL;
+}
+
+/* Increase/Decrease from the tray menu: one step from each target's own
+ * current value. A manual change, so scheduled monitors pause. */
+static void StepTrayTarget(int direction) {
+    BOOL allVisible = FALSE;
+    Monitor* target = TrayTargetMonitor(&allVisible);
+    int changed = 0;
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        if (m->hidden || MonitorMode(m) == MODE_PROBING) continue;
+        if (!allVisible && m != target) continue;
+        int before = m->value;
+        SetMonitorValue(m, m->value + direction * TRAY_STEP_PERCENT);
+        NoteManualChange(m);
+        if (m->value != before) changed++;
+    }
+    DebugPrint(L"[INFO] Tray menu: brightness %s by %d%% on %s (%d monitor(s) changed)\n",
+               direction > 0 ? L"up" : L"down", TRAY_STEP_PERCENT,
+               allVisible ? L"all monitors" : (target ? target->name : L"no monitor"), changed);
+    if (changed) PushMonitorsToDialog();
+}
+
 static void RemoveTrayIcon(void) {
     if (!g_nid.hWnd) return;
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -4962,6 +5074,25 @@ static void ShowContextMenu(HWND hwnd) {
 
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu) return;
+    /* The brightness items exist only once a target has been chosen in the
+     * dialog; they are greyed out while that target is not available. */
+    if (g_config.trayTarget[0]) {
+        BOOL allVisible = FALSE;
+        Monitor* target = TrayTargetMonitor(&allVisible);
+        BOOL usable = allVisible ? VisibleMonitorCount() > 0 : target != NULL;
+        UINT state = usable ? MF_ENABLED : MF_GRAYED;
+        wchar_t brighter[96], dimmer[96];
+        if (allVisible) {
+            wcscpy_s(brighter, 96, L"Increase brightness");
+            wcscpy_s(dimmer, 96, L"Decrease brightness");
+        } else {
+            swprintf_s(brighter, 96, L"Increase brightness (%s)", target ? target->name : L"unavailable");
+            swprintf_s(dimmer, 96, L"Decrease brightness (%s)", target ? target->name : L"unavailable");
+        }
+        AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_BRIGHTER, brighter);
+        AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_DIMMER, dimmer);
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    }
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CONFIGURE, L"Configure");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_EXIT, L"Exit");
@@ -4999,6 +5130,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             switch (LOWORD(wParam)) {
                 case ID_TRAY_MENU_CONFIGURE:
                     ShowConfigDialog();
+                    return 0;
+                case ID_TRAY_MENU_BRIGHTER:
+                    StepTrayTarget(+1);
+                    return 0;
+                case ID_TRAY_MENU_DIMMER:
+                    StepTrayTarget(-1);
                     return 0;
                 case ID_TRAY_MENU_EXIT:
                     DebugPrint(L"[INFO] Exit selected from the tray menu\n");
@@ -5059,6 +5196,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     return 0;
                 case ID_TIMER_AUTO_UPDATE:
                     if (g_config.autoCheckForUpdates) StartUpdateCheck(TRUE);
+                    return 0;
+                case ID_TIMER_TOOLTIP:
+                    KillTimer(hwnd, ID_TIMER_TOOLTIP);
+                    UpdateTrayTooltip();
                     return 0;
             }
             break;
@@ -5291,6 +5432,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_PERSIST);
     KillTimer(g_hwnd, ID_TIMER_SCHEDULE);
     KillTimer(g_hwnd, ID_TIMER_DDC_RETRY);
+    KillTimer(g_hwnd, ID_TIMER_TOOLTIP);
     PersistDirtyMonitors();
     DestroyAllOverlays();
     StopDdcWorker();
