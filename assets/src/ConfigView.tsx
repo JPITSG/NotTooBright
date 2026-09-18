@@ -106,9 +106,9 @@ function ScheduleBadge({ monitor }: { monitor: MonitorData }) {
     return (
       <span
         className="shrink-0 whitespace-nowrap rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700"
-        title="Changed by hand; the schedule takes over again at this time"
+        title={`Changed by hand; the schedule takes over again at ${monitor.pausedUntil}`}
       >
-        Auto paused until {monitor.pausedUntil}
+        Auto paused
       </span>
     );
   }

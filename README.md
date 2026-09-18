@@ -1,43 +1,48 @@
 # Not Too Bright
 
-A lightweight Windows system tray application for lowering the brightness of
-desktop monitors from software, for displays that have no native Windows
-brightness control.
+**Dim your desktop monitors from the system tray — no more hunting for buttons on the back of the screen.**
 
-## Features
+Laptops get brightness keys. Desktop monitors get a five-button menu and a
+Windows that pretends the backlight does not exist. Not Too Bright is a tiny,
+single-file Windows tray app that fixes that: real backlight control over
+DDC/CI where the monitor allows it, a software dimming fallback everywhere
+else, and an optional schedule that follows the sun for your location.
 
-- **Hardware Brightness (DDC/CI)** - Drives the monitor's own backlight through the Windows Monitor Configuration API, exactly like the buttons on the monitor, for every monitor that answers DDC/CI
-- **Software Dimming Fallback** - Monitors that do not support DDC/CI (or that you switch to software mode) are dimmed with a click-through overlay that works on any display, GPU, dock, or remote session
-- **Below the Hardware Minimum** - Optionally continue below 0% on hardware-controlled monitors: the backlight stays at its minimum and software dimming is added on top
-- **One Slider per Monitor** - Plus an "All monitors" slider; changes apply immediately while dragging
-- **Hide Monitors** - Restore a monitor's original brightness, then remove it from the list and stop controlling it entirely until the next rescan; the last monitor can never be hidden
-- **Automatic Brightness (optional)** - Follows the sun for your latitude and longitude: a daytime level after sunrise, a night level after sunset, smooth transitions at dawn and dusk, shown on an editable graph of today's curve; a manual change pauses it until a reset time of your choosing
-- **Remembered per Monitor** - Each monitor is identified by its EDID (model and serial), so settings follow the monitor and are re-applied after sleep, after the display turns back on, and after display changes
-- **Never Black** - Software dimming stops at 10% apparent brightness, and overlays vanish with the process, so a screen can never be left dark
-- **Screenshot Friendly** - Overlays are excluded from screen capture and screen sharing (Windows 10 2004+), so screenshots show the undimmed picture
-- **System Tray Integration** - Runs in the system tray with no main window; click the icon to open the brightness dialog
-- **Registry Storage** - Settings persist in the Windows Registry (`HKCU\SOFTWARE\JPIT\NotTooBright`)
-- **Single Instance** - Only one instance can run at a time
-- **Single File** - The executable embeds its icon, manifest, WebView2 loader, and configuration UI; nothing else needs to be installed alongside it
-- **Debug Log** - Optional diagnostic log of monitor detection and DDC/CI results for reporting issues
+![Not Too Bright configuration dialog](assets/screenshot.png)
 
-## Context Menu Options
+## Highlights
 
-Right-click the tray icon to access:
+- **Real backlight control** - Talks DDC/CI to the monitor, the same channel its own menu uses, so dimming keeps full contrast and saves power
+- **Works on anything** - Monitors without DDC/CI (docks, KVMs, virtual displays, remote sessions) get a click-through software overlay instead
+- **One slider per monitor** - Plus *All monitors*; changes apply live while you drag and are remembered per monitor
+- **Follows the sun** - Optional day/night levels with smooth dawn and dusk transitions computed for your latitude and longitude, shown on an editable graph
+- **Manual override that makes sense** - Touch a scheduled monitor's slider and the schedule leaves it alone until a reset time you choose
+- **Below the minimum** - Optionally continue below 0% on hardware monitors by adding software dimming on top of the lowest backlight setting
+- **Hide what you do not want touched** - Remove a monitor from the app entirely until the next rescan; its original brightness is restored first
+- **Never black, never in screenshots** - Software dimming stops at 10% and its overlay is excluded from screen capture and screen sharing
+- **Zero install** - One 560 KB executable, no runtime to install, settings in your user registry, nothing written next to the exe
+- **Survives everything** - Settings follow the monitor (by EDID) and are re-applied after sleep, after displays are switched back on, and after display changes
 
-- **Configure** - Opens the brightness and settings dialog (also opened by clicking the tray icon)
-- **Exit** - Closes the application; software dimming is removed, hardware brightness stays as set
+## Getting Started
+
+1. Download [`releases/NotTooBright.exe`](releases/NotTooBright.exe) and run it. An icon appears in the system tray.
+2. Click the icon. Every connected monitor gets a card with a slider and a badge showing how it is controlled.
+3. Drag. That is it - values are remembered per monitor and restored next time.
+
+Right-click the icon for **Configure** and **Exit**. Requires Windows 10 or 11
+(64-bit) and the [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
+which is already installed on virtually every Windows 10/11 machine.
 
 ## How Brightness Control Works
 
-For every connected monitor Not Too Bright first tries **DDC/CI**, the control
-channel monitors expose over their video cable. It reads and writes the
-standard VCP brightness code (0x10), so the change is the same one you would
-make with the monitor's own buttons: the backlight actually gets dimmer, with
-no loss of contrast. All DDC/CI traffic runs on a background thread with
-retries, because a single command can take a while and some monitors are slow
-or flaky. If a driver refuses the raw VCP request but accepts the high-level
-Monitor Configuration API, that route is used instead.
+For every connected monitor Not Too Bright first tries **DDC/CI**, the
+control channel monitors expose over their video cable. It reads and writes
+the standard VCP brightness code (0x10), so the change is the same one you
+would make with the monitor's own buttons: the backlight actually gets
+dimmer, with no loss of contrast. All DDC/CI traffic runs on a background
+thread with retries, because a single command can take a while and some
+monitors are slow or flaky. If a driver refuses the raw VCP request but
+accepts the high-level Monitor Configuration API, that route is used instead.
 
 When a monitor does not answer (DDC/CI disabled in its on-screen menu, some
 docks, KVMs, USB-C hubs, DisplayLink adapters, virtual machines, remote
@@ -47,17 +52,17 @@ lower the backlight, but it works everywhere, needs no driver support, and
 never affects screenshots or screen sharing.
 
 A monitor that has answered DDC/CI before is treated differently when it
-stops responding (a flaky first request after start-up or a display change,
-a KVM switched away, a cable swap): its backlight may well be sitting below
-100% from an earlier setting, and dimming it in software on top of that
-would stack the two. Such a monitor is left exactly as it is, shown as
-*DDC/CI not answering*, and retried automatically with a growing delay (3 s,
-6 s, ... up to once a minute) until it answers again; its slider applies as
-soon as it does. **Software dimming only** remains available as an explicit
-choice in the meantime. Monitors that have never answered are re-probed a
-few times after start-up and otherwise use software dimming.
+stops responding (a flaky request after a display change, a KVM switched
+away, a cable swap): its backlight may well be sitting below 100% from an
+earlier setting, and dimming it in software on top of that would stack the
+two. Such a monitor is left exactly as it is, shown as *DDC/CI not
+answering*, and retried automatically with a growing delay (3 s, 6 s, ... up
+to once a minute) until it answers again; its slider applies as soon as it
+does. **Software dimming only** remains available as an explicit choice in
+the meantime. Monitors that have never answered are re-probed a few times
+after start-up and otherwise use software dimming.
 
-Both methods are behind the same per-monitor slider. With **Allow dimming
+Both methods sit behind the same per-monitor slider. With **Allow dimming
 below the hardware minimum** enabled, the slider of a hardware-controlled
 monitor extends to -90%: values below 0% keep the backlight at its minimum and
 add software dimming on top, for monitors whose lowest setting is still too
@@ -97,11 +102,11 @@ the rounded percentage changes. If you change a scheduled monitor's
 brightness by hand (its slider or **All monitors**), automatic control of
 that monitor pauses until the **cycle reset time** you set (04:00 by
 default), so an adjustment you make in the evening is not undone a minute
-later; the card shows *Auto paused until HH:MM* with a **Resume now** link,
-and saving the schedule again also resumes every monitor. Hidden monitors are
-never scheduled. The night level can only go below 0% when **Allow dimming
-below the hardware minimum** is enabled, and each monitor clamps the
-scheduled value to its own range.
+later; the card shows *Auto paused* with a **Resume now** link, and saving
+the schedule again also resumes every monitor. Hidden monitors are never
+scheduled. The night level can only go below 0% when **Allow dimming below
+the hardware minimum** is enabled, and each monitor clamps the scheduled
+value to its own range.
 
 ## Configuration
 
@@ -112,7 +117,7 @@ brightness section applies immediately; the settings below it are saved with
 | Control | Description |
 |---------|-------------|
 | All monitors | Sets every monitor to the same value (shown only with more than one monitor). |
-| Per-monitor slider | The brightness of that monitor. The badge shows how it is controlled: **Hardware (DDC/CI)**, **Software (no DDC/CI)**, or **Software (chosen)**. |
+| Per-monitor slider | The brightness of that monitor. The badge shows how it is controlled: **Hardware (DDC/CI)**, **Software (no DDC/CI)**, **Software (chosen)**, or **DDC/CI not answering**. |
 | Software dimming only | Shown for monitors that have answered DDC/CI. Uses the overlay instead of DDC/CI and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values, or that have stopped answering. |
 | Hide | Puts the monitor back to the brightness it had when Not Too Bright first saw it, then removes it from the list and stops controlling it entirely, as if it were not connected: its dimming overlay is removed, it is no longer probed, and no further brightness changes are sent. The last monitor in the list cannot be hidden. Hidden monitors stay hidden across restarts and display changes until you choose **Rescan**. |
 | Rescan | Re-detects monitors, probes DDC/CI again (for example after enabling DDC/CI in a monitor's menu), and shows every hidden monitor again. |
@@ -127,10 +132,22 @@ brightness section applies immediately; the settings below it are saved with
 
 The footer displays the application version.
 
-Per-monitor values are stored under `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>`;
-the schedule itself is stored under `HKCU\SOFTWARE\JPIT\NotTooBright`.
+## Where Settings Live
 
-### Limitations
+Everything is stored per user in the Windows Registry; nothing is written
+next to the executable, so it can run from any folder.
+
+| Location | Contents |
+|----------|----------|
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, pause deadline, original brightness |
+| `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
+| `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |
+
+Deleting the `HKCU\SOFTWARE\JPIT\NotTooBright` key returns the application to
+its factory state.
+
+## Limitations
 
 - Software dimming blends the picture toward black; it cannot reduce the
   backlight, so contrast drops as you dim, and the mouse cursor stays bright.
@@ -140,27 +157,8 @@ the schedule itself is stored under `HKCU\SOFTWARE\JPIT\NotTooBright`.
 - DDC/CI must be enabled in the monitor's menu and pass through whatever
   sits between the computer and the monitor; many docks and KVM switches do
   not forward it.
-
-## Icon Customization
-
-The application uses a single icon file (`assets/icon.ico`) for the system
-tray and the configuration dialog's title bar.
-
-### Replacing the Icon
-
-1. Replace `assets/icon.svg` with your own SVG file
-2. Run `make icon` to generate `assets/icon.ico` (requires ImageMagick)
-3. Rebuild with `make`
-
-This generates a multi-resolution `.ico` containing 16x16, 24x24, 32x32,
-48x48, and 256x256 sizes, covering all DPI scaling levels. The icon is
-embedded into the executable at compile time via `resource.rc`.
-
-## Requirements
-
-- Windows 10/11 (64-bit)
-- [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (usually pre-installed on Windows 10/11); only needed for the configuration dialog
-- For hardware control: a monitor with DDC/CI enabled, connected so that DDC/CI reaches it (see [Limitations](#limitations)); everything else falls back to software dimming
+- Laptop built-in panels are controlled by Windows itself; this application
+  is for external monitors.
 
 ## Building from Source
 
@@ -201,17 +199,18 @@ make clean-all  # additionally remove node_modules and releases/
 ```
 
 The WebView2 COM interfaces used by the configuration dialog are declared
-directly in `NotTooBright.c`, so no WebView2 SDK download is required.
+directly in `NotTooBright.c`, so no WebView2 SDK download is required. The
+build is reproducible: the same sources produce a byte-identical executable.
 
 ## Project Structure
 
 | Path | Description |
 |------|-------------|
-| `NotTooBright.c` | Application source (monitor detection, DDC/CI worker, dimming overlays, tray icon, configuration dialog host, settings) |
+| `NotTooBright.c` | Application source (monitor detection, DDC/CI worker, dimming overlays, schedule, tray icon, configuration dialog host, settings) |
 | `NotTooBright.manifest` | DPI awareness and supported OS manifest, embedded as a resource |
 | `resource.rc`, `resource.h` | Resource script: icon, manifest, version info, embedded UI and loader |
 | `version.h` | Single source of truth for the application version |
-| `assets/` | Configuration UI (React, Vite, Tailwind) plus the icon and `WebView2Loader.dll` |
+| `assets/` | Configuration UI (React, Vite, Tailwind), the icon, the screenshot, and `WebView2Loader.dll` |
 | `releases/` | Build output (`NotTooBright.exe`) |
 
 ## License

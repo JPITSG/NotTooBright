@@ -40,8 +40,9 @@ CFLAGS += -mwindows -Wall -Wextra -I.
 # dependency on the compiler's runtime DLLs (libgcc, winpthread).
 # --no-insert-timestamp makes the link reproducible: rebuilding unchanged
 # sources yields a byte-identical executable, so the tracked release binary
-# only changes when the program does.
-LDFLAGS += -mwindows -static -Wl,--no-insert-timestamp
+# only changes when the program does. -s strips symbols and debug data,
+# which otherwise carry file paths from the build machine's toolchain.
+LDFLAGS += -mwindows -static -s -Wl,--no-insert-timestamp
 LIBS = -luser32 -lgdi32 -lshell32 -lshlwapi -ladvapi32 -lole32 -luuid -ldxva2
 
 .PHONY: all frontend icon clean clean-all
