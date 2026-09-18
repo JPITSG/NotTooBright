@@ -415,6 +415,11 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
 
           <div className="space-y-1">
             <Label className="text-xs">Apply to</Label>
+            {monitors.length > 0 && settings.scheduledUids.length === 0 && (
+              <p className="text-[11px] leading-snug text-amber-700">
+                No monitor is selected, so the schedule will not change anything.
+              </p>
+            )}
             {monitors.length === 0 ? (
               <p className="text-neutral-500 text-[11px]">No monitors are available.</p>
             ) : (

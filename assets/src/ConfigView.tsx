@@ -266,9 +266,15 @@ export default function ConfigView({ config, monitors }: Props) {
     config.allowBelowMinimum ?? false
   );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
-  const [schedule, setSchedule] = useState<ScheduleSettings>(() =>
-    initialSchedule(config, monitors)
-  );
+  const [schedule, setSchedule] = useState<ScheduleSettings>(() => {
+    const initial = initialSchedule(config, monitors);
+    // An enabled schedule with nothing selected controls nothing; start
+    // from every visible monitor so a saved dialog does something.
+    if (initial.enabled && initial.scheduledUids.length === 0) {
+      initial.scheduledUids = monitors.filter((m) => !m.hidden).map((m) => m.uid);
+    }
+    return initial;
+  });
   const [scheduleError, setScheduleError] = useState("");
   const throttledSend = useThrottledSender();
   // The schedule section is tall; on a wide enough screen the dialog shows

@@ -1210,10 +1210,16 @@ static HWND CreateOverlayWindow(const RECT* rc) {
     SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
     /* Windows 10 2004+; older versions simply keep the overlay in captures. */
     BOOL excluded = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-    DebugPrint(L"[OVERLAY] created hwnd=%p at (%ld,%ld) %ldx%ld, capture exclusion %s%lu\n",
-               (void*)hwnd, (long)rc->left, (long)rc->top, (long)(rc->right - rc->left),
-               (long)(rc->bottom - rc->top), excluded ? L"ok" : L"unavailable, error ",
-               (unsigned long)(excluded ? 0 : GetLastError()));
+    DWORD affinityError = excluded ? 0 : GetLastError();
+    if (excluded) {
+        DebugPrint(L"[OVERLAY] created hwnd=%p at (%ld,%ld) %ldx%ld, excluded from capture\n",
+                   (void*)hwnd, (long)rc->left, (long)rc->top, (long)(rc->right - rc->left),
+                   (long)(rc->bottom - rc->top));
+    } else {
+        DebugPrint(L"[OVERLAY] created hwnd=%p at (%ld,%ld) %ldx%ld, capture exclusion unavailable (error %lu)\n",
+                   (void*)hwnd, (long)rc->left, (long)rc->top, (long)(rc->right - rc->left),
+                   (long)(rc->bottom - rc->top), (unsigned long)affinityError);
+    }
     return hwnd;
 }
 
@@ -1426,10 +1432,14 @@ static WorkerSource* FindWorkerSource(WorkerSource* sources, int count, HMONITOR
     return NULL;
 }
 
-static HANDLE WorkerMonitorHandle(WorkerSource* sources, int count, const WorkerMonitor* wm) {
+/* A physical monitor handle is an opaque value that can legitimately be 0:
+ * some drivers (AMD, for one) hand out small sequential numbers starting
+ * at zero. Never treat 0 as "no handle"; use the return value instead. */
+static BOOL WorkerMonitorHandle(WorkerSource* sources, int count, const WorkerMonitor* wm, HANDLE* handle) {
     WorkerSource* src = FindWorkerSource(sources, count, wm->hmon);
-    if (!src || (DWORD)wm->physicalIndex >= src->count) return NULL;
-    return src->monitors[wm->physicalIndex].hPhysicalMonitor;
+    if (!src || (DWORD)wm->physicalIndex >= src->count) return FALSE;
+    *handle = src->monitors[wm->physicalIndex].hPhysicalMonitor;
+    return TRUE;
 }
 
 /* Physical monitor handles stay open for as long as their display is
@@ -1542,10 +1552,12 @@ static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMo
     ULONGLONG start = GetTickCount64();
     DWORD min = 0, current = 0, max = 0;
     BOOL ok = FALSE, highLevel = FALSE;
-    HANDLE handle = WorkerMonitorHandle(sources, *sourceCount, wm);
-    DebugPrint(L"[DDC] monitor %d probe start: hmon=%p physicalIndex=%d handle=%p patient=%d\n",
-               wm->uid, (void*)wm->hmon, wm->physicalIndex, (void*)handle, wm->patient);
-    if (!handle) {
+    HANDLE handle = NULL;
+    BOOL haveHandle = WorkerMonitorHandle(sources, *sourceCount, wm, &handle);
+    DebugPrint(L"[DDC] monitor %d probe start: hmon=%p physicalIndex=%d handle=%p (%s) patient=%d\n",
+               wm->uid, (void*)wm->hmon, wm->physicalIndex, (void*)handle,
+               haveHandle ? L"valid" : L"none", wm->patient);
+    if (!haveHandle) {
         r->error = ERROR_NOT_FOUND;
     } else {
         static const DWORD waitMs[DDC_PROBE_ATTEMPTS] = { 0, 300, 800, 1500 };
@@ -1569,8 +1581,7 @@ static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMo
                 CloseWorkerSource(src);
                 Sleep(DDC_REOPEN_PAUSE_MS);
                 OpenWorkerSource(src);
-                handle = WorkerMonitorHandle(sources, *sourceCount, wm);
-                if (handle) {
+                if (WorkerMonitorHandle(sources, *sourceCount, wm, &handle)) {
                     ok = ReadVcpBrightness(handle, wm->uid, L"after reopen", &current, &max, &r->error);
                     if (!ok) {
                         ok = ReadHighLevelBrightness(handle, wm->uid, &min, &current, &max);
@@ -1705,8 +1716,8 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
             }
             BOOL ok = FALSE;
             if (wm && wm->supported) {
-                HANDLE handle = WorkerMonitorHandle(sources, sourceCount, wm);
-                if (handle) ok = WriteWorkerBrightness(handle, wm, target, raw);
+                HANDLE handle = NULL;
+                if (WorkerMonitorHandle(sources, sourceCount, wm, &handle)) ok = WriteWorkerBrightness(handle, wm, target, raw);
                 else DebugPrint(L"[DDC] monitor %d: no handle for the write\n", uid);
             } else {
                 DebugPrint(L"[DDC] monitor %d: write skipped (%s)\n", uid,
@@ -2977,11 +2988,16 @@ static void SaveScheduleFromMessage(const char* msg) {
     }
     PersistDirtyMonitors();
 
-    DebugPrint(L"[INFO] Schedule %s: lat %.4f lon %.4f, day %d%% night %d%%, dawn %+d/%+d, dusk %+d/%+d, reset %02d:%02d\n",
+    int scheduledCount = 0;
+    for (int i = 0; i < g_monitorCount; i++) {
+        if (g_monitors[i].scheduled) scheduledCount++;
+    }
+    DebugPrint(L"[INFO] Schedule %s: lat %.4f lon %.4f, day %d%% night %d%%, dawn %+d/%+d, dusk %+d/%+d, reset %02d:%02d, %d monitor(s) selected%s\n",
                sc->enabled ? L"enabled" : L"disabled", sc->latitude, sc->longitude,
                sc->dayLevel, sc->nightLevel, sc->dawnStartOffset, sc->dawnEndOffset,
                sc->duskStartOffset, sc->duskEndOffset,
-               sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60);
+               sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60, scheduledCount,
+               (sc->enabled && scheduledCount == 0) ? L" - the schedule has nothing to control" : L"");
     UpdateScheduleTimer();
     EvaluateSchedule();
 }
@@ -3005,11 +3021,15 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     char action[64] = {0};
     json_get_string(msg, "action", action, sizeof(action));
     if (strcmp(action, "resize") != 0) {
-        wchar_t preview[256];
-        int n = MultiByteToWideChar(CP_UTF8, 0, msg, -1, preview, 255);
-        if (n <= 0) preview[0] = L'\0';
-        preview[255] = L'\0';
-        DebugPrint(L"[DIALOG] %s\n", preview);
+        /* Long messages are cut; a partial trailing UTF-8 sequence only
+         * costs one replacement character. */
+        wchar_t preview[512];
+        int bytes = (int)strlen(msg);
+        if (bytes > 480) bytes = 480;
+        int n = MultiByteToWideChar(CP_UTF8, 0, msg, bytes, preview, 500);
+        if (n < 0) n = 0;
+        preview[n] = L'\0';
+        DebugPrint(L"[DIALOG] %s%s\n", preview, strlen(msg) > 480 ? L"..." : L"");
     }
 
     if (strcmp(action, "getInit") == 0) {
