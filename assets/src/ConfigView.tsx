@@ -1,7 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   type ConfigData,
   type MonitorData,
+  type ScheduleSettings,
+  SINGLE_COLUMN_WIDTH,
+  TWO_COLUMN_WIDTH,
   saveSettings,
   closeDialog,
   setBrightness,
@@ -10,12 +13,15 @@ import {
   setAllowBelowMinimum,
   hideMonitor,
   refreshMonitors,
+  resumeSchedule,
+  setDesiredContentWidth,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
 import { Label } from "./components/ui/label";
 import { Separator } from "./components/ui/separator";
 import { Slider } from "./components/ui/slider";
+import ScheduleSection, { parseCoordinate } from "./ScheduleSection";
 
 interface Props {
   config: ConfigData;
@@ -92,10 +98,32 @@ function ModeBadge({ monitor }: { monitor: MonitorData }) {
   );
 }
 
+function ScheduleBadge({ monitor }: { monitor: MonitorData }) {
+  if (monitor.pausedUntil) {
+    return (
+      <span
+        className="shrink-0 whitespace-nowrap rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700"
+        title="Changed by hand; the schedule takes over again at this time"
+      >
+        Auto paused until {monitor.pausedUntil}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="shrink-0 whitespace-nowrap rounded border border-indigo-200 bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium leading-none text-indigo-700"
+      title="Follows the sun-based schedule"
+    >
+      Auto
+    </span>
+  );
+}
+
 interface MonitorCardProps {
   monitor: MonitorData;
   value: number;
   canHide: boolean;
+  scheduleEnabled: boolean;
   onChange: (value: number) => void;
   onSoftwareOnlyChange: (softwareOnly: boolean) => void;
   onHide: () => void;
@@ -105,6 +133,7 @@ function MonitorCard({
   monitor,
   value,
   canHide,
+  scheduleEnabled,
   onChange,
   onSoftwareOnlyChange,
   onHide,
@@ -133,6 +162,7 @@ function MonitorCard({
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {scheduleEnabled && monitor.scheduled && <ScheduleBadge monitor={monitor} />}
           <ModeBadge monitor={monitor} />
           <span className="w-10 text-right text-xs tabular-nums">
             {formatValue(value)}
@@ -183,11 +213,40 @@ function MonitorCard({
           it has a DDC/CI option in its on-screen menu, enable it and rescan.
         </p>
       )}
+      {scheduleEnabled && monitor.scheduled && monitor.pausedUntil && (
+        <p className="text-[11px] leading-snug text-neutral-500">
+          Set by hand; the schedule resumes at {monitor.pausedUntil}.{" "}
+          <button
+            type="button"
+            className="underline hover:text-neutral-900"
+            onClick={() => resumeSchedule(monitor.uid)}
+          >
+            Resume now
+          </button>
+        </p>
+      )}
       {monitor.error && (
         <p className="text-[11px] leading-snug text-red-600">{monitor.error}</p>
       )}
     </div>
   );
+}
+
+function initialSchedule(config: ConfigData, monitors: MonitorData[]): ScheduleSettings {
+  const s = config.schedule;
+  return {
+    enabled: s?.enabled ?? false,
+    latitude: s?.hasLocation ? String(s.latitude) : "",
+    longitude: s?.hasLocation ? String(s.longitude) : "",
+    dayLevel: s?.dayLevel ?? 100,
+    nightLevel: s?.nightLevel ?? 30,
+    dawnStartOffset: s?.dawnStartOffset ?? -30,
+    dawnEndOffset: s?.dawnEndOffset ?? 30,
+    duskStartOffset: s?.duskStartOffset ?? -30,
+    duskEndOffset: s?.duskEndOffset ?? 30,
+    cycleResetMinutes: s?.cycleResetMinutes ?? 240,
+    scheduledUids: monitors.filter((m) => m.scheduled).map((m) => m.uid),
+  };
 }
 
 export default function ConfigView({ config, monitors }: Props) {
@@ -196,7 +255,18 @@ export default function ConfigView({ config, monitors }: Props) {
     config.allowBelowMinimum ?? false
   );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
+  const [schedule, setSchedule] = useState<ScheduleSettings>(() =>
+    initialSchedule(config, monitors)
+  );
+  const [scheduleError, setScheduleError] = useState("");
   const throttledSend = useThrottledSender();
+  // The schedule section is tall; on a wide enough screen the dialog shows
+  // it beside the monitors instead of below them.
+  const twoColumn =
+    schedule.enabled && window.screen.availWidth >= TWO_COLUMN_WIDTH + 96;
+  useLayoutEffect(() => {
+    setDesiredContentWidth(twoColumn ? TWO_COLUMN_WIDTH : SINGLE_COLUMN_WIDTH);
+  }, [twoColumn]);
   const visibleMonitors = monitors.filter((m) => !m.hidden);
   const hiddenCount = monitors.length - visibleMonitors.length;
   const canHide = visibleMonitors.length > 1;
@@ -245,11 +315,41 @@ export default function ConfigView({ config, monitors }: Props) {
   }
 
   function handleSave() {
-    saveSettings({ debugLog });
+    if (schedule.enabled) {
+      const lat = parseCoordinate(schedule.latitude, 90);
+      const lon = parseCoordinate(schedule.longitude, 180);
+      if (lat === null || lon === null) {
+        setScheduleError(
+          "Enter a latitude between -90 and 90 and a longitude between -180 and 180."
+        );
+        return;
+      }
+    }
+    setScheduleError("");
+    saveSettings(debugLog, schedule);
   }
 
+  const minLevel = allowBelowMinimum ? -90 : 0;
+  const scheduleSection = (
+    <ScheduleSection
+      settings={schedule}
+      onChange={(next) => {
+        setSchedule(next);
+        if (scheduleError) setScheduleError("");
+      }}
+      monitors={visibleMonitors}
+      minLevel={minLevel}
+      error={scheduleError}
+    />
+  );
+
   return (
-    <div className="p-4 space-y-3">
+    <div
+      className="p-4 space-y-3"
+      style={twoColumn ? { width: TWO_COLUMN_WIDTH, maxWidth: "100%" } : undefined}
+    >
+      <div className={twoColumn ? "grid grid-cols-2 items-start gap-x-6" : "space-y-3"}>
+      <div className="space-y-3">
       <div className="flex items-start justify-between gap-3">
         <div className="space-y-0.5">
           <Label>Brightness</Label>
@@ -303,6 +403,7 @@ export default function ConfigView({ config, monitors }: Props) {
           monitor={monitor}
           value={valueOf(monitor)}
           canHide={canHide}
+          scheduleEnabled={config.schedule?.enabled ?? false}
           onChange={(value) => handleMonitorChange(monitor, value)}
           onSoftwareOnlyChange={(softwareOnly) =>
             setMonitorSoftwareOnly(monitor.uid, softwareOnly)
@@ -337,6 +438,17 @@ export default function ConfigView({ config, monitors }: Props) {
             dimming on top, down to -90%. Applies immediately.
           </p>
         </div>
+      </div>
+      </div>
+
+      {twoColumn ? (
+        <div className="space-y-3">{scheduleSection}</div>
+      ) : (
+        <>
+          <Separator />
+          {scheduleSection}
+        </>
+      )}
       </div>
 
       <Separator />

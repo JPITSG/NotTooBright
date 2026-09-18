@@ -11,6 +11,7 @@ brightness control.
 - **Below the Hardware Minimum** - Optionally continue below 0% on hardware-controlled monitors: the backlight stays at its minimum and software dimming is added on top
 - **One Slider per Monitor** - Plus an "All monitors" slider; changes apply immediately while dragging
 - **Hide Monitors** - Restore a monitor's original brightness, then remove it from the list and stop controlling it entirely until the next rescan; the last monitor can never be hidden
+- **Automatic Brightness (optional)** - Follows the sun for your latitude and longitude: a daytime level after sunrise, a night level after sunset, smooth transitions at dawn and dusk, shown on an editable graph of today's curve; a manual change pauses it until a reset time of your choosing
 - **Remembered per Monitor** - Each monitor is identified by its EDID (model and serial), so settings follow the monitor and are re-applied after sleep, after the display turns back on, and after display changes
 - **Never Black** - Software dimming stops at 10% apparent brightness, and overlays vanish with the process, so a screen can never be left dark
 - **Screenshot Friendly** - Overlays are excluded from screen capture and screen sharing (Windows 10 2004+), so screenshots show the undimmed picture
@@ -60,6 +61,37 @@ nothing changes until you move the slider, and that original value is
 recorded for good: hiding the monitor later restores it before the
 application lets go of the monitor.
 
+## Automatic Brightness
+
+Enable **Adjust brightness automatically with the sun** in the dialog, enter
+your latitude and longitude (decimal degrees, north and east positive; a
+nearby city is close enough), and choose a daytime and a night level. From
+then on the selected monitors are brightened to the daytime level after
+sunrise and dimmed to the night level after sunset, every day of the year,
+using sunrise and sunset times computed for your location and the current
+date.
+
+The graph shows today's curve: the shaded band is daylight, the dashed
+lines mark sunrise and sunset, and the blue marker is the current moment.
+The four points shape the transitions - when the morning ramp starts and
+reaches full brightness, and when the evening ramp starts and reaches the
+night level. Drag them to taste; they are stored as offsets from sunrise and
+sunset, so the curve keeps following the seasons instead of freezing at a
+clock time. **Reset curve** restores the defaults (half an hour on either
+side of sunrise and sunset). Where the sun does not rise or set on a given
+day, the night or daytime level simply applies all day.
+
+The schedule is evaluated every 30 seconds and writes to a monitor only when
+the rounded percentage changes. If you change a scheduled monitor's
+brightness by hand (its slider or **All monitors**), automatic control of
+that monitor pauses until the **cycle reset time** you set (04:00 by
+default), so an adjustment you make in the evening is not undone a minute
+later; the card shows *Auto paused until HH:MM* with a **Resume now** link,
+and saving the schedule again also resumes every monitor. Hidden monitors are
+never scheduled. The night level can only go below 0% when **Allow dimming
+below the hardware minimum** is enabled, and each monitor clamps the
+scheduled value to its own range.
+
 ## Configuration
 
 Click the tray icon (or choose **Configure**) to open the dialog. The
@@ -74,11 +106,18 @@ brightness section applies immediately; the settings below it are saved with
 | Hide | Puts the monitor back to the brightness it had when Not Too Bright first saw it, then removes it from the list and stops controlling it entirely, as if it were not connected: its dimming overlay is removed, it is no longer probed, and no further brightness changes are sent. The last monitor in the list cannot be hidden. Hidden monitors stay hidden across restarts and display changes until you choose **Rescan**. |
 | Rescan | Re-detects monitors, probes DDC/CI again (for example after enabling DDC/CI in a monitor's menu), and shows every hidden monitor again. |
 | Allow dimming below the hardware minimum | Extends hardware-controlled sliders below 0% into software dimming (down to -90%). Applies immediately. Disabled by default. |
+| Adjust brightness automatically with the sun | Enables the sun-based schedule described in [Automatic Brightness](#automatic-brightness). Requires a latitude and longitude. Saved with **Save**. Disabled by default. |
+| Latitude / Longitude | Your location in decimal degrees (north and east positive), used to compute sunrise and sunset. |
+| Daytime / Night brightness | The levels the schedule applies during the day and at night. |
+| Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
+| Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
+| Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
 | Enable debug logging | Appends timestamped diagnostic events (monitor detection, DDC/CI probe and write results, fallbacks, power events) to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
 The footer displays the application version.
 
-Per-monitor values are stored under `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>`.
+Per-monitor values are stored under `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>`;
+the schedule itself is stored under `HKCU\SOFTWARE\JPIT\NotTooBright`.
 
 ### Limitations
 

@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <math.h>
 #include "resource.h"
 #include "version.h"
 
@@ -71,6 +72,19 @@
  * before anything was written to it; restored when the monitor is hidden. */
 #define REG_VALUE_MON_ORIGINAL L"OriginalBrightness"
 #define REG_VALUE_MON_ORIGINAL_MAX L"OriginalBrightnessMax"
+#define REG_VALUE_MON_SCHEDULED L"Scheduled"
+#define REG_VALUE_MON_PAUSED_UNTIL L"SchedulePausedUntil"   /* REG_QWORD, UTC FILETIME */
+/* Sun-based automatic brightness. */
+#define REG_VALUE_SCHEDULE_ENABLED L"ScheduleEnabled"
+#define REG_VALUE_LATITUDE L"Latitude"                        /* REG_SZ, decimal degrees */
+#define REG_VALUE_LONGITUDE L"Longitude"
+#define REG_VALUE_SCHEDULE_DAY L"ScheduleDayLevel"
+#define REG_VALUE_SCHEDULE_NIGHT L"ScheduleNightLevel"
+#define REG_VALUE_SCHEDULE_DAWN_START L"ScheduleDawnStartOffset"
+#define REG_VALUE_SCHEDULE_DAWN_END L"ScheduleDawnEndOffset"
+#define REG_VALUE_SCHEDULE_DUSK_START L"ScheduleDuskStartOffset"
+#define REG_VALUE_SCHEDULE_DUSK_END L"ScheduleDuskEndOffset"
+#define REG_VALUE_CYCLE_RESET L"CycleResetMinutes"
 #define REG_VALUE_MON_NAME L"Name"
 
 #define TRAY_ICON_ID 100
@@ -115,6 +129,22 @@
 /* After this many consecutive failed DDC/CI writes a monitor is treated as
  * software-only until the next rescan. */
 #define DDC_MAX_CONSECUTIVE_FAILURES 3
+
+/* The schedule is evaluated on this timer while enabled; values only
+ * change by whole percents, so this is plenty for a slow transition. */
+#define ID_TIMER_SCHEDULE 5
+#define SCHEDULE_INTERVAL_MS 30000
+#define SCHEDULE_DEFAULT_DAY 100
+#define SCHEDULE_DEFAULT_NIGHT 30
+/* Transition anchors are minutes relative to sunrise (dawn) and sunset
+ * (dusk); the defaults cover roughly civil twilight. */
+#define SCHEDULE_DEFAULT_DAWN_START (-30)
+#define SCHEDULE_DEFAULT_DAWN_END 30
+#define SCHEDULE_DEFAULT_DUSK_START (-30)
+#define SCHEDULE_DEFAULT_DUSK_END 30
+#define SCHEDULE_MAX_OFFSET (6 * 60)
+#define SCHEDULE_MIN_GAP 5
+#define SCHEDULE_DEFAULT_RESET_MINUTES (4 * 60)
 
 /* ── WebView2 COM interface definitions (minimal vtable approach) ─────── */
 
@@ -320,10 +350,36 @@ typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
 
 /* ── Configuration and monitor model ─────────────────────────────────────── */
 
+/* Sun-based automatic brightness: the day/night levels and four transition
+ * anchors (minutes relative to sunrise and sunset) that shape the curve. */
+typedef struct {
+    BOOL enabled;
+    BOOL hasLocation;
+    double latitude;          /* degrees, north positive */
+    double longitude;         /* degrees, east positive */
+    int dayLevel;             /* -SOFT_MAX_DIM..100 */
+    int nightLevel;
+    int dawnStartOffset;      /* night level until here (sunrise + offset) */
+    int dawnEndOffset;        /* day level from here (sunrise + offset) */
+    int duskStartOffset;      /* day level until here (sunset + offset) */
+    int duskEndOffset;        /* night level from here (sunset + offset) */
+    int cycleResetMinutes;    /* time of day when manual overrides expire */
+} Schedule;
+
 typedef struct {
     BOOL allowBelowMinimum;   /* let hardware monitors dim further in software */
     BOOL debugLogEnabled;
+    Schedule schedule;
 } Configuration;
+
+/* Sunrise, sunset, and solar noon for one local date, in local minutes
+ * since midnight (may fall outside 0..1439 near the date line). */
+typedef struct {
+    int polar;                /* 0 normal, 1 sun never sets, -1 sun never rises */
+    int sunrise;
+    int sunset;
+    int noon;
+} SolarDay;
 
 typedef enum {
     HW_UNKNOWN = 0,   /* probe in flight */
@@ -356,6 +412,8 @@ typedef struct {
     BOOL hasOriginal;             /* original DDC/CI value recorded */
     DWORD originalRaw;            /* raw VCP value at first sighting */
     DWORD originalMax;            /* its maximum, for display as a percent */
+    BOOL scheduled;               /* follows the automatic brightness schedule */
+    ULONGLONG pausedUntil;        /* UTC FILETIME; automation resumes after a manual change */
     int value;                    /* desired brightness, -SOFT_MAX_DIM..100 */
     BOOL hasValue;
     int lastHwSent;               /* last percent handed to the worker, -1 = none */
@@ -462,6 +520,13 @@ static void CreateTrayIcon(HWND hwnd);
 static void RefreshTrayIcon(void);
 static void RemoveTrayIcon(void);
 static void ShowContextMenu(HWND hwnd);
+static BOOL ScheduleTargetNow(int* value);
+static void EvaluateSchedule(void);
+static void NoteManualChange(Monitor* m);
+static void UpdateScheduleTimer(void);
+static ULONGLONG NowFileTime(void);
+static BOOL IsSchedulePaused(const Monitor* m, ULONGLONG nowFt);
+static void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count);
 
 /* ── Debug logging ───────────────────────────────────────────────────────── */
 
@@ -558,8 +623,80 @@ static BOOL WriteRegistryDword(HKEY hKey, const wchar_t* name, DWORD value) {
                           sizeof(value)) == ERROR_SUCCESS;
 }
 
+/* Signed values are stored as two's complement DWORDs. */
+static BOOL ReadRegistryInt(HKEY hKey, const wchar_t* name, int* out, int min, int max) {
+    DWORD value = 0;
+    DWORD dataSize = sizeof(value);
+    DWORD dataType = 0;
+    if (RegQueryValueExW(hKey, name, NULL, &dataType, (LPBYTE)&value, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_DWORD) {
+        return FALSE;
+    }
+    int v = (int)(LONG)value;
+    if (v < min) v = min;
+    if (v > max) v = max;
+    *out = v;
+    return TRUE;
+}
+
+static BOOL ReadRegistryQword(HKEY hKey, const wchar_t* name, ULONGLONG* out) {
+    ULONGLONG value = 0;
+    DWORD dataSize = sizeof(value);
+    DWORD dataType = 0;
+    if (RegQueryValueExW(hKey, name, NULL, &dataType, (LPBYTE)&value, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_QWORD) {
+        return FALSE;
+    }
+    *out = value;
+    return TRUE;
+}
+
+static BOOL WriteRegistryQword(HKEY hKey, const wchar_t* name, ULONGLONG value) {
+    return RegSetValueExW(hKey, name, 0, REG_QWORD, (const BYTE*)&value,
+                          sizeof(value)) == ERROR_SUCCESS;
+}
+
+/* Coordinates are stored as text so they survive any rounding rules. */
+static BOOL ReadRegistryDouble(HKEY hKey, const wchar_t* name, double* out) {
+    wchar_t text[64];
+    DWORD dataSize = sizeof(text) - sizeof(wchar_t);
+    DWORD dataType = 0;
+    if (RegQueryValueExW(hKey, name, NULL, &dataType, (LPBYTE)text, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_SZ) {
+        return FALSE;
+    }
+    text[dataSize / sizeof(wchar_t)] = L'\0';
+    wchar_t* end = NULL;
+    double value = wcstod(text, &end);
+    if (end == text) return FALSE;
+    *out = value;
+    return TRUE;
+}
+
+static BOOL WriteRegistryDouble(HKEY hKey, const wchar_t* name, double value) {
+    wchar_t text[64];
+    swprintf_s(text, sizeof(text) / sizeof(wchar_t), L"%.6f", value);
+    return RegSetValueExW(hKey, name, 0, REG_SZ, (const BYTE*)text,
+                          (DWORD)((wcslen(text) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+}
+
+static void SetScheduleDefaults(Schedule* schedule) {
+    ZeroMemory(schedule, sizeof(*schedule));
+    schedule->dayLevel = SCHEDULE_DEFAULT_DAY;
+    schedule->nightLevel = SCHEDULE_DEFAULT_NIGHT;
+    schedule->dawnStartOffset = SCHEDULE_DEFAULT_DAWN_START;
+    schedule->dawnEndOffset = SCHEDULE_DEFAULT_DAWN_END;
+    schedule->duskStartOffset = SCHEDULE_DEFAULT_DUSK_START;
+    schedule->duskEndOffset = SCHEDULE_DEFAULT_DUSK_END;
+    schedule->cycleResetMinutes = SCHEDULE_DEFAULT_RESET_MINUTES;
+}
+
+static BOOL IsValidLatitude(double v) { return v >= -90.0 && v <= 90.0; }
+static BOOL IsValidLongitude(double v) { return v >= -180.0 && v <= 180.0; }
+
 static BOOL LoadConfigFromRegistry(Configuration* config) {
     ZeroMemory(config, sizeof(*config));
+    SetScheduleDefaults(&config->schedule);
 
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -567,6 +704,25 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     }
     ReadRegistryBool(hKey, REG_VALUE_DEBUGLOG, &config->debugLogEnabled);
     ReadRegistryBool(hKey, REG_VALUE_ALLOW_BELOW_MIN, &config->allowBelowMinimum);
+
+    Schedule* sc = &config->schedule;
+    ReadRegistryBool(hKey, REG_VALUE_SCHEDULE_ENABLED, &sc->enabled);
+    double latitude = 0, longitude = 0;
+    if (ReadRegistryDouble(hKey, REG_VALUE_LATITUDE, &latitude) &&
+        ReadRegistryDouble(hKey, REG_VALUE_LONGITUDE, &longitude) &&
+        IsValidLatitude(latitude) && IsValidLongitude(longitude)) {
+        sc->latitude = latitude;
+        sc->longitude = longitude;
+        sc->hasLocation = TRUE;
+    }
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DAY, &sc->dayLevel, -SOFT_MAX_DIM, 100);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_NIGHT, &sc->nightLevel, -SOFT_MAX_DIM, 100);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DAWN_START, &sc->dawnStartOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DAWN_END, &sc->dawnEndOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DUSK_START, &sc->duskStartOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DUSK_END, &sc->duskEndOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    ReadRegistryInt(hKey, REG_VALUE_CYCLE_RESET, &sc->cycleResetMinutes, 0, 1439);
+    if (!sc->hasLocation) sc->enabled = FALSE;
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -583,6 +739,20 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     BOOL success = TRUE;
     if (!WriteRegistryDword(hKey, REG_VALUE_DEBUGLOG, config->debugLogEnabled ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_ALLOW_BELOW_MIN, config->allowBelowMinimum ? 1 : 0)) success = FALSE;
+
+    const Schedule* sc = &config->schedule;
+    if (!WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_ENABLED, sc->enabled ? 1 : 0)) success = FALSE;
+    if (sc->hasLocation) {
+        if (!WriteRegistryDouble(hKey, REG_VALUE_LATITUDE, sc->latitude)) success = FALSE;
+        if (!WriteRegistryDouble(hKey, REG_VALUE_LONGITUDE, sc->longitude)) success = FALSE;
+    }
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DAY, (DWORD)(LONG)sc->dayLevel);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_NIGHT, (DWORD)(LONG)sc->nightLevel);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DAWN_START, (DWORD)(LONG)sc->dawnStartOffset);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DAWN_END, (DWORD)(LONG)sc->dawnEndOffset);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DUSK_START, (DWORD)(LONG)sc->duskStartOffset);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DUSK_END, (DWORD)(LONG)sc->duskEndOffset);
+    WriteRegistryDword(hKey, REG_VALUE_CYCLE_RESET, (DWORD)sc->cycleResetMinutes);
     RegCloseKey(hKey);
     return success;
 }
@@ -619,6 +789,8 @@ static void LoadMonitorSettings(Monitor* m) {
     }
     ReadRegistryBool(hKey, REG_VALUE_MON_SOFTWARE_ONLY, &m->forceSoftware);
     ReadRegistryBool(hKey, REG_VALUE_MON_HIDDEN, &m->hidden);
+    ReadRegistryBool(hKey, REG_VALUE_MON_SCHEDULED, &m->scheduled);
+    ReadRegistryQword(hKey, REG_VALUE_MON_PAUSED_UNTIL, &m->pausedUntil);
     DWORD original = 0, originalMax = 0;
     DWORD originalSize = sizeof(original), originalMaxSize = sizeof(originalMax);
     if (RegQueryValueExW(hKey, REG_VALUE_MON_ORIGINAL, NULL, &dataType,
@@ -645,6 +817,8 @@ static void SaveMonitorSettings(const Monitor* m) {
     }
     WriteRegistryDword(hKey, REG_VALUE_MON_SOFTWARE_ONLY, m->forceSoftware ? 1 : 0);
     WriteRegistryDword(hKey, REG_VALUE_MON_HIDDEN, m->hidden ? 1 : 0);
+    WriteRegistryDword(hKey, REG_VALUE_MON_SCHEDULED, m->scheduled ? 1 : 0);
+    WriteRegistryQword(hKey, REG_VALUE_MON_PAUSED_UNTIL, m->pausedUntil);
     if (m->hasOriginal) {
         WriteRegistryDword(hKey, REG_VALUE_MON_ORIGINAL, m->originalRaw);
         WriteRegistryDword(hKey, REG_VALUE_MON_ORIGINAL_MAX, m->originalMax);
@@ -1621,6 +1795,22 @@ static void UnhideAllMonitors(void) {
     RegCloseKey(hMonitors);
 }
 
+/* Right after a probe the mode is known, so a scheduled monitor can take
+ * the schedule's current value instead of first restoring a stale one. */
+static void ApplyScheduleAfterProbe(Monitor* m) {
+    int target;
+    if (!m->scheduled || m->hidden || !ScheduleTargetNow(&target)) return;
+    if (IsSchedulePaused(m, NowFileTime())) return;
+    int value = ClampMonitorValue(m, target);
+    if (!m->hasValue || m->value != value) {
+        m->value = value;
+        m->hasValue = TRUE;
+        m->dirty = TRUE;
+        SchedulePersist();
+        DebugPrint(L"[INFO] %s (%s): schedule sets %d%% after probe\n", m->name, m->device, value);
+    }
+}
+
 static void HandleDdcProbed(DdcProbeResult* r) {
     Monitor* m = FindMonitorByUid(r->uid);
     if (m) {
@@ -1651,6 +1841,7 @@ static void HandleDdcProbed(DdcProbeResult* r) {
                 m->dirty = TRUE;
                 SchedulePersist();
             }
+            ApplyScheduleAfterProbe(m);
             /* Already at the wanted level: no write needed. */
             m->lastHwSent = (m->value == percent) ? percent : -1;
             DebugPrint(L"[INFO] %s (%s): DDC/CI brightness available, current %lu/%lu (%lu ms)\n",
@@ -1664,6 +1855,7 @@ static void HandleDdcProbed(DdcProbeResult* r) {
                 m->dirty = TRUE;
                 SchedulePersist();
             }
+            ApplyScheduleAfterProbe(m);
             DebugPrint(L"[INFO] %s (%s): no DDC/CI brightness (error %lu, %lu ms); using software dimming\n",
                        m->name, m->device, (unsigned long)r->error,
                        (unsigned long)r->elapsedMs);
@@ -1709,6 +1901,281 @@ static void HandleDdcSetResult(int uid, BOOL success) {
                  L"The monitor did not accept the last brightness change.");
     }
     PushMonitorsToDialog();
+}
+
+/* ── Automatic brightness schedule ───────────────────────────────────────── */
+
+#define PI_D 3.14159265358979323846
+#define DEG2RAD(d) ((d) * PI_D / 180.0)
+#define RAD2DEG(r) ((r) * 180.0 / PI_D)
+
+static double JulianDay(int year, int month, int day) {
+    if (month <= 2) {
+        year -= 1;
+        month += 12;
+    }
+    int a = year / 100;
+    int b = 2 - a + a / 4;
+    return floor(365.25 * (year + 4716)) + floor(30.6001 * (month + 1)) + day + b - 1524.5;
+}
+
+static int DayNumber(const SYSTEMTIME* st) {
+    return (int)floor(JulianDay(st->wYear, st->wMonth, st->wDay) + 0.5);
+}
+
+/* NOAA solar position equations: solar noon (minutes after 0h UTC of the
+ * date) and the sunrise/sunset hour angle in degrees. cosHA outside -1..1
+ * means the sun never rises (> 1) or never sets (< -1) that day. */
+static void SolarNoonAndHourAngle(double latitude, double longitude, double julianDay,
+                                  double* noonUtcMinutes, double* cosHourAngle, double* hourAngle) {
+    double t = (julianDay - 2451545.0) / 36525.0;
+    double l0 = fmod(280.46646 + t * (36000.76983 + t * 0.0003032), 360.0);
+    if (l0 < 0) l0 += 360.0;
+    double m = 357.52911 + t * (35999.05029 - 0.0001537 * t);
+    double e = 0.016708634 - t * (0.000042037 + 0.0000001267 * t);
+    double mr = DEG2RAD(m);
+    double c = sin(mr) * (1.914602 - t * (0.004817 + 0.000014 * t)) +
+               sin(2 * mr) * (0.019993 - 0.000101 * t) + sin(3 * mr) * 0.000289;
+    double trueLongitude = l0 + c;
+    double omega = 125.04 - 1934.136 * t;
+    double lambda = trueLongitude - 0.00569 - 0.00478 * sin(DEG2RAD(omega));
+    double epsilon0 = 23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0;
+    double epsilon = epsilon0 + 0.00256 * cos(DEG2RAD(omega));
+    double declination = asin(sin(DEG2RAD(epsilon)) * sin(DEG2RAD(lambda)));
+    double y = tan(DEG2RAD(epsilon) / 2.0);
+    y *= y;
+    double l0r = DEG2RAD(l0);
+    double equationOfTime = 4.0 * RAD2DEG(
+        y * sin(2 * l0r) - 2 * e * sin(mr) + 4 * e * y * sin(mr) * cos(2 * l0r) -
+        0.5 * y * y * sin(4 * l0r) - 1.25 * e * e * sin(2 * mr));
+    *noonUtcMinutes = 720.0 - 4.0 * longitude - equationOfTime;
+    double latr = DEG2RAD(latitude);
+    /* 90.833 degrees: the sun's upper limb at the horizon with refraction. */
+    double cosHa = cos(DEG2RAD(90.833)) / (cos(latr) * cos(declination)) - tan(latr) * tan(declination);
+    *cosHourAngle = cosHa;
+    *hourAngle = (cosHa >= -1.0 && cosHa <= 1.0) ? RAD2DEG(acos(cosHa)) : 0.0;
+}
+
+/* Minutes after local midnight of localDate for the instant "0h UTC of
+ * the same calendar date plus utcMinutes", using the current time zone
+ * rules (so DST is right). May be negative or beyond 1439. */
+static int UtcMinutesToLocalMinutes(const SYSTEMTIME* localDate, double utcMinutes) {
+    SYSTEMTIME utcMidnight;
+    ZeroMemory(&utcMidnight, sizeof(utcMidnight));
+    utcMidnight.wYear = localDate->wYear;
+    utcMidnight.wMonth = localDate->wMonth;
+    utcMidnight.wDay = localDate->wDay;
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&utcMidnight, &ft)) return (int)lround(utcMinutes);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    LONGLONG offset = (LONGLONG)(utcMinutes * 60.0 * 10000000.0);
+    u.QuadPart = (ULONGLONG)((LONGLONG)u.QuadPart + offset);
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SYSTEMTIME utcInstant, localInstant;
+    if (!FileTimeToSystemTime(&ft, &utcInstant) ||
+        !SystemTimeToTzSpecificLocalTime(NULL, &utcInstant, &localInstant)) {
+        return (int)lround(utcMinutes);
+    }
+    int dayDifference = DayNumber(&localInstant) - DayNumber(localDate);
+    return dayDifference * 1440 + localInstant.wHour * 60 + localInstant.wMinute;
+}
+
+static void ComputeSolarDay(double latitude, double longitude, const SYSTEMTIME* localDate, SolarDay* out) {
+    ZeroMemory(out, sizeof(*out));
+    double jd = JulianDay(localDate->wYear, localDate->wMonth, localDate->wDay);
+    double noonUtc, cosHa, ha;
+    SolarNoonAndHourAngle(latitude, longitude, jd, &noonUtc, &cosHa, &ha);
+    out->noon = UtcMinutesToLocalMinutes(localDate, noonUtc);
+    if (cosHa > 1.0) {
+        out->polar = -1;
+        out->sunrise = out->sunset = out->noon;
+    } else if (cosHa < -1.0) {
+        out->polar = 1;
+        out->sunrise = out->sunset = out->noon;
+    } else {
+        out->sunrise = UtcMinutesToLocalMinutes(localDate, noonUtc - ha * 4.0);
+        out->sunset = UtcMinutesToLocalMinutes(localDate, noonUtc + ha * 4.0);
+    }
+}
+
+/* The four anchors in local minutes, forced into order with a small gap so
+ * a dragged transition can never invert. */
+static void ScheduleAnchors(const Schedule* sc, const SolarDay* day, int anchors[4]) {
+    anchors[0] = day->sunrise + sc->dawnStartOffset;
+    anchors[1] = day->sunrise + sc->dawnEndOffset;
+    anchors[2] = day->sunset + sc->duskStartOffset;
+    anchors[3] = day->sunset + sc->duskEndOffset;
+    for (int i = 1; i < 4; i++) {
+        if (anchors[i] < anchors[i - 1] + SCHEDULE_MIN_GAP) anchors[i] = anchors[i - 1] + SCHEDULE_MIN_GAP;
+    }
+}
+
+static double SmoothStep(double x) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    return x * x * (3 - 2 * x);
+}
+
+/* Brightness at a local time (minutes, fractional) on the given day. */
+static int ScheduleValueAt(const Schedule* sc, const SolarDay* day, double minutes) {
+    if (day->polar > 0) return sc->dayLevel;
+    if (day->polar < 0) return sc->nightLevel;
+    int a[4];
+    ScheduleAnchors(sc, day, a);
+    /* A dusk that ends after midnight (or a dawn that starts before it)
+     * belongs to the neighbouring calendar day; test the shifted times too. */
+    double candidates[3] = { minutes, minutes + 1440, minutes - 1440 };
+    double t = minutes;
+    for (int i = 0; i < 3; i++) {
+        if (candidates[i] >= a[0] && candidates[i] <= a[3]) {
+            t = candidates[i];
+            break;
+        }
+    }
+    double night = sc->nightLevel, dayLevel = sc->dayLevel, v;
+    if (t <= a[0] || t >= a[3]) {
+        v = night;
+    } else if (t < a[1]) {
+        v = night + (dayLevel - night) * SmoothStep((t - a[0]) / (double)(a[1] - a[0]));
+    } else if (t <= a[2]) {
+        v = dayLevel;
+    } else {
+        v = dayLevel + (night - dayLevel) * SmoothStep((t - a[2]) / (double)(a[3] - a[2]));
+    }
+    return (int)lround(v);
+}
+
+static ULONGLONG NowFileTime(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+/* The next occurrence of the cycle reset time of day, as a UTC FILETIME. */
+static ULONGLONG NextCycleResetFileTime(void) {
+    SYSTEMTIME local;
+    GetLocalTime(&local);
+    int nowMinutes = local.wHour * 60 + local.wMinute;
+    SYSTEMTIME reset = local;
+    reset.wHour = (WORD)(g_config.schedule.cycleResetMinutes / 60);
+    reset.wMinute = (WORD)(g_config.schedule.cycleResetMinutes % 60);
+    reset.wSecond = 0;
+    reset.wMilliseconds = 0;
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&reset, &ft)) return 0;   /* treated as a local wall clock */
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    if (g_config.schedule.cycleResetMinutes <= nowMinutes) {
+        u.QuadPart += 24ULL * 60 * 60 * 10000000;   /* tomorrow */
+    }
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SYSTEMTIME localReset, utcReset;
+    if (!FileTimeToSystemTime(&ft, &localReset) ||
+        !TzSpecificLocalTimeToSystemTime(NULL, &localReset, &utcReset) ||
+        !SystemTimeToFileTime(&utcReset, &ft)) {
+        return 0;
+    }
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+static void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count) {
+    out[0] = L'\0';
+    if (!ft) return;
+    FILETIME f;
+    ULARGE_INTEGER u;
+    u.QuadPart = ft;
+    f.dwLowDateTime = u.LowPart;
+    f.dwHighDateTime = u.HighPart;
+    SYSTEMTIME utc, local;
+    if (FileTimeToSystemTime(&f, &utc) && SystemTimeToTzSpecificLocalTime(NULL, &utc, &local)) {
+        swprintf_s(out, count, L"%02u:%02u", (unsigned)local.wHour, (unsigned)local.wMinute);
+    }
+}
+
+static BOOL IsSchedulePaused(const Monitor* m, ULONGLONG nowFt) {
+    return m->pausedUntil != 0 && m->pausedUntil > nowFt;
+}
+
+/* The value the schedule wants right now, or FALSE when it is off. */
+static BOOL ScheduleTargetNow(int* value) {
+    const Schedule* sc = &g_config.schedule;
+    if (!sc->enabled || !sc->hasLocation) return FALSE;
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    SolarDay day;
+    ComputeSolarDay(sc->latitude, sc->longitude, &now, &day);
+    double minutes = now.wHour * 60 + now.wMinute + now.wSecond / 60.0;
+    *value = ScheduleValueAt(sc, &day, minutes);
+    return TRUE;
+}
+
+/* Applies the current schedule value to every scheduled, unpaused monitor.
+ * Runs on the schedule timer and after anything that changes the inputs. */
+static void EvaluateSchedule(void) {
+    int target;
+    if (!ScheduleTargetNow(&target)) return;
+    ULONGLONG now = NowFileTime();
+    BOOL changed = FALSE;
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        if (!m->scheduled || m->hidden) continue;
+        if (m->pausedUntil) {
+            if (m->pausedUntil > now) continue;
+            m->pausedUntil = 0;
+            m->dirty = TRUE;
+            changed = TRUE;
+            DebugPrint(L"[INFO] %s (%s): automatic brightness resumed\n", m->name, m->device);
+        }
+        if (MonitorMode(m) == MODE_PROBING) continue;
+        int value = ClampMonitorValue(m, target);
+        if (!m->hasValue || m->value != value) {
+            DebugPrint(L"[INFO] %s (%s): schedule sets %d%%\n", m->name, m->device, value);
+            m->value = value;
+            m->hasValue = TRUE;
+            m->dirty = TRUE;
+            ApplyMonitor(m);
+            changed = TRUE;
+        }
+    }
+    if (changed) {
+        SchedulePersist();
+        PushMonitorsToDialog();
+    }
+}
+
+/* A manual brightness change on a scheduled monitor suspends automation
+ * for it until the next cycle reset time. */
+static void NoteManualChange(Monitor* m) {
+    if (!g_config.schedule.enabled || !m->scheduled || m->hidden) return;
+    ULONGLONG now = NowFileTime();
+    if (IsSchedulePaused(m, now)) return;
+    m->pausedUntil = NextCycleResetFileTime();
+    m->dirty = TRUE;
+    SchedulePersist();
+    wchar_t until[16];
+    FormatLocalTimeOfDay(m->pausedUntil, until, 16);
+    DebugPrint(L"[INFO] %s (%s): manual change; automatic brightness paused until %s\n",
+               m->name, m->device, until);
+    PushMonitorsToDialog();
+}
+
+static void UpdateScheduleTimer(void) {
+    if (!g_hwnd) return;
+    if (g_config.schedule.enabled && g_config.schedule.hasLocation) {
+        SetTimer(g_hwnd, ID_TIMER_SCHEDULE, SCHEDULE_INTERVAL_MS, NULL);
+    } else {
+        KillTimer(g_hwnd, ID_TIMER_SCHEDULE);
+    }
 }
 
 /* ── WebView2 loader ─────────────────────────────────────────────────────── */
@@ -1805,9 +2272,11 @@ static wchar_t* BuildMonitorsJson(void) {
     size_t len = 0;
     buf[len++] = L'[';
     buf[len] = L'\0';
+    ULONGLONG nowFt = NowFileTime();
     for (int i = 0; i < g_monitorCount; i++) {
         const Monitor* m = &g_monitors[i];
-        wchar_t eKey[256], eName[128], eDevice[64], eError[320];
+        wchar_t eKey[256], eName[128], eDevice[64], eError[320], pausedUntil[16] = L"";
+        if (IsSchedulePaused(m, nowFt)) FormatLocalTimeOfDay(m->pausedUntil, pausedUntil, 16);
         json_escape_wstring(m->key, eKey, 256);
         json_escape_wstring(m->name, eName, 128);
         json_escape_wstring(m->device, eDevice, 64);
@@ -1816,13 +2285,15 @@ static wchar_t* BuildMonitorsJson(void) {
             L"%s{\"uid\":%d,\"key\":\"%s\",\"name\":\"%s\",\"device\":\"%s\","
             L"\"width\":%ld,\"height\":%ld,\"primary\":%s,\"hardware\":\"%s\","
             L"\"mode\":\"%s\",\"forceSoftware\":%s,\"hidden\":%s,\"value\":%d,"
-            L"\"min\":%d,\"max\":100,\"error\":\"%s\"}",
+            L"\"min\":%d,\"max\":100,\"scheduled\":%s,\"pausedUntil\":\"%s\","
+            L"\"error\":\"%s\"}",
             i == 0 ? L"" : L",", m->uid, eKey, eName, eDevice,
             (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
             m->primary ? L"true" : L"false", HardwareStateName(m->hardwareState),
             ModeName(MonitorMode(m)), m->forceSoftware ? L"true" : L"false",
             m->hidden ? L"true" : L"false",
-            m->hasValue ? m->value : 100, MonitorMinValue(m), eError);
+            m->hasValue ? m->value : 100, MonitorMinValue(m),
+            m->scheduled ? L"true" : L"false", pausedUntil, eError);
         if (written > 0) len += (size_t)written;
     }
     if (len + 2 <= cap) {
@@ -1836,14 +2307,23 @@ static void webview_push_init_config(void) {
     wchar_t* monitors = BuildMonitorsJson();
     if (!monitors) return;
 
-    const size_t cap = wcslen(monitors) + 512;
+    const Schedule* sc = &g_config.schedule;
+    const size_t cap = wcslen(monitors) + 1024;
     wchar_t* script = (wchar_t*)malloc(cap * sizeof(wchar_t));
     if (script) {
         int written = swprintf_s(script, cap,
-            L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s},"
+            L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
+            L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
+            L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
+            L"\"dawnStartOffset\":%d,\"dawnEndOffset\":%d,\"duskStartOffset\":%d,"
+            L"\"duskEndOffset\":%d,\"cycleResetMinutes\":%d}},"
             L"\"monitors\":%s})",
             g_config.allowBelowMinimum ? L"true" : L"false",
             g_config.debugLogEnabled ? L"true" : L"false",
+            sc->enabled ? L"true" : L"false", sc->hasLocation ? L"true" : L"false",
+            sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
+            sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset,
+            sc->duskEndOffset, sc->cycleResetMinutes,
             monitors);
         if (written > 0) webview_cfg_execute_script(script);
         free(script);
@@ -2082,6 +2562,69 @@ static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
     return S_OK;
 }
 
+static int ClampInt(int value, int min, int max) {
+    return value < min ? min : (value > max ? max : value);
+}
+
+/* Reads the schedule part of a saveSettings message. Saving the schedule
+ * counts as a deliberate change, so any paused monitors resume. */
+static void SaveScheduleFromMessage(const char* msg) {
+    Schedule* sc = &g_config.schedule;
+    char latitude[64] = {0}, longitude[64] = {0}, scheduledUids[512] = {0};
+    json_get_string(msg, "latitude", latitude, sizeof(latitude));
+    json_get_string(msg, "longitude", longitude, sizeof(longitude));
+    json_get_string(msg, "scheduledUids", scheduledUids, sizeof(scheduledUids));
+
+    char* end = NULL;
+    double lat = strtod(latitude, &end);
+    BOOL latOk = end != latitude && IsValidLatitude(lat);
+    double lon = strtod(longitude, &end);
+    BOOL lonOk = end != longitude && IsValidLongitude(lon);
+    if (latOk && lonOk) {
+        sc->latitude = lat;
+        sc->longitude = lon;
+        sc->hasLocation = TRUE;
+    }
+
+    int v;
+    if (json_get_int(msg, "dayLevel", &v)) sc->dayLevel = ClampInt(v, -SOFT_MAX_DIM, 100);
+    if (json_get_int(msg, "nightLevel", &v)) sc->nightLevel = ClampInt(v, -SOFT_MAX_DIM, 100);
+    if (json_get_int(msg, "dawnStartOffset", &v)) sc->dawnStartOffset = ClampInt(v, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    if (json_get_int(msg, "dawnEndOffset", &v)) sc->dawnEndOffset = ClampInt(v, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    if (json_get_int(msg, "duskStartOffset", &v)) sc->duskStartOffset = ClampInt(v, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    if (json_get_int(msg, "duskEndOffset", &v)) sc->duskEndOffset = ClampInt(v, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
+    if (json_get_int(msg, "cycleResetMinutes", &v)) sc->cycleResetMinutes = ClampInt(v, 0, 1439);
+    sc->enabled = json_get_bool(msg, "scheduleEnabled", FALSE) && sc->hasLocation;
+
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        BOOL scheduled = FALSE;
+        const char* p = scheduledUids;
+        while (*p) {
+            char* next = NULL;
+            long uid = strtol(p, &next, 10);
+            if (next == p) break;
+            if ((int)uid == m->uid) scheduled = TRUE;
+            p = next;
+            while (*p == ',' || *p == ' ') p++;
+        }
+        if (m->scheduled != scheduled || m->pausedUntil) {
+            m->scheduled = scheduled;
+            m->pausedUntil = 0;
+            m->dirty = TRUE;
+        }
+    }
+    PersistDirtyMonitors();
+
+    DebugPrint(L"[INFO] Schedule %s: lat %.4f lon %.4f, day %d%% night %d%%, dawn %+d/%+d, dusk %+d/%+d, reset %02d:%02d\n",
+               sc->enabled ? L"enabled" : L"disabled", sc->latitude, sc->longitude,
+               sc->dayLevel, sc->nightLevel, sc->dawnStartOffset, sc->dawnEndOffset,
+               sc->duskStartOffset, sc->duskEndOffset,
+               sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60);
+    UpdateScheduleTimer();
+    EvaluateSchedule();
+}
+
 static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     ICoreWebView2WebMessageReceivedEventHandler *This,
     ICoreWebView2 *sender,
@@ -2107,13 +2650,18 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         int uid = -1, value = 0;
         if (json_get_int(msg, "uid", &uid) && json_get_int(msg, "value", &value)) {
             Monitor* m = FindMonitorByUid(uid);
-            if (m) SetMonitorValue(m, value);
+            if (m) {
+                SetMonitorValue(m, value);
+                NoteManualChange(m);
+            }
         }
     } else if (strcmp(action, "setAllBrightness") == 0) {
         int value = 0;
         if (json_get_int(msg, "value", &value)) {
             for (int i = 0; i < g_monitorCount; i++) {
-                if (!g_monitors[i].hidden) SetMonitorValue(&g_monitors[i], value);
+                if (g_monitors[i].hidden) continue;
+                SetMonitorValue(&g_monitors[i], value);
+                NoteManualChange(&g_monitors[i]);
             }
         }
     } else if (strcmp(action, "setMonitorSoftwareOnly") == 0) {
@@ -2182,8 +2730,20 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         DebugPrint(L"[INFO] Rescan requested from the configuration dialog\n");
         UnhideAllMonitors();
         RefreshMonitors();
+    } else if (strcmp(action, "resumeSchedule") == 0) {
+        int uid = -1;
+        Monitor* m = json_get_int(msg, "uid", &uid) ? FindMonitorByUid(uid) : NULL;
+        if (m && m->pausedUntil) {
+            m->pausedUntil = 0;
+            m->dirty = TRUE;
+            DebugPrint(L"[INFO] %s (%s): automatic brightness resumed by the user\n", m->name, m->device);
+            EvaluateSchedule();
+            SchedulePersist();
+            PushMonitorsToDialog();
+        }
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
+        SaveScheduleFromMessage(msg);
         InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
         if (!SaveConfigToRegistry(&g_config)) {
             DebugPrint(L"[WARNING] Could not save all settings to the registry\n");
@@ -2482,6 +3042,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     KillTimer(hwnd, ID_TIMER_PERSIST);
                     PersistDirtyMonitors();
                     return 0;
+                case ID_TIMER_SCHEDULE:
+                    EvaluateSchedule();
+                    return 0;
             }
             break;
 
@@ -2637,6 +3200,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_hwnd, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
     RefreshMonitors();
     SetTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST, OVERLAY_TOPMOST_INTERVAL_MS, NULL);
+    UpdateScheduleTimer();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -2648,6 +3212,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_REFRESH_MONITORS);
     KillTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST);
     KillTimer(g_hwnd, ID_TIMER_PERSIST);
+    KillTimer(g_hwnd, ID_TIMER_SCHEDULE);
     PersistDirtyMonitors();
     DestroyAllOverlays();
     StopDdcWorker();

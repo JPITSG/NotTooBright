@@ -14,6 +14,10 @@ export interface MonitorData {
   forceSoftware: boolean;
   // Removed from the dialog and left alone until the next rescan.
   hidden: boolean;
+  // Follows the sun-based schedule; pausedUntil is "HH:MM" while a manual
+  // change has suspended it, otherwise "".
+  scheduled: boolean;
+  pausedUntil: string;
   // Desired brightness. 0..100 drives the backlight on hardware monitors;
   // negative values (only when allowed) add software dimming below the
   // backlight's minimum. Software-only monitors use min..100.
@@ -23,9 +27,38 @@ export interface MonitorData {
   error: string;
 }
 
+export interface ScheduleData {
+  enabled: boolean;
+  hasLocation: boolean;
+  latitude: number;
+  longitude: number;
+  dayLevel: number;
+  nightLevel: number;
+  dawnStartOffset: number;
+  dawnEndOffset: number;
+  duskStartOffset: number;
+  duskEndOffset: number;
+  cycleResetMinutes: number;
+}
+
 export interface ConfigData {
   allowBelowMinimum: boolean;
   debugLog: boolean;
+  schedule: ScheduleData;
+}
+
+export interface ScheduleSettings {
+  enabled: boolean;
+  latitude: string;
+  longitude: string;
+  dayLevel: number;
+  nightLevel: number;
+  dawnStartOffset: number;
+  dawnEndOffset: number;
+  duskStartOffset: number;
+  duskEndOffset: number;
+  cycleResetMinutes: number;
+  scheduledUids: number[];
 }
 
 export interface InitData {
@@ -93,10 +126,25 @@ export function refreshMonitors() {
   post({ action: "refreshMonitors" });
 }
 
-export function saveSettings(config: Pick<ConfigData, "debugLog">) {
+export function resumeSchedule(uid: number) {
+  post({ action: "resumeSchedule", uid });
+}
+
+export function saveSettings(debugLog: boolean, schedule: ScheduleSettings) {
   post({
     action: "saveSettings",
-    debugLog: config.debugLog,
+    debugLog,
+    scheduleEnabled: schedule.enabled,
+    latitude: schedule.latitude,
+    longitude: schedule.longitude,
+    dayLevel: schedule.dayLevel,
+    nightLevel: schedule.nightLevel,
+    dawnStartOffset: schedule.dawnStartOffset,
+    dawnEndOffset: schedule.dawnEndOffset,
+    duskStartOffset: schedule.duskStartOffset,
+    duskEndOffset: schedule.duskEndOffset,
+    cycleResetMinutes: schedule.cycleResetMinutes,
+    scheduledUids: schedule.scheduledUids.join(","),
   });
 }
 
@@ -104,11 +152,32 @@ export function closeDialog() {
   post({ action: "close" });
 }
 
-// The height the page wants the host window to provide, in CSS pixels. The
+// The size the page wants the host window to provide, in CSS pixels. The
 // host converts it to physical pixels, adds the window frame, clamps the
-// result to the monitor's work area, and re-centers the dialog.
+// result to the monitor's work area, and re-centers the dialog. The width
+// switches between the single- and two-column layouts.
+export const SINGLE_COLUMN_WIDTH = 480;
+export const TWO_COLUMN_WIDTH = 2 * SINGLE_COLUMN_WIDTH + 40;
+
+let desiredContentWidth = SINGLE_COLUMN_WIDTH;
+// The window starts at the single-column width; a width is only sent when
+// the layout changes, so a user who widened the dialog by hand keeps it.
+let lastSentWidth = SINGLE_COLUMN_WIDTH;
+
+export function setDesiredContentWidth(width: number) {
+  desiredContentWidth = width;
+}
+
 export function reportSize(height: number) {
-  post({ action: "resize", height });
+  const message: { action: string; height: number; width?: number } = {
+    action: "resize",
+    height,
+  };
+  if (desiredContentWidth !== lastSentWidth) {
+    message.width = desiredContentWidth;
+    lastSentWidth = desiredContentWidth;
+  }
+  post(message);
 }
 
 declare global {
