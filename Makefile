@@ -42,7 +42,7 @@ CFLAGS += -mwindows -Wall -Wextra -I.
 # sources yields a byte-identical executable, so the tracked release binary
 # only changes when the program does.
 LDFLAGS += -mwindows -static -Wl,--no-insert-timestamp
-LIBS = -luser32 -lgdi32 -lshell32 -lshlwapi -ladvapi32 -lole32 -luuid
+LIBS = -luser32 -lgdi32 -lshell32 -lshlwapi -ladvapi32 -lole32 -luuid -ldxva2
 
 .PHONY: all frontend icon clean clean-all
 

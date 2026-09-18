@@ -1,14 +1,27 @@
 import { useEffect, useRef, useState } from "react";
-import { type InitData, onInit, getInit, reportSize } from "./lib/bridge";
+import {
+  type InitData,
+  type MonitorData,
+  onInit,
+  onMonitors,
+  getInit,
+  reportSize,
+} from "./lib/bridge";
 import ConfigView from "./ConfigView";
 
 export default function App() {
   const [initData, setInitData] = useState<InitData | null>(null);
+  const [monitors, setMonitors] = useState<MonitorData[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    onInit((data) => setInitData(data));
+    onInit((data) => {
+      setMonitors(data.monitors ?? []);
+      setInitData(data);
+    });
+    const removeMonitorsListener = onMonitors((list) => setMonitors(list));
     getInit();
+    return removeMonitorsListener;
   }, []);
 
   useEffect(() => {
@@ -32,6 +45,7 @@ export default function App() {
     <div ref={rootRef}>
       <ConfigView
         config={initData.config}
+        monitors={monitors}
         webView2Version={initData.webView2Version ?? "Unknown"}
       />
     </div>
