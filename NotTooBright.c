@@ -138,8 +138,10 @@
 #define DDC_RETRY_MAX_MS 60000
 /* Probe attempts per monitor and the pauses between them: DDC/CI often
  * drops the first request after a handle is opened or a display change. */
-#define DDC_PROBE_ATTEMPTS 3
+#define DDC_PROBE_ATTEMPTS 4
+#define DDC_PROBE_ATTEMPTS_UNKNOWN 3
 #define DDC_HANDLE_SETTLE_MS 100
+#define DDC_REOPEN_PAUSE_MS 1500
 /* A monitor that has never answered is re-probed this many times after a
  * failure (a flaky first probe must not lock it into software mode); one
  * that has answered before is retried for as long as it takes. */
@@ -442,11 +444,14 @@ typedef struct {
     wchar_t error[160];           /* user-facing status, empty when fine */
 } Monitor;
 
-/* Main-to-worker probe request: which physical monitors to open and query. */
+/* Main-to-worker probe request: which physical monitors to open and query.
+ * patient: the monitor has answered before, so it is worth the long retry
+ * sequence including a handle reopen. */
 typedef struct {
     int uid;
     HMONITOR hmon;
     int physicalIndex;
+    BOOL patient;
 } DdcProbeEntry;
 
 /* Main-to-worker brightness request; one slot per monitor so a burst of
@@ -1283,11 +1288,14 @@ typedef struct {
     HMONITOR hmon;
     DWORD count;
     PHYSICAL_MONITOR* monitors;
+    BOOL inJob;
 } WorkerSource;
 
 typedef struct {
     int uid;
-    HANDLE handle;
+    HMONITOR hmon;
+    int physicalIndex;
+    BOOL patient;
     BOOL supported;
     DWORD max;
 } WorkerMonitor;
@@ -1337,80 +1345,147 @@ static void DdcRequestProbe(const DdcProbeEntry* entries, int count) {
     if (g_ddcEvent) SetEvent(g_ddcEvent);
 }
 
-static void ReleaseWorkerSources(WorkerSource* sources, int* count) {
-    for (int i = 0; i < *count; i++) {
-        if (sources[i].monitors) {
-            DestroyPhysicalMonitors(sources[i].count, sources[i].monitors);
-            free(sources[i].monitors);
-            sources[i].monitors = NULL;
-        }
-        sources[i].count = 0;
+static void CloseWorkerSource(WorkerSource* s) {
+    if (s->monitors) {
+        DestroyPhysicalMonitors(s->count, s->monitors);
+        free(s->monitors);
     }
-    *count = 0;
+    s->monitors = NULL;
+    s->count = 0;
 }
 
-static WorkerSource* AcquireWorkerSource(WorkerSource* sources, int* count, HMONITOR hmon) {
-    for (int i = 0; i < *count; i++) {
-        if (sources[i].hmon == hmon) return &sources[i];
-    }
-    if (*count >= MAX_MONITORS) return NULL;
-    WorkerSource* s = &sources[(*count)++];
-    s->hmon = hmon;
-    s->count = 0;
+static BOOL OpenWorkerSource(WorkerSource* s) {
     s->monitors = NULL;
+    s->count = 0;
     DWORD n = 0;
-    if (GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &n) && n > 0) {
-        s->monitors = (PHYSICAL_MONITOR*)calloc(n, sizeof(PHYSICAL_MONITOR));
-        if (s->monitors && GetPhysicalMonitorsFromHMONITOR(hmon, n, s->monitors)) {
-            s->count = n;
-            Sleep(DDC_HANDLE_SETTLE_MS);
-        } else {
-            DebugPrint(L"[WARNING] GetPhysicalMonitorsFromHMONITOR failed (error %lu)\n",
-                       (unsigned long)GetLastError());
-            free(s->monitors);
-            s->monitors = NULL;
-        }
-    } else {
+    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(s->hmon, &n) || n == 0) {
         DebugPrint(L"[WARNING] GetNumberOfPhysicalMonitorsFromHMONITOR failed (error %lu)\n",
                    (unsigned long)GetLastError());
+        return FALSE;
     }
-    return s;
+    s->monitors = (PHYSICAL_MONITOR*)calloc(n, sizeof(PHYSICAL_MONITOR));
+    if (!s->monitors) return FALSE;
+    if (!GetPhysicalMonitorsFromHMONITOR(s->hmon, n, s->monitors)) {
+        DebugPrint(L"[WARNING] GetPhysicalMonitorsFromHMONITOR failed (error %lu)\n",
+                   (unsigned long)GetLastError());
+        free(s->monitors);
+        s->monitors = NULL;
+        return FALSE;
+    }
+    s->count = n;
+    Sleep(DDC_HANDLE_SETTLE_MS);
+    return TRUE;
+}
+
+static WorkerSource* FindWorkerSource(WorkerSource* sources, int count, HMONITOR hmon) {
+    for (int i = 0; i < count; i++) {
+        if (sources[i].hmon == hmon) return &sources[i];
+    }
+    return NULL;
+}
+
+static HANDLE WorkerMonitorHandle(WorkerSource* sources, int count, const WorkerMonitor* wm) {
+    WorkerSource* src = FindWorkerSource(sources, count, wm->hmon);
+    if (!src || (DWORD)wm->physicalIndex >= src->count) return NULL;
+    return src->monitors[wm->physicalIndex].hPhysicalMonitor;
+}
+
+/* Physical monitor handles stay open for as long as their display is
+ * present: some GPU drivers refuse DDC/CI for a while after a handle is
+ * destroyed and recreated, so tearing everything down on every probe made
+ * a lone monitor look unresponsive. New displays are opened before a job
+ * and displays that left the job are closed only after it, so a close
+ * never immediately precedes a read. */
+static void OpenJobSources(WorkerSource* sources, int* count, const DdcProbeEntry* job, int jobCount) {
+    for (int i = 0; i < *count; i++) sources[i].inJob = FALSE;
+    for (int j = 0; j < jobCount; j++) {
+        WorkerSource* src = FindWorkerSource(sources, *count, job[j].hmon);
+        if (src) {
+            src->inJob = TRUE;
+        } else if (*count < MAX_MONITORS) {
+            WorkerSource* s = &sources[(*count)++];
+            s->hmon = job[j].hmon;
+            s->inJob = TRUE;
+            OpenWorkerSource(s);
+        }
+    }
+}
+
+static void CloseUnusedSources(WorkerSource* sources, int* count) {
+    int kept = 0;
+    for (int i = 0; i < *count; i++) {
+        if (sources[i].inJob) {
+            sources[kept++] = sources[i];
+        } else {
+            CloseWorkerSource(&sources[i]);
+        }
+    }
+    *count = kept;
+}
+
+static void ReleaseWorkerSources(WorkerSource* sources, int* count) {
+    for (int i = 0; i < *count; i++) CloseWorkerSource(&sources[i]);
+    *count = 0;
 }
 
 /* Asks the monitor for VCP 0x10 (brightness) directly instead of going
  * through the capabilities string, which is far slower and which some
- * monitors do not report correctly even though brightness works. */
-static void ProbeWorkerMonitor(WorkerMonitor* wm) {
+ * monitors do not report correctly even though brightness works. Reads
+ * are retried with growing pauses on the same handle; only when all of
+ * those fail is the handle reopened (after a pause) for one last try. */
+static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMonitor* wm) {
     DdcProbeResult* r = (DdcProbeResult*)calloc(1, sizeof(*r));
     if (!r) return;
     r->uid = wm->uid;
-    if (wm->handle) {
-        ULONGLONG start = GetTickCount64();
-        MC_VCP_CODE_TYPE type = MC_SET_PARAMETER;
-        DWORD current = 0, max = 0;
-        static const DWORD retryWaitMs[DDC_PROBE_ATTEMPTS] = { 0, 250, 750 };
-        BOOL ok = FALSE;
-        for (int attempt = 0; attempt < DDC_PROBE_ATTEMPTS && !ok; attempt++) {
-            if (retryWaitMs[attempt]) Sleep(retryWaitMs[attempt]);
-            ok = GetVCPFeatureAndVCPFeatureReply(wm->handle, VCP_BRIGHTNESS, &type, &current, &max);
-            if (!ok) r->error = GetLastError();
-        }
-        r->elapsedMs = (DWORD)(GetTickCount64() - start);
-        if (ok) {
-            r->supported = TRUE;
-            r->current = current;
-            r->max = max ? max : 100;
-            r->error = 0;
-            wm->supported = TRUE;
-            wm->max = r->max;
-        }
-    } else {
+    ULONGLONG start = GetTickCount64();
+    MC_VCP_CODE_TYPE type = MC_SET_PARAMETER;
+    DWORD current = 0, max = 0;
+    BOOL ok = FALSE;
+    HANDLE handle = WorkerMonitorHandle(sources, *sourceCount, wm);
+    if (!handle) {
         r->error = ERROR_NOT_FOUND;
+    } else {
+        static const DWORD waitMs[DDC_PROBE_ATTEMPTS] = { 0, 300, 800, 1500 };
+        int attempts = wm->patient ? DDC_PROBE_ATTEMPTS : DDC_PROBE_ATTEMPTS_UNKNOWN;
+        for (int attempt = 0; attempt < attempts && !ok; attempt++) {
+            if (waitMs[attempt]) Sleep(waitMs[attempt]);
+            ok = GetVCPFeatureAndVCPFeatureReply(handle, VCP_BRIGHTNESS, &type, &current, &max);
+            if (!ok) {
+                r->error = GetLastError();
+                DebugPrint(L"[INFO] DDC/CI monitor %d: probe attempt %d failed (error %lu)\n",
+                           wm->uid, attempt + 1, (unsigned long)r->error);
+            }
+            if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
+        }
+        if (!ok && wm->patient && !InterlockedCompareExchange(&g_ddcStop, 0, 0)) {
+            WorkerSource* src = FindWorkerSource(sources, *sourceCount, wm->hmon);
+            if (src) {
+                CloseWorkerSource(src);
+                Sleep(DDC_REOPEN_PAUSE_MS);
+                OpenWorkerSource(src);
+                handle = WorkerMonitorHandle(sources, *sourceCount, wm);
+                if (handle) {
+                    ok = GetVCPFeatureAndVCPFeatureReply(handle, VCP_BRIGHTNESS, &type, &current, &max);
+                    if (!ok) r->error = GetLastError();
+                    DebugPrint(L"[INFO] DDC/CI monitor %d: probe after reopening the handle %s\n",
+                               wm->uid, ok ? L"succeeded" : L"failed");
+                }
+            }
+        }
+    }
+    r->elapsedMs = (DWORD)(GetTickCount64() - start);
+    if (ok) {
+        r->supported = TRUE;
+        r->current = current;
+        r->max = max ? max : 100;
+        r->error = 0;
+        wm->supported = TRUE;
+        wm->max = r->max;
     }
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_DDC_PROBED, 0, (LPARAM)r)) free(r);
 }
 
-static BOOL WriteWorkerBrightness(WorkerMonitor* wm, int target, BOOL raw) {
+static BOOL WriteWorkerBrightness(HANDLE handle, WorkerMonitor* wm, int target, BOOL raw) {
     DWORD value;
     int percent;
     if (raw) {
@@ -1422,11 +1497,11 @@ static BOOL WriteWorkerBrightness(WorkerMonitor* wm, int target, BOOL raw) {
         value = (DWORD)(((unsigned)percent * wm->max + 50) / 100);
     }
     ULONGLONG start = GetTickCount64();
-    BOOL ok = SetVCPFeature(wm->handle, VCP_BRIGHTNESS, value);
+    BOOL ok = SetVCPFeature(handle, VCP_BRIGHTNESS, value);
     DWORD error = ok ? 0 : GetLastError();
     if (!ok) {
         Sleep(100);
-        ok = SetVCPFeature(wm->handle, VCP_BRIGHTNESS, value);
+        ok = SetVCPFeature(handle, VCP_BRIGHTNESS, value);
         if (!ok) error = GetLastError();
     }
     DebugPrint(L"[%s] DDC/CI monitor %d: set brightness %lu/%lu (%d%%) in %lu ms%s%lu\n",
@@ -1462,19 +1537,20 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
         LeaveCriticalSection(&g_ddcLock);
 
         if (probe) {
-            ReleaseWorkerSources(sources, &sourceCount);
+            OpenJobSources(sources, &sourceCount, job, jobCount);
             monitorCount = 0;
             for (int i = 0; i < jobCount && monitorCount < MAX_MONITORS; i++) {
-                WorkerSource* src = AcquireWorkerSource(sources, &sourceCount, job[i].hmon);
                 WorkerMonitor* wm = &monitors[monitorCount++];
                 wm->uid = job[i].uid;
+                wm->hmon = job[i].hmon;
+                wm->physicalIndex = job[i].physicalIndex;
+                wm->patient = job[i].patient;
                 wm->supported = FALSE;
                 wm->max = 100;
-                wm->handle = (src && (DWORD)job[i].physicalIndex < src->count)
-                    ? src->monitors[job[i].physicalIndex].hPhysicalMonitor : NULL;
-                ProbeWorkerMonitor(wm);
+                ProbeWorkerMonitor(sources, &sourceCount, wm);
                 if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
             }
+            CloseUnusedSources(sources, &sourceCount);
         }
 
         for (;;) {
@@ -1502,7 +1578,10 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
                 }
             }
             BOOL ok = FALSE;
-            if (wm && wm->handle && wm->supported) ok = WriteWorkerBrightness(wm, target, raw);
+            if (wm && wm->supported) {
+                HANDLE handle = WorkerMonitorHandle(sources, sourceCount, wm);
+                if (handle) ok = WriteWorkerBrightness(handle, wm, target, raw);
+            }
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DDC_SET_RESULT, (WPARAM)uid, ok ? 1 : 0);
         }
     }
@@ -1781,11 +1860,24 @@ static void RefreshMonitors(void) {
             ReleaseMonitorOverlay(m);
         }
         /* Hidden monitors are not even probed; they are left alone until a
-         * rescan brings them back. */
+         * rescan brings them back. Monitors that have answered before go
+         * first so their results are not held up behind a display that
+         * never answers and burns through every retry. */
         if (!m->hidden) {
-            probe[probeCount].uid = m->uid;
-            probe[probeCount].hmon = m->hmon;
-            probe[probeCount].physicalIndex = m->physicalIndex;
+            int at = probeCount;
+            if (m->knownHardware) {
+                at = 0;
+                while (at < probeCount) {
+                    Monitor* other = FindMonitorByUid(probe[at].uid);
+                    if (!other || !other->knownHardware) break;
+                    at++;
+                }
+                memmove(&probe[at + 1], &probe[at], sizeof(DdcProbeEntry) * (size_t)(probeCount - at));
+            }
+            probe[at].uid = m->uid;
+            probe[at].hmon = m->hmon;
+            probe[at].physicalIndex = m->physicalIndex;
+            probe[at].patient = m->knownHardware;
             probeCount++;
         }
         DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s%s%s\n",
