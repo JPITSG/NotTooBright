@@ -36,7 +36,8 @@ standard VCP brightness code (0x10), so the change is the same one you would
 make with the monitor's own buttons: the backlight actually gets dimmer, with
 no loss of contrast. All DDC/CI traffic runs on a background thread with
 retries, because a single command can take a while and some monitors are slow
-or flaky.
+or flaky. If a driver refuses the raw VCP request but accepts the high-level
+Monitor Configuration API, that route is used instead.
 
 When a monitor does not answer (DDC/CI disabled in its on-screen menu, some
 docks, KVMs, USB-C hubs, DisplayLink adapters, virtual machines, remote
@@ -122,7 +123,7 @@ brightness section applies immediately; the settings below it are saved with
 | Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
 | Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
 | Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
-| Enable debug logging | Appends timestamped diagnostic events (monitor detection, DDC/CI probe and write results, fallbacks, power events) to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
+| Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
 
 The footer displays the application version.
 

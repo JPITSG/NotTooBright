@@ -41,6 +41,7 @@
 #include <dbt.h>
 #include <physicalmonitorenumerationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
+#include <highlevelmonitorconfigurationapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -426,7 +427,9 @@ typedef struct {
     BOOL knownHardware;           /* has answered DDC/CI at some point (persisted) */
     int probeFailures;            /* consecutive failed probes in this outage */
     DWORD ddcMax;
+    DWORD ddcMin;                 /* non-zero only on the high-level route */
     DWORD ddcCurrent;
+    BOOL ddcHighLevel;            /* GetMonitorBrightness/SetMonitorBrightness route */
     BOOL forceSoftware;           /* user asked for software dimming only */
     BOOL hidden;                  /* removed from the dialog and left alone until a rescan */
     BOOL hasOriginal;             /* original DDC/CI value recorded */
@@ -463,10 +466,13 @@ typedef struct {
     BOOL pending;
 } DdcSetSlot;
 
-/* Worker-to-main probe result. */
+/* Worker-to-main probe result. highLevel: the raw VCP read failed but the
+ * high-level GetMonitorBrightness/SetMonitorBrightness route works. */
 typedef struct {
     int uid;
     BOOL supported;
+    BOOL highLevel;
+    DWORD min;
     DWORD current;
     DWORD max;
     DWORD error;
@@ -527,6 +533,8 @@ static void LoadMonitorSettings(Monitor* m);
 static void SaveMonitorSettings(const Monitor* m);
 static Monitor* FindMonitorByUid(int uid);
 static BrightnessMode MonitorMode(const Monitor* m);
+static const wchar_t* ModeName(BrightnessMode mode);
+static const wchar_t* HardwareStateName(HardwareState state);
 static int MonitorMinValue(const Monitor* m);
 static void ApplyMonitor(Monitor* m);
 static void SetMonitorValue(Monitor* m, int value);
@@ -1089,6 +1097,14 @@ static void ResolveMonitorIdentity(const wchar_t* adapterDevice, int physicalInd
     wchar_t pnpId[32] = L"";
     wchar_t instance[160] = L"";
     if (found) {
+        DebugPrint(L"[ENUM] %s physical %d -> monitor device \"%s\" (%s), flags 0x%08lX, id %s\n",
+                   adapterDevice, physicalIndex, dd.DeviceString, dd.DeviceName,
+                   (unsigned long)dd.StateFlags, dd.DeviceID);
+    } else {
+        DebugPrint(L"[ENUM] %s physical %d -> no monitor device found (error %lu)\n",
+                   adapterDevice, physicalIndex, (unsigned long)GetLastError());
+    }
+    if (found) {
         const wchar_t* p = dd.DeviceID;
         if (wcsncmp(p, L"\\\\?\\", 4) == 0) p += 4;
         const wchar_t* h1 = wcschr(p, L'#');
@@ -1108,6 +1124,11 @@ static void ResolveMonitorIdentity(const wchar_t* adapterDevice, int physicalInd
     if (pnpId[0] && instance[0]) {
         DWORD edidLen = ReadEdidFromRegistry(pnpId, instance, edid, sizeof(edid));
         edidOk = edidLen > 0 && ParseEdid(edid, edidLen, edidName, 64, edidSerial, 64, &numericSerial);
+        DebugPrint(L"[ENUM] EDID for %s\\%s: %lu bytes, %s, name \"%s\", serial \"%s\", numeric serial %lu\n",
+                   pnpId, instance, (unsigned long)edidLen, edidOk ? L"parsed" : L"not usable",
+                   edidName, edidSerial, (unsigned long)numericSerial);
+    } else {
+        DebugPrint(L"[ENUM] no PnP id/instance for %s physical %d; EDID not read\n", adapterDevice, physicalIndex);
     }
 
     const size_t keyCount = sizeof(m->key) / sizeof(wchar_t);
@@ -1188,10 +1209,11 @@ static HWND CreateOverlayWindow(const RECT* rc) {
     }
     SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
     /* Windows 10 2004+; older versions simply keep the overlay in captures. */
-    if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
-        DebugPrint(L"[INFO] Overlay capture exclusion unavailable (error %lu)\n",
-                   (unsigned long)GetLastError());
-    }
+    BOOL excluded = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+    DebugPrint(L"[OVERLAY] created hwnd=%p at (%ld,%ld) %ldx%ld, capture exclusion %s%lu\n",
+               (void*)hwnd, (long)rc->left, (long)rc->top, (long)(rc->right - rc->left),
+               (long)(rc->bottom - rc->top), excluded ? L"ok" : L"unavailable, error ",
+               (unsigned long)(excluded ? 0 : GetLastError()));
     return hwnd;
 }
 
@@ -1206,10 +1228,14 @@ static void PositionOverlay(Monitor* m) {
 static void SetOverlayDim(Monitor* m, int dim) {
     if (dim < 0) dim = 0;
     if (dim > SOFT_MAX_DIM) dim = SOFT_MAX_DIM;
+    int previous = m->overlayDim;
     m->overlayDim = dim;
     if (!m->overlay) return;
     if (dim == 0) {
-        if (IsWindowVisible(m->overlay)) ShowWindow(m->overlay, SW_HIDE);
+        if (IsWindowVisible(m->overlay)) {
+            ShowWindow(m->overlay, SW_HIDE);
+            DebugPrint(L"[OVERLAY] %s: hidden (was %d%%)\n", m->name, previous);
+        }
         return;
     }
     BYTE alpha = (BYTE)((dim * 255 + 50) / 100);
@@ -1218,6 +1244,7 @@ static void SetOverlayDim(Monitor* m, int dim) {
         ShowWindow(m->overlay, SW_SHOWNOACTIVATE);
         PositionOverlay(m);
     }
+    if (previous != dim) DebugPrint(L"[OVERLAY] %s: dim %d%% (alpha %u)\n", m->name, dim, (unsigned)alpha);
 }
 
 static BOOL IsOverlayWindow(HWND hwnd) {
@@ -1297,6 +1324,8 @@ typedef struct {
     int physicalIndex;
     BOOL patient;
     BOOL supported;
+    BOOL highLevel;
+    DWORD min;
     DWORD max;
 } WorkerMonitor;
 
@@ -1347,7 +1376,9 @@ static void DdcRequestProbe(const DdcProbeEntry* entries, int count) {
 
 static void CloseWorkerSource(WorkerSource* s) {
     if (s->monitors) {
-        DestroyPhysicalMonitors(s->count, s->monitors);
+        BOOL ok = DestroyPhysicalMonitors(s->count, s->monitors);
+        DebugPrint(L"[DDC] hmon=%p DestroyPhysicalMonitors(%lu) -> %s\n", (void*)s->hmon,
+                   (unsigned long)s->count, ok ? L"ok" : L"FAILED");
         free(s->monitors);
     }
     s->monitors = NULL;
@@ -1358,19 +1389,30 @@ static BOOL OpenWorkerSource(WorkerSource* s) {
     s->monitors = NULL;
     s->count = 0;
     DWORD n = 0;
-    if (!GetNumberOfPhysicalMonitorsFromHMONITOR(s->hmon, &n) || n == 0) {
-        DebugPrint(L"[WARNING] GetNumberOfPhysicalMonitorsFromHMONITOR failed (error %lu)\n",
-                   (unsigned long)GetLastError());
-        return FALSE;
-    }
+    ULONGLONG start = GetTickCount64();
+    BOOL ok = GetNumberOfPhysicalMonitorsFromHMONITOR(s->hmon, &n);
+    DWORD error = ok ? 0 : GetLastError();
+    DebugPrint(L"[DDC] hmon=%p GetNumberOfPhysicalMonitorsFromHMONITOR -> %s, count %lu, error %lu, %lu ms\n",
+               (void*)s->hmon, ok ? L"ok" : L"FAILED", (unsigned long)n, (unsigned long)error,
+               (unsigned long)(GetTickCount64() - start));
+    if (!ok || n == 0) return FALSE;
     s->monitors = (PHYSICAL_MONITOR*)calloc(n, sizeof(PHYSICAL_MONITOR));
     if (!s->monitors) return FALSE;
-    if (!GetPhysicalMonitorsFromHMONITOR(s->hmon, n, s->monitors)) {
-        DebugPrint(L"[WARNING] GetPhysicalMonitorsFromHMONITOR failed (error %lu)\n",
-                   (unsigned long)GetLastError());
+    start = GetTickCount64();
+    ok = GetPhysicalMonitorsFromHMONITOR(s->hmon, n, s->monitors);
+    error = ok ? 0 : GetLastError();
+    DebugPrint(L"[DDC] hmon=%p GetPhysicalMonitorsFromHMONITOR -> %s, error %lu, %lu ms\n",
+               (void*)s->hmon, ok ? L"ok" : L"FAILED", (unsigned long)error,
+               (unsigned long)(GetTickCount64() - start));
+    if (!ok) {
         free(s->monitors);
         s->monitors = NULL;
         return FALSE;
+    }
+    for (DWORD i = 0; i < n; i++) {
+        DebugPrint(L"[DDC] hmon=%p physical[%lu] handle=%p description=\"%s\"\n",
+                   (void*)s->hmon, (unsigned long)i, (void*)s->monitors[i].hPhysicalMonitor,
+                   s->monitors[i].szPhysicalMonitorDescription);
     }
     s->count = n;
     Sleep(DDC_HANDLE_SETTLE_MS);
@@ -1428,20 +1470,81 @@ static void ReleaseWorkerSources(WorkerSource* sources, int* count) {
     *count = 0;
 }
 
-/* Asks the monitor for VCP 0x10 (brightness) directly instead of going
- * through the capabilities string, which is far slower and which some
- * monitors do not report correctly even though brightness works. Reads
- * are retried with growing pauses on the same handle; only when all of
- * those fail is the handle reopened (after a pause) for one last try. */
+/* One raw VCP 0x10 read with everything about it logged. */
+static BOOL ReadVcpBrightness(HANDLE handle, int uid, const wchar_t* label,
+                              DWORD* current, DWORD* max, DWORD* error) {
+    MC_VCP_CODE_TYPE type = MC_SET_PARAMETER;
+    ULONGLONG start = GetTickCount64();
+    BOOL ok = GetVCPFeatureAndVCPFeatureReply(handle, VCP_BRIGHTNESS, &type, current, max);
+    *error = ok ? 0 : GetLastError();
+    DebugPrint(L"[DDC] monitor %d handle=%p %s: GetVCPFeatureAndVCPFeatureReply(0x10) -> %s, "
+               L"current %lu, max %lu, type %d, error %lu (0x%08lX), %lu ms\n",
+               uid, (void*)handle, label, ok ? L"ok" : L"FAILED", (unsigned long)*current,
+               (unsigned long)*max, (int)type, (unsigned long)*error, (unsigned long)*error,
+               (unsigned long)(GetTickCount64() - start));
+    return ok;
+}
+
+/* The high-level route: the capabilities string first (diagnostic: shows
+ * whether the monitor lists VCP 10 at all, and how slow the channel is),
+ * then GetMonitorBrightness, which some drivers accept when the raw VCP
+ * call is refused. */
+static BOOL ReadHighLevelBrightness(HANDLE handle, int uid, DWORD* min, DWORD* current, DWORD* max) {
+    ULONGLONG start = GetTickCount64();
+    DWORD caps = 0, temps = 0;
+    BOOL capsOk = GetMonitorCapabilities(handle, &caps, &temps);
+    DebugPrint(L"[DDC] monitor %d handle=%p GetMonitorCapabilities -> %s, caps 0x%08lX%s, temps 0x%08lX, error %lu, %lu ms\n",
+               uid, (void*)handle, capsOk ? L"ok" : L"FAILED", (unsigned long)caps,
+               (caps & MC_CAPS_BRIGHTNESS) ? L" (brightness)" : L"", (unsigned long)temps,
+               (unsigned long)(capsOk ? 0 : GetLastError()),
+               (unsigned long)(GetTickCount64() - start));
+
+    start = GetTickCount64();
+    DWORD length = 0;
+    if (GetCapabilitiesStringLength(handle, &length) && length > 1 && length < 8192) {
+        char* text = (char*)calloc(length + 1, 1);
+        if (text && CapabilitiesRequestAndCapabilitiesReply(handle, text, length)) {
+            wchar_t wide[1600];
+            int n = MultiByteToWideChar(CP_ACP, 0, text, -1, wide, 1599);
+            if (n <= 0) wide[0] = L'\0';
+            wide[1599] = L'\0';
+            DebugPrint(L"[DDC] monitor %d capabilities (%lu bytes, %lu ms): %s\n", uid,
+                       (unsigned long)length, (unsigned long)(GetTickCount64() - start), wide);
+        } else {
+            DebugPrint(L"[DDC] monitor %d CapabilitiesRequestAndCapabilitiesReply FAILED, error %lu, %lu ms\n",
+                       uid, (unsigned long)GetLastError(), (unsigned long)(GetTickCount64() - start));
+        }
+        free(text);
+    } else {
+        DebugPrint(L"[DDC] monitor %d GetCapabilitiesStringLength -> length %lu, error %lu, %lu ms\n",
+                   uid, (unsigned long)length, (unsigned long)GetLastError(),
+                   (unsigned long)(GetTickCount64() - start));
+    }
+
+    start = GetTickCount64();
+    *min = *current = *max = 0;
+    BOOL ok = GetMonitorBrightness(handle, min, current, max);
+    DebugPrint(L"[DDC] monitor %d handle=%p GetMonitorBrightness -> %s, min %lu, current %lu, max %lu, error %lu, %lu ms\n",
+               uid, (void*)handle, ok ? L"ok" : L"FAILED", (unsigned long)*min, (unsigned long)*current,
+               (unsigned long)*max, (unsigned long)(ok ? 0 : GetLastError()),
+               (unsigned long)(GetTickCount64() - start));
+    return ok && *max > *min;
+}
+
+/* Asks the monitor for VCP 0x10 (brightness) directly first (fast, no
+ * capabilities string), retrying on the same handle with growing pauses;
+ * then the high-level route; then, for a monitor that answered before,
+ * once more on a freshly opened handle. */
 static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMonitor* wm) {
     DdcProbeResult* r = (DdcProbeResult*)calloc(1, sizeof(*r));
     if (!r) return;
     r->uid = wm->uid;
     ULONGLONG start = GetTickCount64();
-    MC_VCP_CODE_TYPE type = MC_SET_PARAMETER;
-    DWORD current = 0, max = 0;
-    BOOL ok = FALSE;
+    DWORD min = 0, current = 0, max = 0;
+    BOOL ok = FALSE, highLevel = FALSE;
     HANDLE handle = WorkerMonitorHandle(sources, *sourceCount, wm);
+    DebugPrint(L"[DDC] monitor %d probe start: hmon=%p physicalIndex=%d handle=%p patient=%d\n",
+               wm->uid, (void*)wm->hmon, wm->physicalIndex, (void*)handle, wm->patient);
     if (!handle) {
         r->error = ERROR_NOT_FOUND;
     } else {
@@ -1449,26 +1552,30 @@ static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMo
         int attempts = wm->patient ? DDC_PROBE_ATTEMPTS : DDC_PROBE_ATTEMPTS_UNKNOWN;
         for (int attempt = 0; attempt < attempts && !ok; attempt++) {
             if (waitMs[attempt]) Sleep(waitMs[attempt]);
-            ok = GetVCPFeatureAndVCPFeatureReply(handle, VCP_BRIGHTNESS, &type, &current, &max);
-            if (!ok) {
-                r->error = GetLastError();
-                DebugPrint(L"[INFO] DDC/CI monitor %d: probe attempt %d failed (error %lu)\n",
-                           wm->uid, attempt + 1, (unsigned long)r->error);
-            }
+            wchar_t label[32];
+            swprintf_s(label, 32, L"attempt %d", attempt + 1);
+            ok = ReadVcpBrightness(handle, wm->uid, label, &current, &max, &r->error);
             if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
+        }
+        if (!ok && !InterlockedCompareExchange(&g_ddcStop, 0, 0)) {
+            ok = ReadHighLevelBrightness(handle, wm->uid, &min, &current, &max);
+            highLevel = ok;
         }
         if (!ok && wm->patient && !InterlockedCompareExchange(&g_ddcStop, 0, 0)) {
             WorkerSource* src = FindWorkerSource(sources, *sourceCount, wm->hmon);
             if (src) {
+                DebugPrint(L"[DDC] monitor %d: reopening the handle after %lu ms pause\n",
+                           wm->uid, (unsigned long)DDC_REOPEN_PAUSE_MS);
                 CloseWorkerSource(src);
                 Sleep(DDC_REOPEN_PAUSE_MS);
                 OpenWorkerSource(src);
                 handle = WorkerMonitorHandle(sources, *sourceCount, wm);
                 if (handle) {
-                    ok = GetVCPFeatureAndVCPFeatureReply(handle, VCP_BRIGHTNESS, &type, &current, &max);
-                    if (!ok) r->error = GetLastError();
-                    DebugPrint(L"[INFO] DDC/CI monitor %d: probe after reopening the handle %s\n",
-                               wm->uid, ok ? L"succeeded" : L"failed");
+                    ok = ReadVcpBrightness(handle, wm->uid, L"after reopen", &current, &max, &r->error);
+                    if (!ok) {
+                        ok = ReadHighLevelBrightness(handle, wm->uid, &min, &current, &max);
+                        highLevel = ok;
+                    }
                 }
             }
         }
@@ -1476,39 +1583,49 @@ static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMo
     r->elapsedMs = (DWORD)(GetTickCount64() - start);
     if (ok) {
         r->supported = TRUE;
+        r->highLevel = highLevel;
+        r->min = highLevel ? min : 0;
         r->current = current;
         r->max = max ? max : 100;
         r->error = 0;
         wm->supported = TRUE;
+        wm->highLevel = highLevel;
+        wm->min = r->min;
         wm->max = r->max;
     }
+    DebugPrint(L"[DDC] monitor %d probe result: %s%s, min %lu, current %lu, max %lu, error %lu, %lu ms total\n",
+               wm->uid, ok ? L"supported" : L"NOT supported", highLevel ? L" (high-level route)" : L"",
+               (unsigned long)r->min, (unsigned long)r->current, (unsigned long)r->max,
+               (unsigned long)r->error, (unsigned long)r->elapsedMs);
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_DDC_PROBED, 0, (LPARAM)r)) free(r);
 }
 
 static BOOL WriteWorkerBrightness(HANDLE handle, WorkerMonitor* wm, int target, BOOL raw) {
+    DWORD range = wm->max > wm->min ? wm->max - wm->min : 100;
     DWORD value;
     int percent;
     if (raw) {
         value = (DWORD)target;
         if (value > wm->max) value = wm->max;
-        percent = (int)((value * 100 + wm->max / 2) / wm->max);
+        if (value < wm->min) value = wm->min;
+        percent = (int)(((value - wm->min) * 100 + range / 2) / range);
     } else {
         percent = target < 0 ? 0 : (target > 100 ? 100 : target);
-        value = (DWORD)(((unsigned)percent * wm->max + 50) / 100);
+        value = wm->min + (DWORD)(((unsigned)percent * range + 50) / 100);
     }
-    ULONGLONG start = GetTickCount64();
-    BOOL ok = SetVCPFeature(handle, VCP_BRIGHTNESS, value);
-    DWORD error = ok ? 0 : GetLastError();
-    if (!ok) {
-        Sleep(100);
-        ok = SetVCPFeature(handle, VCP_BRIGHTNESS, value);
-        if (!ok) error = GetLastError();
+    BOOL ok = FALSE;
+    DWORD error = 0;
+    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+        if (attempt) Sleep(100);
+        ULONGLONG start = GetTickCount64();
+        ok = wm->highLevel ? SetMonitorBrightness(handle, value) : SetVCPFeature(handle, VCP_BRIGHTNESS, value);
+        error = ok ? 0 : GetLastError();
+        DebugPrint(L"[DDC] monitor %d handle=%p %s(%lu) [%d%%, range %lu..%lu] attempt %d -> %s, error %lu, %lu ms\n",
+                   wm->uid, (void*)handle, wm->highLevel ? L"SetMonitorBrightness" : L"SetVCPFeature",
+                   (unsigned long)value, percent, (unsigned long)wm->min, (unsigned long)wm->max,
+                   attempt + 1, ok ? L"ok" : L"FAILED", (unsigned long)error,
+                   (unsigned long)(GetTickCount64() - start));
     }
-    DebugPrint(L"[%s] DDC/CI monitor %d: set brightness %lu/%lu (%d%%) in %lu ms%s%lu\n",
-               ok ? L"INFO" : L"WARNING", wm->uid, (unsigned long)value,
-               (unsigned long)wm->max, percent,
-               (unsigned long)(GetTickCount64() - start),
-               ok ? L"" : L", error ", (unsigned long)error);
     return ok;
 }
 
@@ -1519,6 +1636,7 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
     WorkerMonitor monitors[MAX_MONITORS];
     int monitorCount = 0;
     ZeroMemory(sources, sizeof(sources));
+    DebugPrint(L"[DDC] worker thread started (id %lu)\n", (unsigned long)GetCurrentThreadId());
 
     for (;;) {
         WaitForSingleObject(g_ddcEvent, INFINITE);
@@ -1537,6 +1655,11 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
         LeaveCriticalSection(&g_ddcLock);
 
         if (probe) {
+            DebugPrint(L"[DDC] probe job: %d monitor(s)\n", jobCount);
+            for (int i = 0; i < jobCount; i++) {
+                DebugPrint(L"[DDC]   entry %d: uid %d hmon=%p physicalIndex %d patient %d\n", i,
+                           job[i].uid, (void*)job[i].hmon, job[i].physicalIndex, job[i].patient);
+            }
             OpenJobSources(sources, &sourceCount, job, jobCount);
             monitorCount = 0;
             for (int i = 0; i < jobCount && monitorCount < MAX_MONITORS; i++) {
@@ -1546,11 +1669,14 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
                 wm->physicalIndex = job[i].physicalIndex;
                 wm->patient = job[i].patient;
                 wm->supported = FALSE;
+                wm->highLevel = FALSE;
+                wm->min = 0;
                 wm->max = 100;
                 ProbeWorkerMonitor(sources, &sourceCount, wm);
                 if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
             }
             CloseUnusedSources(sources, &sourceCount);
+            DebugPrint(L"[DDC] probe job done; %d source(s) kept open\n", sourceCount);
         }
 
         for (;;) {
@@ -1581,6 +1707,10 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
             if (wm && wm->supported) {
                 HANDLE handle = WorkerMonitorHandle(sources, sourceCount, wm);
                 if (handle) ok = WriteWorkerBrightness(handle, wm, target, raw);
+                else DebugPrint(L"[DDC] monitor %d: no handle for the write\n", uid);
+            } else {
+                DebugPrint(L"[DDC] monitor %d: write skipped (%s)\n", uid,
+                           wm ? L"not supported" : L"unknown to the worker");
             }
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DDC_SET_RESULT, (WPARAM)uid, ok ? 1 : 0);
         }
@@ -1677,16 +1807,22 @@ static void ApplyMonitor(Monitor* m) {
     }
 
     int dim = 0;
+    BOOL wrote = FALSE;
     if (mode == MODE_HARDWARE) {
         int hw = value < 0 ? 0 : value;
         if (value < 0) dim = -value;
         if (hw != m->lastHwSent) {
             m->lastHwSent = hw;
             DdcRequestSet(m->uid, hw);
+            wrote = TRUE;
         }
     } else {
         dim = 100 - value;
     }
+    DebugPrint(L"[APPLY] %s (%s): mode %s value %d -> hardware %s%d%%, overlay dim %d%%\n",
+               m->name, m->device, ModeName(mode), value,
+               mode == MODE_HARDWARE ? (wrote ? L"write " : L"unchanged ") : L"n/a ",
+               mode == MODE_HARDWARE ? (value < 0 ? 0 : value) : 0, dim);
     SetOverlayDim(m, dim);
 }
 
@@ -1758,10 +1894,41 @@ static BOOL CALLBACK EnumMonitorProc(HMONITOR hmon, HDC hdc, LPRECT rc, LPARAM l
  * loads saved settings for new ones, and asks the worker to (re)probe
  * DDC/CI on all of them. Overlays keep their current dimming until the
  * probe answers, so nothing flashes on a rescan. */
+/* Everything Windows knows about adapters and attached monitors, for the
+ * log: it shows virtual displays, clone setups, and inactive entries that
+ * explain odd enumeration results. */
+static void LogDisplayDevices(void) {
+    DISPLAY_DEVICEW adapter;
+    for (DWORD i = 0; i < 16; i++) {
+        ZeroMemory(&adapter, sizeof(adapter));
+        adapter.cb = sizeof(adapter);
+        if (!EnumDisplayDevicesW(NULL, i, &adapter, 0)) break;
+        DebugPrint(L"[ENUM] adapter %lu: %s \"%s\" flags 0x%08lX%s%s id %s\n", (unsigned long)i,
+                   adapter.DeviceName, adapter.DeviceString, (unsigned long)adapter.StateFlags,
+                   (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? L" (attached)" : L"",
+                   (adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? L" (primary)" : L"",
+                   adapter.DeviceID);
+        DISPLAY_DEVICEW monitor;
+        for (DWORD j = 0; j < 8; j++) {
+            ZeroMemory(&monitor, sizeof(monitor));
+            monitor.cb = sizeof(monitor);
+            if (!EnumDisplayDevicesW(adapter.DeviceName, j, &monitor, EDD_GET_DEVICE_INTERFACE_NAME)) break;
+            DebugPrint(L"[ENUM]   monitor %lu.%lu: %s \"%s\" flags 0x%08lX%s id %s\n", (unsigned long)i,
+                       (unsigned long)j, monitor.DeviceName, monitor.DeviceString,
+                       (unsigned long)monitor.StateFlags,
+                       (monitor.StateFlags & DISPLAY_DEVICE_ACTIVE) ? L" (active)" : L"",
+                       monitor.DeviceID);
+        }
+    }
+}
+
 static void RefreshMonitors(void) {
+    DebugPrint(L"[INFO] Refreshing monitors (%d known so far)\n", g_monitorCount);
+    LogDisplayDevices();
     EnumContext ctx;
     ZeroMemory(&ctx, sizeof(ctx));
     EnumDisplayMonitors(NULL, NULL, EnumMonitorProc, (LPARAM)&ctx);
+    DebugPrint(L"[ENUM] EnumDisplayMonitors: %d display(s)\n", ctx.count);
 
     Monitor fresh[MAX_MONITORS];
     int freshCount = 0;
@@ -1769,7 +1936,15 @@ static void RefreshMonitors(void) {
     for (int i = 0; i < ctx.count; i++) {
         EnumEntry* e = &ctx.entries[i];
         DWORD physCount = 0;
-        if (!GetNumberOfPhysicalMonitorsFromHMONITOR(e->hmon, &physCount) || physCount == 0) {
+        BOOL countOk = GetNumberOfPhysicalMonitorsFromHMONITOR(e->hmon, &physCount);
+        DebugPrint(L"[ENUM] display %d: hmon=%p %s rect (%ld,%ld)-(%ld,%ld)%s, physical monitors %lu (%s, error %lu)\n",
+                   i, (void*)e->hmon, e->info.szDevice,
+                   (long)e->info.rcMonitor.left, (long)e->info.rcMonitor.top,
+                   (long)e->info.rcMonitor.right, (long)e->info.rcMonitor.bottom,
+                   (e->info.dwFlags & MONITORINFOF_PRIMARY) ? L" primary" : L"",
+                   (unsigned long)physCount, countOk ? L"ok" : L"FAILED",
+                   (unsigned long)(countOk ? 0 : GetLastError()));
+        if (!countOk || physCount == 0) {
             physCount = 1;
         }
         if (physCount > MAX_PHYSICAL_PER_DISPLAY) physCount = MAX_PHYSICAL_PER_DISPLAY;
@@ -1880,14 +2055,18 @@ static void RefreshMonitors(void) {
             probe[at].patient = m->knownHardware;
             probeCount++;
         }
-        DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s%s%s\n",
+        DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s state=%s knownHardware=%d%s%s%s original=%s%lu/%lu\n",
                    m->uid, m->name, m->device,
                    (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
                    m->primary ? L", primary" : L"", m->key,
                    m->hasValue ? m->value : -1000,
                    m->hasValue ? L"" : L" (none saved)",
+                   HardwareStateName(m->hardwareState), m->knownHardware,
                    m->forceSoftware ? L", software only" : L"",
-                   m->hidden ? L", hidden" : L"");
+                   m->hidden ? L", hidden" : L"",
+                   m->scheduled ? L", scheduled" : L"",
+                   m->hasOriginal ? L"" : L"none ",
+                   (unsigned long)m->originalRaw, (unsigned long)m->originalMax);
     }
     DebugPrint(L"[INFO] %d monitor(s) enumerated, %d hidden; probing DDC/CI\n",
                g_monitorCount, g_monitorCount - probeCount);
@@ -1953,10 +2132,17 @@ static void ApplyScheduleAfterProbe(Monitor* m) {
 
 static void HandleDdcProbed(DdcProbeResult* r) {
     Monitor* m = FindMonitorByUid(r->uid);
+    DebugPrint(L"[INFO] Probe result for uid %d (%s): supported=%d highLevel=%d min=%lu current=%lu max=%lu error=%lu elapsed=%lu ms\n",
+               r->uid, m ? m->name : L"unknown monitor", r->supported, r->highLevel,
+               (unsigned long)r->min, (unsigned long)r->current, (unsigned long)r->max,
+               (unsigned long)r->error, (unsigned long)r->elapsedMs);
     if (m) {
+        BrightnessMode before = MonitorMode(m);
         if (r->supported) {
             m->hardwareState = HW_AVAILABLE;
             m->ddcMax = r->max;
+            m->ddcMin = r->highLevel ? r->min : 0;
+            m->ddcHighLevel = r->highLevel;
             m->ddcCurrent = r->current;
             m->failures = 0;
             m->error[0] = L'\0';
@@ -1971,7 +2157,9 @@ static void HandleDdcProbed(DdcProbeResult* r) {
                 m->dirty = TRUE;
                 SchedulePersist();
             }
-            int percent = (int)((r->current * 100 + r->max / 2) / r->max);
+            DWORD range = r->max > m->ddcMin ? r->max - m->ddcMin : 100;
+            DWORD above = r->current > m->ddcMin ? r->current - m->ddcMin : 0;
+            int percent = (int)((above * 100 + range / 2) / range);
             if (percent > 100) percent = 100;
             if (!m->hasOriginal) {
                 /* The value the monitor had before this application ever
@@ -2024,6 +2212,10 @@ static void HandleDdcProbed(DdcProbeResult* r) {
             }
         }
         if (!r->supported) m->lastHwSent = -1;
+        BrightnessMode after = MonitorMode(m);
+        DebugPrint(L"[INFO] %s (%s): mode %s -> %s, value %d, lastHwSent %d, knownHardware %d, probeFailures %d\n",
+                   m->name, m->device, ModeName(before), ModeName(after), m->value,
+                   m->lastHwSent, m->knownHardware, m->probeFailures);
         ApplyMonitor(m);
         PushMonitorsToDialog();
     }
@@ -2040,9 +2232,14 @@ static void HandleDdcSetResult(int uid, BOOL success) {
                    success ? L"restored" : L"could not be restored");
         return;
     }
+    DebugPrint(L"[INFO] Write result for %s (%s): %s (lastHwSent %d, failures so far %d)\n",
+               m->name, m->device, success ? L"ok" : L"FAILED", m->lastHwSent, m->failures);
     if (success) {
         m->failures = 0;
-        if (m->lastHwSent >= 0) m->ddcCurrent = (DWORD)m->lastHwSent * m->ddcMax / 100;
+        if (m->lastHwSent >= 0) {
+            DWORD range = m->ddcMax > m->ddcMin ? m->ddcMax - m->ddcMin : 100;
+            m->ddcCurrent = m->ddcMin + (DWORD)m->lastHwSent * range / 100;
+        }
         if (m->error[0]) {
             m->error[0] = L'\0';
             PushMonitorsToDialog();
@@ -2807,6 +3004,13 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
 
     char action[64] = {0};
     json_get_string(msg, "action", action, sizeof(action));
+    if (strcmp(action, "resize") != 0) {
+        wchar_t preview[256];
+        int n = MultiByteToWideChar(CP_UTF8, 0, msg, -1, preview, 255);
+        if (n <= 0) preview[0] = L'\0';
+        preview[255] = L'\0';
+        DebugPrint(L"[DIALOG] %s\n", preview);
+    }
 
     if (strcmp(action, "getInit") == 0) {
         webview_push_init_config();
@@ -3280,6 +3484,40 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 
+typedef struct {
+    ULONG dwOSVersionInfoSize;
+    ULONG dwMajorVersion;
+    ULONG dwMinorVersion;
+    ULONG dwBuildNumber;
+    ULONG dwPlatformId;
+    WCHAR szCSDVersion[128];
+} OsVersionInfo;
+typedef LONG (WINAPI *PFN_RtlGetVersion)(OsVersionInfo*);
+
+static void LogEnvironment(void) {
+    OsVersionInfo os;
+    ZeroMemory(&os, sizeof(os));
+    os.dwOSVersionInfoSize = sizeof(os);
+    PFN_RtlGetVersion rtlGetVersion = (PFN_RtlGetVersion)(void*)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    if (rtlGetVersion) rtlGetVersion(&os);
+    TIME_ZONE_INFORMATION tz;
+    DWORD tzState = GetTimeZoneInformation(&tz);
+    wchar_t exePath[MAX_PATH] = L"";
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    DebugPrint(L"[ENV] Windows %lu.%lu build %lu, %d monitor(s) per GetSystemMetrics, DPI aware, exe %s\n",
+               (unsigned long)os.dwMajorVersion, (unsigned long)os.dwMinorVersion,
+               (unsigned long)os.dwBuildNumber, GetSystemMetrics(SM_CMONITORS), exePath);
+    DebugPrint(L"[ENV] time zone \"%s\" bias %ld min (state %lu)\n", tz.StandardName,
+               (long)tz.Bias, (unsigned long)tzState);
+    const Schedule* sc = &g_config.schedule;
+    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
+               g_config.allowBelowMinimum, g_config.debugLogEnabled, sc->enabled, sc->hasLocation,
+               sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
+               sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset, sc->duskEndOffset,
+               sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
     (void)lpCmdLine;
@@ -3321,6 +3559,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LoadConfigFromRegistry(&g_config);
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
     DebugPrint(L"[INFO] " APP_DISPLAY_NAME_WSTRING L" " APP_VERSION_WSTRING L" starting\n");
+    LogEnvironment();
 
     /* The loader is only needed for the configuration dialog; resolving it
      * up front surfaces a missing runtime in the log immediately rather
