@@ -1,0 +1,33 @@
+# Build artifacts
+*.o
+*.exe
+*.dll
+!assets/WebView2Loader.dll
+!releases/*.exe
+
+# Frontend build output and dependencies
+assets/node_modules/
+assets/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Machine-specific build overrides (toolchain paths etc.)
+local.mk
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editor, tool, and OS clutter
+.*
+!.gitignore
+.DS_Store
+Thumbs.db
+__pycache__/
+
+# Personal agent notes
+AGENTS.md
+CLAUDE.md

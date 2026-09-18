@@ -1,0 +1,35 @@
+#include "resource.h"
+#include "version.h"
+
+1 VERSIONINFO
+FILEVERSION APP_VERSION_RESOURCE
+PRODUCTVERSION APP_VERSION_RESOURCE
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "JPIT\0"
+            VALUE "FileDescription", APP_DISPLAY_NAME_STRING "\0"
+            VALUE "FileVersion", APP_FILE_VERSION_STRING "\0"
+            VALUE "InternalName", "NotTooBright\0"
+            VALUE "OriginalFilename", "NotTooBright.exe\0"
+            VALUE "ProductName", APP_DISPLAY_NAME_STRING "\0"
+            VALUE "ProductVersion", APP_VERSION_STRING "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
+IDI_TRAYICON     ICON   "assets/icon.ico"
+IDR_HTML_UI      RCDATA "assets/dist/index.html"
+IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
+1                24     "NotTooBright.manifest"
