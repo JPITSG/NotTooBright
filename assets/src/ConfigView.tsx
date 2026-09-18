@@ -81,6 +81,9 @@ function ModeBadge({ monitor }: { monitor: MonitorData }) {
   if (monitor.mode === "hardware") {
     text = "Hardware (DDC/CI)";
     className = "border-emerald-200 bg-emerald-50 text-emerald-700";
+  } else if (monitor.mode === "waiting") {
+    text = "DDC/CI not answering";
+    className = "border-amber-200 bg-amber-50 text-amber-700";
   } else if (monitor.mode === "software") {
     text = monitor.forceSoftware
       ? "Software (chosen)"
@@ -192,7 +195,7 @@ function MonitorCard({
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
       />
-      {monitor.hardware === "available" && (
+      {(monitor.hardware === "available" || monitor.knownHardware) && (
         <div className="flex items-center gap-2">
           <Checkbox
             id={softwareId}
@@ -207,10 +210,18 @@ function MonitorCard({
           </Label>
         </div>
       )}
-      {monitor.hardware === "unavailable" && !monitor.forceSoftware && (
+      {monitor.mode === "software" && monitor.hardware === "unavailable" && !monitor.forceSoftware && (
         <p className="text-[11px] leading-snug text-neutral-500">
           This monitor did not answer DDC/CI, so it is dimmed in software. If
           it has a DDC/CI option in its on-screen menu, enable it and rescan.
+        </p>
+      )}
+      {monitor.mode === "waiting" && (
+        <p className="text-[11px] leading-snug text-neutral-500">
+          This monitor answered DDC/CI before but is not responding now. Its
+          backlight is left exactly as it is and it is retried automatically;
+          the slider applies once it answers. To dim it in software in the
+          meantime, tick Software dimming only.
         </p>
       )}
       {scheduleEnabled && monitor.scheduled && monitor.pausedUntil && (

@@ -68,6 +68,9 @@
 #define REG_VALUE_MON_BRIGHTNESS L"Brightness"
 #define REG_VALUE_MON_SOFTWARE_ONLY L"SoftwareOnly"
 #define REG_VALUE_MON_HIDDEN L"Hidden"
+/* Set once a monitor has answered DDC/CI; such a monitor is never dimmed in
+ * software behind the user's back (its backlight may sit below 100%). */
+#define REG_VALUE_MON_HARDWARE L"HardwareControl"
 /* The DDC/CI value the monitor reported the very first time it was seen,
  * before anything was written to it; restored when the monitor is hidden. */
 #define REG_VALUE_MON_ORIGINAL L"OriginalBrightness"
@@ -127,8 +130,20 @@
 #define SOFT_MIN_BRIGHTNESS 10
 #define SOFT_MAX_DIM (100 - SOFT_MIN_BRIGHTNESS)
 /* After this many consecutive failed DDC/CI writes a monitor is treated as
- * software-only until the next rescan. */
+ * not answering: software-only if it never worked, otherwise left alone and
+ * re-probed with a growing delay. */
 #define DDC_MAX_CONSECUTIVE_FAILURES 3
+#define ID_TIMER_DDC_RETRY 7
+#define DDC_RETRY_INITIAL_MS 3000
+#define DDC_RETRY_MAX_MS 60000
+/* Probe attempts per monitor and the pauses between them: DDC/CI often
+ * drops the first request after a handle is opened or a display change. */
+#define DDC_PROBE_ATTEMPTS 3
+#define DDC_HANDLE_SETTLE_MS 100
+/* A monitor that has never answered is re-probed this many times after a
+ * failure (a flaky first probe must not lock it into software mode); one
+ * that has answered before is retried for as long as it takes. */
+#define DDC_UNKNOWN_MONITOR_RETRIES 3
 
 /* The schedule is evaluated on this timer while enabled; values only
  * change by whole percents, so this is plenty for a slow transition. */
@@ -390,7 +405,8 @@ typedef enum {
 typedef enum {
     MODE_PROBING = 0,
     MODE_HARDWARE,
-    MODE_SOFTWARE
+    MODE_SOFTWARE,
+    MODE_WAITING      /* known DDC/CI monitor not answering: left alone, retried */
 } BrightnessMode;
 
 /* One entry per physical monitor. A display (HMONITOR) normally has exactly
@@ -405,6 +421,8 @@ typedef struct {
     RECT rect;
     BOOL primary;
     HardwareState hardwareState;
+    BOOL knownHardware;           /* has answered DDC/CI at some point (persisted) */
+    int probeFailures;            /* consecutive failed probes in this outage */
     DWORD ddcMax;
     DWORD ddcCurrent;
     BOOL forceSoftware;           /* user asked for software dimming only */
@@ -466,6 +484,8 @@ static int g_monitorCount = 0;
 static int g_nextUid = 1;
 static HPOWERNOTIFY g_displayStateNotify = NULL;
 static LONG g_lastDisplayState = -1;
+static UINT g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
+static BOOL g_ddcRetryPending = FALSE;
 
 /* DDC/CI worker thread and its shared request state (guarded by g_ddcLock). */
 static CRITICAL_SECTION g_ddcLock;
@@ -507,6 +527,7 @@ static void ApplyMonitor(Monitor* m);
 static void SetMonitorValue(Monitor* m, int value);
 static void RefreshMonitors(void);
 static void ScheduleMonitorRefresh(UINT delayMs);
+static void ScheduleDdcRetry(void);
 static void SchedulePersist(void);
 static void PersistDirtyMonitors(void);
 static int VisibleMonitorCount(void);
@@ -789,6 +810,7 @@ static void LoadMonitorSettings(Monitor* m) {
     }
     ReadRegistryBool(hKey, REG_VALUE_MON_SOFTWARE_ONLY, &m->forceSoftware);
     ReadRegistryBool(hKey, REG_VALUE_MON_HIDDEN, &m->hidden);
+    ReadRegistryBool(hKey, REG_VALUE_MON_HARDWARE, &m->knownHardware);
     ReadRegistryBool(hKey, REG_VALUE_MON_SCHEDULED, &m->scheduled);
     ReadRegistryQword(hKey, REG_VALUE_MON_PAUSED_UNTIL, &m->pausedUntil);
     DWORD original = 0, originalMax = 0;
@@ -817,6 +839,7 @@ static void SaveMonitorSettings(const Monitor* m) {
     }
     WriteRegistryDword(hKey, REG_VALUE_MON_SOFTWARE_ONLY, m->forceSoftware ? 1 : 0);
     WriteRegistryDword(hKey, REG_VALUE_MON_HIDDEN, m->hidden ? 1 : 0);
+    WriteRegistryDword(hKey, REG_VALUE_MON_HARDWARE, m->knownHardware ? 1 : 0);
     WriteRegistryDword(hKey, REG_VALUE_MON_SCHEDULED, m->scheduled ? 1 : 0);
     WriteRegistryQword(hKey, REG_VALUE_MON_PAUSED_UNTIL, m->pausedUntil);
     if (m->hasOriginal) {
@@ -1340,6 +1363,7 @@ static WorkerSource* AcquireWorkerSource(WorkerSource* sources, int* count, HMON
         s->monitors = (PHYSICAL_MONITOR*)calloc(n, sizeof(PHYSICAL_MONITOR));
         if (s->monitors && GetPhysicalMonitorsFromHMONITOR(hmon, n, s->monitors)) {
             s->count = n;
+            Sleep(DDC_HANDLE_SETTLE_MS);
         } else {
             DebugPrint(L"[WARNING] GetPhysicalMonitorsFromHMONITOR failed (error %lu)\n",
                        (unsigned long)GetLastError());
@@ -1364,11 +1388,10 @@ static void ProbeWorkerMonitor(WorkerMonitor* wm) {
         ULONGLONG start = GetTickCount64();
         MC_VCP_CODE_TYPE type = MC_SET_PARAMETER;
         DWORD current = 0, max = 0;
-        BOOL ok = GetVCPFeatureAndVCPFeatureReply(wm->handle, VCP_BRIGHTNESS, &type, &current, &max);
-        if (!ok) {
-            /* A first request right after a display change is often lost. */
-            r->error = GetLastError();
-            Sleep(200);
+        static const DWORD retryWaitMs[DDC_PROBE_ATTEMPTS] = { 0, 250, 750 };
+        BOOL ok = FALSE;
+        for (int attempt = 0; attempt < DDC_PROBE_ATTEMPTS && !ok; attempt++) {
+            if (retryWaitMs[attempt]) Sleep(retryWaitMs[attempt]);
             ok = GetVCPFeatureAndVCPFeatureReply(wm->handle, VCP_BRIGHTNESS, &type, &current, &max);
             if (!ok) r->error = GetLastError();
         }
@@ -1527,7 +1550,12 @@ static Monitor* FindMonitorByUid(int uid) {
 static BrightnessMode MonitorMode(const Monitor* m) {
     if (m->forceSoftware) return MODE_SOFTWARE;
     if (m->hardwareState == HW_AVAILABLE) return MODE_HARDWARE;
-    if (m->hardwareState == HW_UNAVAILABLE) return MODE_SOFTWARE;
+    if (m->hardwareState == HW_UNAVAILABLE) {
+        /* A monitor that has worked over DDC/CI may well have its backlight
+         * below 100% right now; dimming it in software on top of that would
+         * stack the two. Leave it alone and keep retrying instead. */
+        return m->knownHardware ? MODE_WAITING : MODE_SOFTWARE;
+    }
     return MODE_PROBING;
 }
 
@@ -1537,7 +1565,8 @@ static BrightnessMode MonitorMode(const Monitor* m) {
 static int MonitorMinValue(const Monitor* m) {
     switch (MonitorMode(m)) {
         case MODE_SOFTWARE: return SOFT_MIN_BRIGHTNESS;
-        case MODE_HARDWARE: return g_config.allowBelowMinimum ? -SOFT_MAX_DIM : 0;
+        case MODE_HARDWARE:
+        case MODE_WAITING: return g_config.allowBelowMinimum ? -SOFT_MAX_DIM : 0;
         default: return 0;
     }
 }
@@ -1559,6 +1588,7 @@ static void ApplyMonitor(Monitor* m) {
     if (m->hidden) return;
     BrightnessMode mode = MonitorMode(m);
     if (mode == MODE_PROBING) return;   /* applied when the probe answers */
+    if (mode == MODE_WAITING) return;   /* nothing is touched until it answers */
 
     int value = ClampMonitorValue(m, m->value);
     if (value != m->value) {
@@ -1608,6 +1638,17 @@ static void PersistDirtyMonitors(void) {
 
 static void ScheduleMonitorRefresh(UINT delayMs) {
     if (g_hwnd) SetTimer(g_hwnd, ID_TIMER_REFRESH_MONITORS, delayMs, NULL);
+}
+
+/* Re-probes everything after a growing delay while a known DDC/CI monitor
+ * is not answering (3 s, 6 s, ... up to a minute, then every minute). */
+static void ScheduleDdcRetry(void) {
+    if (!g_hwnd || g_ddcRetryPending) return;
+    g_ddcRetryPending = TRUE;
+    SetTimer(g_hwnd, ID_TIMER_DDC_RETRY, g_ddcRetryDelayMs, NULL);
+    DebugPrint(L"[INFO] Next DDC/CI retry in %u ms\n", g_ddcRetryDelayMs);
+    g_ddcRetryDelayMs *= 2;
+    if (g_ddcRetryDelayMs > DDC_RETRY_MAX_MS) g_ddcRetryDelayMs = DDC_RETRY_MAX_MS;
 }
 
 typedef struct {
@@ -1696,11 +1737,18 @@ static void RefreshMonitors(void) {
         }
         if (old) {
             dst->uid = old->uid;
+            /* Keep the last known hardware state while the re-probe runs so
+             * the dialog does not flash "detecting" on every retry. */
+            dst->hardwareState = old->hardwareState;
+            dst->ddcMax = old->ddcMax;
+            dst->ddcCurrent = old->ddcCurrent;
             dst->value = old->value;
             dst->hasValue = old->hasValue;
             dst->forceSoftware = old->forceSoftware;
             dst->hidden = old->hidden;
             dst->hasOriginal = old->hasOriginal;
+            dst->knownHardware = old->knownHardware;
+            dst->probeFailures = old->probeFailures;
             dst->originalRaw = old->originalRaw;
             dst->originalMax = old->originalMax;
             dst->overlay = old->overlay;
@@ -1820,6 +1868,17 @@ static void HandleDdcProbed(DdcProbeResult* r) {
             m->ddcCurrent = r->current;
             m->failures = 0;
             m->error[0] = L'\0';
+            if (m->probeFailures > 0) {
+                DebugPrint(L"[INFO] %s (%s): DDC/CI answering again after %d failed probe(s)\n",
+                           m->name, m->device, m->probeFailures);
+                m->probeFailures = 0;
+                g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
+            }
+            if (!m->knownHardware) {
+                m->knownHardware = TRUE;
+                m->dirty = TRUE;
+                SchedulePersist();
+            }
             int percent = (int)((r->current * 100 + r->max / 2) / r->max);
             if (percent > 100) percent = 100;
             if (!m->hasOriginal) {
@@ -1849,6 +1908,7 @@ static void HandleDdcProbed(DdcProbeResult* r) {
                        (unsigned long)r->max, (unsigned long)r->elapsedMs);
         } else {
             m->hardwareState = HW_UNAVAILABLE;
+            m->probeFailures++;
             if (!m->hasValue) {
                 m->value = 100;
                 m->hasValue = TRUE;
@@ -1856,9 +1916,20 @@ static void HandleDdcProbed(DdcProbeResult* r) {
                 SchedulePersist();
             }
             ApplyScheduleAfterProbe(m);
-            DebugPrint(L"[INFO] %s (%s): no DDC/CI brightness (error %lu, %lu ms); using software dimming\n",
-                       m->name, m->device, (unsigned long)r->error,
-                       (unsigned long)r->elapsedMs);
+            if (m->knownHardware && !m->forceSoftware) {
+                /* The dialog explains the waiting state itself. */
+                m->error[0] = L'\0';
+                DebugPrint(L"[WARNING] %s (%s): DDC/CI not answering (error %lu, %lu ms, failure %d); "
+                           L"leaving the monitor alone and retrying\n",
+                           m->name, m->device, (unsigned long)r->error,
+                           (unsigned long)r->elapsedMs, m->probeFailures);
+                ScheduleDdcRetry();
+            } else {
+                DebugPrint(L"[INFO] %s (%s): no DDC/CI brightness (error %lu, %lu ms); using software dimming\n",
+                           m->name, m->device, (unsigned long)r->error,
+                           (unsigned long)r->elapsedMs);
+                if (!m->forceSoftware && m->probeFailures <= DDC_UNKNOWN_MONITOR_RETRIES) ScheduleDdcRetry();
+            }
         }
         if (!r->supported) m->lastHwSent = -1;
         ApplyMonitor(m);
@@ -1890,12 +1961,10 @@ static void HandleDdcSetResult(int uid, BOOL success) {
     m->lastHwSent = -1;   /* the next change retries instead of being skipped */
     if (m->failures >= DDC_MAX_CONSECUTIVE_FAILURES && m->hardwareState == HW_AVAILABLE) {
         m->hardwareState = HW_UNAVAILABLE;
-        wcscpy_s(m->error, sizeof(m->error) / sizeof(wchar_t),
-                 L"The monitor stopped answering DDC/CI; switched to software dimming. "
-                 L"Rescan to try hardware control again.");
-        DebugPrint(L"[WARNING] %s (%s): %d consecutive DDC/CI failures; falling back to software\n",
+        m->error[0] = L'\0';
+        DebugPrint(L"[WARNING] %s (%s): %d consecutive DDC/CI failures; leaving the monitor alone and retrying\n",
                    m->name, m->device, m->failures);
-        ApplyMonitor(m);
+        ScheduleDdcRetry();
     } else {
         wcscpy_s(m->error, sizeof(m->error) / sizeof(wchar_t),
                  L"The monitor did not accept the last brightness change.");
@@ -2136,7 +2205,8 @@ static void EvaluateSchedule(void) {
             changed = TRUE;
             DebugPrint(L"[INFO] %s (%s): automatic brightness resumed\n", m->name, m->device);
         }
-        if (MonitorMode(m) == MODE_PROBING) continue;
+        BrightnessMode mode = MonitorMode(m);
+        if (mode == MODE_PROBING || mode == MODE_WAITING) continue;
         int value = ClampMonitorValue(m, target);
         if (!m->hasValue || m->value != value) {
             DebugPrint(L"[INFO] %s (%s): schedule sets %d%%\n", m->name, m->device, value);
@@ -2260,6 +2330,7 @@ static const wchar_t* ModeName(BrightnessMode mode) {
     switch (mode) {
         case MODE_HARDWARE: return L"hardware";
         case MODE_SOFTWARE: return L"software";
+        case MODE_WAITING: return L"waiting";
         default: return L"probing";
     }
 }
@@ -2284,13 +2355,14 @@ static wchar_t* BuildMonitorsJson(void) {
         int written = swprintf_s(buf + len, cap - len,
             L"%s{\"uid\":%d,\"key\":\"%s\",\"name\":\"%s\",\"device\":\"%s\","
             L"\"width\":%ld,\"height\":%ld,\"primary\":%s,\"hardware\":\"%s\","
-            L"\"mode\":\"%s\",\"forceSoftware\":%s,\"hidden\":%s,\"value\":%d,"
+            L"\"mode\":\"%s\",\"knownHardware\":%s,\"forceSoftware\":%s,\"hidden\":%s,\"value\":%d,"
             L"\"min\":%d,\"max\":100,\"scheduled\":%s,\"pausedUntil\":\"%s\","
             L"\"error\":\"%s\"}",
             i == 0 ? L"" : L",", m->uid, eKey, eName, eDevice,
             (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
             m->primary ? L"true" : L"false", HardwareStateName(m->hardwareState),
-            ModeName(MonitorMode(m)), m->forceSoftware ? L"true" : L"false",
+            ModeName(MonitorMode(m)), m->knownHardware ? L"true" : L"false",
+            m->forceSoftware ? L"true" : L"false",
             m->hidden ? L"true" : L"false",
             m->hasValue ? m->value : 100, MonitorMinValue(m),
             m->scheduled ? L"true" : L"false", pausedUntil, eError);
@@ -2676,7 +2748,13 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             SchedulePersist();
             DebugPrint(L"[INFO] %s (%s): software-only dimming %s\n", m->name, m->device,
                        m->forceSoftware ? L"enabled" : L"disabled");
-            ApplyMonitor(m);
+            if (m->forceSoftware) {
+                ApplyMonitor(m);
+            } else {
+                SetOverlayDim(m, 0);
+                if (m->hardwareState == HW_AVAILABLE) ApplyMonitor(m);
+                else ScheduleMonitorRefresh(0);   /* probe again now */
+            }
             PushMonitorsToDialog();
         }
     } else if (strcmp(action, "setAllowBelowMinimum") == 0) {
@@ -2728,6 +2806,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         }
     } else if (strcmp(action, "refreshMonitors") == 0) {
         DebugPrint(L"[INFO] Rescan requested from the configuration dialog\n");
+        g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
         UnhideAllMonitors();
         RefreshMonitors();
     } else if (strcmp(action, "resumeSchedule") == 0) {
@@ -3045,6 +3124,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case ID_TIMER_SCHEDULE:
                     EvaluateSchedule();
                     return 0;
+                case ID_TIMER_DDC_RETRY:
+                    KillTimer(hwnd, ID_TIMER_DDC_RETRY);
+                    g_ddcRetryPending = FALSE;
+                    DebugPrint(L"[INFO] Retrying DDC/CI\n");
+                    RefreshMonitors();
+                    return 0;
             }
             break;
 
@@ -3213,6 +3298,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST);
     KillTimer(g_hwnd, ID_TIMER_PERSIST);
     KillTimer(g_hwnd, ID_TIMER_SCHEDULE);
+    KillTimer(g_hwnd, ID_TIMER_DDC_RETRY);
     PersistDirtyMonitors();
     DestroyAllOverlays();
     StopDdcWorker();

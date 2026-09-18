@@ -1,5 +1,8 @@
 export type HardwareState = "probing" | "available" | "unavailable";
-export type BrightnessMode = "probing" | "hardware" | "software";
+// "waiting": a monitor that has answered DDC/CI before is not responding;
+// it is left alone (no software dimming on top of its backlight) and
+// retried automatically.
+export type BrightnessMode = "probing" | "hardware" | "software" | "waiting";
 
 export interface MonitorData {
   uid: number;
@@ -11,6 +14,8 @@ export interface MonitorData {
   primary: boolean;
   hardware: HardwareState;
   mode: BrightnessMode;
+  // Has answered DDC/CI at some point (remembered across restarts).
+  knownHardware: boolean;
   forceSoftware: boolean;
   // Removed from the dialog and left alone until the next rescan.
   hidden: boolean;

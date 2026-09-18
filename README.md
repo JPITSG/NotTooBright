@@ -43,8 +43,18 @@ docks, KVMs, USB-C hubs, DisplayLink adapters, virtual machines, remote
 sessions), the monitor is switched to **software dimming**: a topmost,
 click-through black overlay whose transparency follows the slider. It cannot
 lower the backlight, but it works everywhere, needs no driver support, and
-never affects screenshots or screen sharing. Monitors that repeatedly fail
-DDC/CI writes fall back to software automatically until the next rescan.
+never affects screenshots or screen sharing.
+
+A monitor that has answered DDC/CI before is treated differently when it
+stops responding (a flaky first request after start-up or a display change,
+a KVM switched away, a cable swap): its backlight may well be sitting below
+100% from an earlier setting, and dimming it in software on top of that
+would stack the two. Such a monitor is left exactly as it is, shown as
+*DDC/CI not answering*, and retried automatically with a growing delay (3 s,
+6 s, ... up to once a minute) until it answers again; its slider applies as
+soon as it does. **Software dimming only** remains available as an explicit
+choice in the meantime. Monitors that have never answered are re-probed a
+few times after start-up and otherwise use software dimming.
 
 Both methods are behind the same per-monitor slider. With **Allow dimming
 below the hardware minimum** enabled, the slider of a hardware-controlled
@@ -102,7 +112,7 @@ brightness section applies immediately; the settings below it are saved with
 |---------|-------------|
 | All monitors | Sets every monitor to the same value (shown only with more than one monitor). |
 | Per-monitor slider | The brightness of that monitor. The badge shows how it is controlled: **Hardware (DDC/CI)**, **Software (no DDC/CI)**, or **Software (chosen)**. |
-| Software dimming only | Shown for hardware-capable monitors. Uses the overlay instead of DDC/CI and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values. |
+| Software dimming only | Shown for monitors that have answered DDC/CI. Uses the overlay instead of DDC/CI and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values, or that have stopped answering. |
 | Hide | Puts the monitor back to the brightness it had when Not Too Bright first saw it, then removes it from the list and stops controlling it entirely, as if it were not connected: its dimming overlay is removed, it is no longer probed, and no further brightness changes are sent. The last monitor in the list cannot be hidden. Hidden monitors stay hidden across restarts and display changes until you choose **Rescan**. |
 | Rescan | Re-detects monitors, probes DDC/CI again (for example after enabling DDC/CI in a monitor's menu), and shows every hidden monitor again. |
 | Allow dimming below the hardware minimum | Extends hardware-controlled sliders below 0% into software dimming (down to -90%). Applies immediately. Disabled by default. |
