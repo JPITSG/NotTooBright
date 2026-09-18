@@ -12,6 +12,8 @@ export interface MonitorData {
   hardware: HardwareState;
   mode: BrightnessMode;
   forceSoftware: boolean;
+  // Removed from the dialog and left alone until the next rescan.
+  hidden: boolean;
   // Desired brightness. 0..100 drives the backlight on hardware monitors;
   // negative values (only when allowed) add software dimming below the
   // backlight's minimum. Software-only monitors use min..100.
@@ -77,6 +79,10 @@ export function setAllBrightness(value: number) {
 
 export function setMonitorSoftwareOnly(uid: number, softwareOnly: boolean) {
   post({ action: "setMonitorSoftwareOnly", uid, softwareOnly });
+}
+
+export function hideMonitor(uid: number) {
+  post({ action: "hideMonitor", uid });
 }
 
 export function setAllowBelowMinimum(enabled: boolean) {

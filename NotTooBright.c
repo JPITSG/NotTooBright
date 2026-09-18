@@ -66,6 +66,7 @@
 #define REG_MONITORS_SUBKEY L"Monitors"
 #define REG_VALUE_MON_BRIGHTNESS L"Brightness"
 #define REG_VALUE_MON_SOFTWARE_ONLY L"SoftwareOnly"
+#define REG_VALUE_MON_HIDDEN L"Hidden"
 #define REG_VALUE_MON_NAME L"Name"
 
 #define TRAY_ICON_ID 100
@@ -347,6 +348,7 @@ typedef struct {
     DWORD ddcMax;
     DWORD ddcCurrent;
     BOOL forceSoftware;           /* user asked for software dimming only */
+    BOOL hidden;                  /* removed from the dialog and left alone until a rescan */
     int value;                    /* desired brightness, -SOFT_MAX_DIM..100 */
     BOOL hasValue;
     int lastHwSent;               /* last percent handed to the worker, -1 = none */
@@ -441,6 +443,8 @@ static void RefreshMonitors(void);
 static void ScheduleMonitorRefresh(UINT delayMs);
 static void SchedulePersist(void);
 static void PersistDirtyMonitors(void);
+static int VisibleMonitorCount(void);
+static void UnhideAllMonitors(void);
 static void DdcRequestSet(int uid, int percent);
 static void DdcRequestProbe(const DdcProbeEntry* entries, int count);
 static BOOL load_webview2_loader(void);
@@ -606,6 +610,7 @@ static void LoadMonitorSettings(Monitor* m) {
         m->hasValue = TRUE;
     }
     ReadRegistryBool(hKey, REG_VALUE_MON_SOFTWARE_ONLY, &m->forceSoftware);
+    ReadRegistryBool(hKey, REG_VALUE_MON_HIDDEN, &m->hidden);
     RegCloseKey(hKey);
 }
 
@@ -619,6 +624,7 @@ static void SaveMonitorSettings(const Monitor* m) {
         WriteRegistryDword(hKey, REG_VALUE_MON_BRIGHTNESS, (DWORD)(LONG)m->value);
     }
     WriteRegistryDword(hKey, REG_VALUE_MON_SOFTWARE_ONLY, m->forceSoftware ? 1 : 0);
+    WriteRegistryDword(hKey, REG_VALUE_MON_HIDDEN, m->hidden ? 1 : 0);
     /* Informational: lets a user recognise entries when browsing the registry. */
     RegSetValueExW(hKey, REG_VALUE_MON_NAME, 0, REG_SZ, (const BYTE*)m->name,
                    (DWORD)((wcslen(m->name) + 1) * sizeof(wchar_t)));
@@ -1320,6 +1326,12 @@ static int ClampMonitorValue(const Monitor* m, int value) {
  * its minimum and add software dimming. Software monitors: the overlay
  * alone provides the whole range. */
 static void ApplyMonitor(Monitor* m) {
+    if (m->hidden) {
+        /* Hidden monitors are left alone: no overlay and no DDC/CI writes.
+         * The backlight simply stays where it last was. */
+        SetOverlayDim(m, 0);
+        return;
+    }
     BrightnessMode mode = MonitorMode(m);
     if (mode == MODE_PROBING) return;   /* applied when the probe answers */
 
@@ -1461,6 +1473,7 @@ static void RefreshMonitors(void) {
             dst->value = old->value;
             dst->hasValue = old->hasValue;
             dst->forceSoftware = old->forceSoftware;
+            dst->hidden = old->hidden;
             dst->overlay = old->overlay;
             dst->overlayDim = old->overlayDim;
             dst->dirty = old->dirty;
@@ -1479,31 +1492,91 @@ static void RefreshMonitors(void) {
     memcpy(g_monitors, merged, sizeof(merged));
     g_monitorCount = freshCount;
 
+    /* Hiding the last visible monitor is refused, but unplugging the others
+     * can still leave only hidden ones behind; never present an empty list. */
+    if (g_monitorCount > 0 && VisibleMonitorCount() == 0) {
+        DebugPrint(L"[INFO] Only hidden monitors remain; showing them again\n");
+        for (int i = 0; i < g_monitorCount; i++) {
+            g_monitors[i].hidden = FALSE;
+            g_monitors[i].dirty = TRUE;
+        }
+        SchedulePersist();
+    }
+
     DdcProbeEntry probe[MAX_MONITORS];
+    int probeCount = 0;
     for (int i = 0; i < g_monitorCount; i++) {
         Monitor* m = &g_monitors[i];
         if (m->physicalIndex == 0) {
             if (!m->overlay) m->overlay = CreateOverlayWindow(&m->rect);
             else PositionOverlay(m);
-            if (m->overlayDim > 0) SetOverlayDim(m, m->overlayDim);
+            if (m->overlayDim > 0 && !m->hidden) SetOverlayDim(m, m->overlayDim);
+            else if (m->hidden) SetOverlayDim(m, 0);
         } else if (m->overlay) {
             DestroyWindow(m->overlay);
             m->overlay = NULL;
         }
-        probe[i].uid = m->uid;
-        probe[i].hmon = m->hmon;
-        probe[i].physicalIndex = m->physicalIndex;
-        DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s%s\n",
+        /* Hidden monitors are not even probed; they are left alone until a
+         * rescan brings them back. */
+        if (!m->hidden) {
+            probe[probeCount].uid = m->uid;
+            probe[probeCount].hmon = m->hmon;
+            probe[probeCount].physicalIndex = m->physicalIndex;
+            probeCount++;
+        }
+        DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s%s%s\n",
                    m->uid, m->name, m->device,
                    (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
                    m->primary ? L", primary" : L"", m->key,
                    m->hasValue ? m->value : -1000,
                    m->hasValue ? L"" : L" (none saved)",
-                   m->forceSoftware ? L", software only" : L"");
+                   m->forceSoftware ? L", software only" : L"",
+                   m->hidden ? L", hidden" : L"");
     }
-    DebugPrint(L"[INFO] %d monitor(s) enumerated; probing DDC/CI\n", g_monitorCount);
-    DdcRequestProbe(probe, g_monitorCount);
+    DebugPrint(L"[INFO] %d monitor(s) enumerated, %d hidden; probing DDC/CI\n",
+               g_monitorCount, g_monitorCount - probeCount);
+    DdcRequestProbe(probe, probeCount);
     PushMonitorsToDialog();
+}
+
+static int VisibleMonitorCount(void) {
+    int count = 0;
+    for (int i = 0; i < g_monitorCount; i++) {
+        if (!g_monitors[i].hidden) count++;
+    }
+    return count;
+}
+
+/* A rescan brings every monitor back, including hidden ones that are not
+ * connected right now, so the stored flag is cleared for all known
+ * monitors rather than only the current list. */
+static void UnhideAllMonitors(void) {
+    for (int i = 0; i < g_monitorCount; i++) {
+        if (g_monitors[i].hidden) {
+            g_monitors[i].hidden = FALSE;
+            g_monitors[i].dirty = TRUE;
+        }
+    }
+    PersistDirtyMonitors();
+
+    HKEY hMonitors;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH L"\\" REG_MONITORS_SUBKEY, 0,
+                      KEY_READ, &hMonitors) != ERROR_SUCCESS) {
+        return;
+    }
+    for (DWORD index = 0;; index++) {
+        wchar_t name[256];
+        DWORD nameCount = sizeof(name) / sizeof(wchar_t);
+        if (RegEnumKeyExW(hMonitors, index, name, &nameCount, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+            break;
+        }
+        HKEY hMonitor;
+        if (RegOpenKeyExW(hMonitors, name, 0, KEY_SET_VALUE, &hMonitor) == ERROR_SUCCESS) {
+            WriteRegistryDword(hMonitor, REG_VALUE_MON_HIDDEN, 0);
+            RegCloseKey(hMonitor);
+        }
+    }
+    RegCloseKey(hMonitors);
 }
 
 static void HandleDdcProbed(DdcProbeResult* r) {
@@ -1682,12 +1755,13 @@ static wchar_t* BuildMonitorsJson(void) {
         int written = swprintf_s(buf + len, cap - len,
             L"%s{\"uid\":%d,\"key\":\"%s\",\"name\":\"%s\",\"device\":\"%s\","
             L"\"width\":%ld,\"height\":%ld,\"primary\":%s,\"hardware\":\"%s\","
-            L"\"mode\":\"%s\",\"forceSoftware\":%s,\"value\":%d,\"min\":%d,"
-            L"\"max\":100,\"error\":\"%s\"}",
+            L"\"mode\":\"%s\",\"forceSoftware\":%s,\"hidden\":%s,\"value\":%d,"
+            L"\"min\":%d,\"max\":100,\"error\":\"%s\"}",
             i == 0 ? L"" : L",", m->uid, eKey, eName, eDevice,
             (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
             m->primary ? L"true" : L"false", HardwareStateName(m->hardwareState),
             ModeName(MonitorMode(m)), m->forceSoftware ? L"true" : L"false",
+            m->hidden ? L"true" : L"false",
             m->hasValue ? m->value : 100, MonitorMinValue(m), eError);
         if (written > 0) len += (size_t)written;
     }
@@ -1978,7 +2052,9 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     } else if (strcmp(action, "setAllBrightness") == 0) {
         int value = 0;
         if (json_get_int(msg, "value", &value)) {
-            for (int i = 0; i < g_monitorCount; i++) SetMonitorValue(&g_monitors[i], value);
+            for (int i = 0; i < g_monitorCount; i++) {
+                if (!g_monitors[i].hidden) SetMonitorValue(&g_monitors[i], value);
+            }
         }
     } else if (strcmp(action, "setMonitorSoftwareOnly") == 0) {
         int uid = -1;
@@ -2003,8 +2079,26 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         /* Re-clamp: disabling pulls any monitor parked below 0 back up. */
         for (int i = 0; i < g_monitorCount; i++) ApplyMonitor(&g_monitors[i]);
         PushMonitorsToDialog();
+    } else if (strcmp(action, "hideMonitor") == 0) {
+        int uid = -1;
+        Monitor* m = json_get_int(msg, "uid", &uid) ? FindMonitorByUid(uid) : NULL;
+        if (m && !m->hidden) {
+            /* The last visible monitor can never be hidden: there would be
+             * nothing left to control and no card to bring things back. */
+            if (VisibleMonitorCount() <= 1) {
+                DebugPrint(L"[INFO] Refused to hide the last visible monitor (%s)\n", m->name);
+            } else {
+                m->hidden = TRUE;
+                m->dirty = TRUE;
+                SchedulePersist();
+                DebugPrint(L"[INFO] %s (%s): hidden until the next rescan\n", m->name, m->device);
+                ApplyMonitor(m);
+            }
+            PushMonitorsToDialog();
+        }
     } else if (strcmp(action, "refreshMonitors") == 0) {
         DebugPrint(L"[INFO] Rescan requested from the configuration dialog\n");
+        UnhideAllMonitors();
         RefreshMonitors();
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);

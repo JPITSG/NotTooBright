@@ -8,6 +8,7 @@ import {
   setAllBrightness,
   setMonitorSoftwareOnly,
   setAllowBelowMinimum,
+  hideMonitor,
   refreshMonitors,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
@@ -94,15 +95,19 @@ function ModeBadge({ monitor }: { monitor: MonitorData }) {
 interface MonitorCardProps {
   monitor: MonitorData;
   value: number;
+  canHide: boolean;
   onChange: (value: number) => void;
   onSoftwareOnlyChange: (softwareOnly: boolean) => void;
+  onHide: () => void;
 }
 
 function MonitorCard({
   monitor,
   value,
+  canHide,
   onChange,
   onSoftwareOnlyChange,
+  onHide,
 }: MonitorCardProps) {
   const sliderId = `brightness-${monitor.uid}`;
   const softwareId = `software-${monitor.uid}`;
@@ -132,6 +137,21 @@ function MonitorCard({
           <span className="w-10 text-right text-xs tabular-nums">
             {formatValue(value)}
           </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-[11px] text-neutral-500"
+            disabled={!canHide}
+            title={
+              canHide
+                ? "Remove this monitor from the list and leave it alone until the next rescan"
+                : "The last monitor in the list cannot be hidden"
+            }
+            aria-label={`Hide ${monitor.name}`}
+            onClick={onHide}
+          >
+            Hide
+          </Button>
         </div>
       </div>
       <Slider
@@ -177,6 +197,9 @@ export default function ConfigView({ config, monitors }: Props) {
   );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const throttledSend = useThrottledSender();
+  const visibleMonitors = monitors.filter((m) => !m.hidden);
+  const hiddenCount = monitors.length - visibleMonitors.length;
+  const canHide = visibleMonitors.length > 1;
 
   // The host is the source of truth: whenever it pushes a monitor list
   // (probe finished, display change, mode switch) adopt its values.
@@ -198,18 +221,19 @@ export default function ConfigView({ config, monitors }: Props) {
     throttledSend(monitor.uid, () => setBrightness(monitor.uid, value));
   }
 
-  const masterMin = monitors.reduce((min, m) => Math.max(min, m.min), 0);
+  const masterMin = visibleMonitors.reduce((min, m) => Math.max(min, m.min), 0);
   const masterValue =
-    monitors.length > 0
+    visibleMonitors.length > 0
       ? Math.round(
-          monitors.reduce((sum, m) => sum + valueOf(m), 0) / monitors.length
+          visibleMonitors.reduce((sum, m) => sum + valueOf(m), 0) /
+            visibleMonitors.length
         )
       : 100;
 
   function handleMasterChange(value: number) {
-    setValues(() => {
-      const next: Record<number, number> = {};
-      for (const m of monitors) next[m.uid] = clamp(value, m.min, m.max);
+    setValues((current) => {
+      const next = { ...current };
+      for (const m of visibleMonitors) next[m.uid] = clamp(value, m.min, m.max);
       return next;
     });
     throttledSend(MASTER_KEY, () => setAllBrightness(value));
@@ -237,19 +261,20 @@ export default function ConfigView({ config, monitors }: Props) {
           variant="outline"
           size="sm"
           className="shrink-0"
+          title="Detect monitors again and show any hidden ones"
           onClick={refreshMonitors}
         >
           Rescan
         </Button>
       </div>
 
-      {monitors.length === 0 && (
+      {visibleMonitors.length === 0 && (
         <p className="rounded-md border border-neutral-200 px-3 py-2 text-[11px] leading-snug text-neutral-500">
           No monitors were detected. Connect a display and choose Rescan.
         </p>
       )}
 
-      {monitors.length > 1 && (
+      {visibleMonitors.length > 1 && (
         <div className="space-y-1.5 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2">
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor="brightness-all" className="text-xs">
@@ -270,17 +295,28 @@ export default function ConfigView({ config, monitors }: Props) {
         </div>
       )}
 
-      {monitors.map((monitor) => (
+      {visibleMonitors.map((monitor) => (
         <MonitorCard
           key={monitor.uid}
           monitor={monitor}
           value={valueOf(monitor)}
+          canHide={canHide}
           onChange={(value) => handleMonitorChange(monitor, value)}
           onSoftwareOnlyChange={(softwareOnly) =>
             setMonitorSoftwareOnly(monitor.uid, softwareOnly)
           }
+          onHide={() => hideMonitor(monitor.uid)}
         />
       ))}
+
+      {hiddenCount > 0 && (
+        <p className="text-[11px] leading-snug text-neutral-500">
+          {hiddenCount === 1
+            ? "1 monitor is hidden and left alone."
+            : `${hiddenCount} monitors are hidden and left alone.`}{" "}
+          Rescan shows hidden monitors again.
+        </p>
+      )}
 
       <div className="flex items-start gap-2 pt-1">
         <Checkbox
