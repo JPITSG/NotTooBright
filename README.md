@@ -32,8 +32,9 @@ else, and an optional schedule that follows the sun for your location.
 
 Hover the icon for a tooltip listing every monitor and its current
 brightness. Right-click it for **Configure** and **Exit**, plus **Increase
-brightness** / **Decrease brightness** once you have chosen which monitor the
-menu controls (see *Tray menu brightness control*). Requires Windows 10 or 11
+brightness** / **Decrease brightness** and any preset levels you have listed
+once you have chosen which monitor the menu controls (see *Tray menu
+brightness control*). Requires Windows 10 or 11
 (64-bit) and the [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
 which is already installed on virtually every Windows 10/11 machine.
 
@@ -163,6 +164,7 @@ brightness section applies immediately; the settings below it are saved with
 | Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
 | Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
 | Tray menu brightness control | Chooses what the tray menu's **Increase brightness** and **Decrease brightness** items act on: **None** (the items are not shown; the default), **All monitors**, or one specific monitor. Each click moves the target by 10% from its current value; that counts as a manual change for scheduled monitors. Saved with **Save**. |
+| Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed, with a bullet on the level the target is currently at. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Update (button) | Checks the repository for a newer build right now and shows the result; see [Updates](#updates). |
 | Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
@@ -176,7 +178,7 @@ next to the executable, so it can run from any folder.
 
 | Location | Contents |
 |----------|----------|
-| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule, the tray menu target, update checking and the ignored update version, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule, the tray menu target and preset levels, update checking and the ignored update version, debug logging |
 | `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, pause deadline, original brightness |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |

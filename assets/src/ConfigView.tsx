@@ -8,6 +8,7 @@ import {
   TWO_COLUMN_WIDTH,
   TRAY_TARGET_NONE,
   TRAY_TARGET_ALL,
+  parseTrayPresets,
   saveSettings,
   closeDialog,
   checkForUpdate,
@@ -30,6 +31,7 @@ import {
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
+import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 import { Select } from "./components/ui/select";
 import { Separator } from "./components/ui/separator";
@@ -288,6 +290,11 @@ export default function ConfigView({
     config.autoCheckForUpdates ?? true
   );
   const [trayTarget, setTrayTarget] = useState(config.trayTarget ?? TRAY_TARGET_NONE);
+  // Shown as "100, 75, 50"; only what parses is saved.
+  const [trayPresets, setTrayPresets] = useState(
+    (config.trayPresets ?? "").split(",").filter(Boolean).join(", ")
+  );
+  const trayPresetsRef = useRef<HTMLInputElement>(null);
   const [updateChecking, setUpdateChecking] = useState(
     config.updateCheckPending ?? false
   );
@@ -455,6 +462,12 @@ export default function ConfigView({
     setAllowBelowMinimum(enabled);
   }
 
+  const minLevel = allowBelowMinimum ? -90 : 0;
+  // The preset field only matters once the tray menu has a target; its
+  // error is shown live under the field and blocks Save while visible.
+  const showTrayPresets = trayTarget !== TRAY_TARGET_NONE;
+  const trayPresetsParsed = parseTrayPresets(trayPresets, minLevel);
+
   function handleSave() {
     if (schedule.enabled) {
       const lat = parseCoordinate(schedule.latitude, 90);
@@ -467,10 +480,18 @@ export default function ConfigView({
       }
     }
     setScheduleError("");
-    saveSettings(debugLog, autoCheckForUpdates, trayTarget, schedule);
+    if (showTrayPresets && trayPresetsParsed.error) {
+      trayPresetsRef.current?.focus();
+      return;
+    }
+    saveSettings(
+      debugLog,
+      autoCheckForUpdates,
+      trayTarget,
+      trayPresetsParsed.values,
+      schedule
+    );
   }
-
-  const minLevel = allowBelowMinimum ? -90 : 0;
   const scheduleSection = (
     <ScheduleSection
       settings={schedule}
@@ -614,11 +635,37 @@ export default function ConfigView({
               <option value={trayTarget}>Selected monitor (not available right now)</option>
             )}
         </Select>
+        {showTrayPresets && (
+          <div className="space-y-1 pt-1">
+            <Label htmlFor="trayPresets">Preset levels</Label>
+            <Input
+              id="trayPresets"
+              ref={trayPresetsRef}
+              placeholder="e.g. 100, 75, 50, 25"
+              value={trayPresets}
+              onChange={(e) =>
+                // Only digits, commas and spaces can be typed (a minus sign
+                // too when the extended range is on); the rest is dropped.
+                setTrayPresets(
+                  e.target.value.replace(minLevel < 0 ? /[^0-9,\s-]/g : /[^0-9,\s]/g, "")
+                )
+              }
+              aria-invalid={trayPresetsParsed.error !== null}
+              className={trayPresetsParsed.error ? "border-red-500" : ""}
+            />
+            {trayPresetsParsed.error && (
+              <p className="text-red-600 text-[11px]">{trayPresetsParsed.error}</p>
+            )}
+          </div>
+        )}
         <p className="text-neutral-500 text-[11px] leading-snug">
-          Adds Increase brightness and Decrease brightness to the tray icon's
-          menu, stepping the chosen monitor (or every listed monitor) by 10%
-          per click. Counts as a manual change for scheduled monitors. Choose
-          None to keep the menu short. Saved with the Save button.
+          {showTrayPresets
+            ? `The tray menu gets Increase and Decrease brightness (10% steps) plus ` +
+              `the preset levels above: whole numbers from ${minLevel} to 100, ` +
+              `separated by commas, listed in that order. Manual changes pause ` +
+              `scheduled monitors.`
+            : "Choose All monitors or one monitor to add Increase brightness, " +
+              "Decrease brightness and preset levels to the tray menu."}
         </p>
       </div>
 

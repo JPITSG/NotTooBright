@@ -55,11 +55,44 @@ export interface ConfigData {
   // Tray menu Increase/Decrease target: "" (items hidden), "*" (all
   // visible monitors), or a monitor key.
   trayTarget: string;
+  // Preset levels listed between Increase and Decrease, "100,75,50".
+  trayPresets: string;
   schedule: ScheduleData;
 }
 
 export const TRAY_TARGET_NONE = "";
 export const TRAY_TARGET_ALL = "*";
+export const TRAY_MAX_PRESETS = 20;
+
+/** Parses the preset field: whole numbers from `min` to 100 separated by
+ * commas (blank entries ignored, duplicates dropped, order kept). `error`
+ * is set when anything else is in the text; `values` holds what did parse. */
+export function parseTrayPresets(
+  text: string,
+  min: number
+): { values: number[]; error: string | null } {
+  const values: number[] = [];
+  let error: string | null = null;
+  for (const raw of text.split(",")) {
+    const token = raw.trim();
+    if (!token) continue;
+    if (!/^-?\d+$/.test(token)) {
+      error = "Use whole numbers separated by commas.";
+      continue;
+    }
+    const value = Number(token);
+    if (value < min || value > 100) {
+      error = `Preset levels must be between ${min} and 100.`;
+      continue;
+    }
+    if (!values.includes(value)) values.push(value);
+  }
+  if (!error && values.length > TRAY_MAX_PRESETS) {
+    error = `Enter at most ${TRAY_MAX_PRESETS} preset levels.`;
+    values.length = TRAY_MAX_PRESETS;
+  }
+  return { values, error };
+}
 
 export interface ScheduleSettings {
   enabled: boolean;
@@ -224,6 +257,7 @@ export function saveSettings(
   debugLog: boolean,
   autoCheckForUpdates: boolean,
   trayTarget: string,
+  trayPresets: number[],
   schedule: ScheduleSettings
 ) {
   post({
@@ -231,6 +265,7 @@ export function saveSettings(
     debugLog,
     autoCheckForUpdates,
     trayTarget,
+    trayPresets: trayPresets.join(","),
     scheduleEnabled: schedule.enabled,
     latitude: schedule.latitude,
     longitude: schedule.longitude,

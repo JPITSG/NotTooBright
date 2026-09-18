@@ -52,6 +52,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
+#include <limits.h>
 #include "resource.h"
 #include "version.h"
 
@@ -127,6 +128,11 @@
  * "*" for every visible monitor, otherwise a monitor identity key. */
 #define REG_VALUE_TRAY_TARGET L"TrayMenuTarget"
 #define TRAY_TARGET_ALL L"*"
+/* Preset levels listed between Increase and Decrease in the tray menu, in
+ * the order the user typed them; stored as "100,75,50,25". */
+#define REG_VALUE_TRAY_PRESETS L"TrayMenuPresets"
+#define TRAY_MAX_PRESETS 20
+#define ID_TRAY_MENU_PRESET_FIRST 1000   /* + preset index */
 /* The tray tooltip lists every visible monitor; rebuilding it is deferred
  * briefly so a slider drag does not rewrite it dozens of times a second. */
 #define ID_TIMER_TOOLTIP 9
@@ -422,6 +428,8 @@ typedef struct {
     BOOL debugLogEnabled;
     BOOL autoCheckForUpdates;
     wchar_t trayTarget[128];  /* "", "*", or a monitor key */
+    int trayPresets[TRAY_MAX_PRESETS];  /* -SOFT_MAX_DIM..100, menu order */
+    int trayPresetCount;
     Schedule schedule;
 } Configuration;
 
@@ -819,6 +827,45 @@ static void SetScheduleDefaults(Schedule* schedule) {
 static BOOL IsValidLatitude(double v) { return v >= -90.0 && v <= 90.0; }
 static BOOL IsValidLongitude(double v) { return v >= -180.0 && v <= 180.0; }
 
+/* Reads "100, 75, 50" style text into tray preset levels: whole numbers
+ * within the brightness range, kept in the order given, duplicates and
+ * anything else dropped, at most TRAY_MAX_PRESETS. Returns the count. The
+ * dialog validates what the user types; this guards the registry value. */
+static int ParseTrayPresets(const wchar_t* text, int* out, int max) {
+    int count = 0;
+    const wchar_t* p = text;
+    while (*p && count < max) {
+        while (*p == L' ' || *p == L'\t' || *p == L',') p++;
+        if (!*p) break;
+        const wchar_t* start = p;
+        if (*p == L'-') p++;
+        const wchar_t* digits = p;
+        while (*p >= L'0' && *p <= L'9') p++;
+        BOOL valid = p != digits && p - digits <= 3;
+        while (*p == L' ' || *p == L'\t') p++;
+        if (*p && *p != L',') valid = FALSE;
+        while (*p && *p != L',') p++;   /* skip the rest of a bad token */
+        if (!valid) continue;
+        int value = _wtoi(start);
+        if (value < -SOFT_MAX_DIM || value > 100) continue;
+        BOOL duplicate = FALSE;
+        for (int i = 0; i < count && !duplicate; i++) duplicate = out[i] == value;
+        if (!duplicate) out[count++] = value;
+    }
+    return count;
+}
+
+/* The inverse, "100,75,50", for the registry and the dialog. */
+static void FormatTrayPresets(const int* presets, int count, wchar_t* out, size_t cap) {
+    size_t len = 0;
+    out[0] = L'\0';
+    for (int i = 0; i < count; i++) {
+        int written = swprintf_s(out + len, cap - len, i ? L",%d" : L"%d", presets[i]);
+        if (written < 0) break;
+        len += (size_t)written;
+    }
+}
+
 static BOOL LoadConfigFromRegistry(Configuration* config) {
     ZeroMemory(config, sizeof(*config));
     SetScheduleDefaults(&config->schedule);
@@ -840,6 +887,14 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->trayTarget[0] = L'\0';
     }
     config->trayTarget[(sizeof(config->trayTarget) / sizeof(wchar_t)) - 1] = L'\0';
+
+    wchar_t presetText[128] = {0};
+    dataSize = sizeof(presetText) - sizeof(wchar_t);
+    if (RegQueryValueExW(hKey, REG_VALUE_TRAY_PRESETS, NULL, &dataType,
+                         (LPBYTE)presetText, &dataSize) == ERROR_SUCCESS &&
+        dataType == REG_SZ) {
+        config->trayPresetCount = ParseTrayPresets(presetText, config->trayPresets, TRAY_MAX_PRESETS);
+    }
 
     dataSize = sizeof(g_ignoredUpdateVersion);
     if (RegQueryValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, NULL,
@@ -888,6 +943,10 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     if (!WriteRegistryDword(hKey, REG_VALUE_AUTO_UPDATE, config->autoCheckForUpdates ? 1 : 0)) success = FALSE;
     RegSetValueExW(hKey, REG_VALUE_TRAY_TARGET, 0, REG_SZ, (const BYTE*)config->trayTarget,
                    (DWORD)((wcslen(config->trayTarget) + 1) * sizeof(wchar_t)));
+    wchar_t presetText[128];
+    FormatTrayPresets(config->trayPresets, config->trayPresetCount, presetText, 128);
+    RegSetValueExW(hKey, REG_VALUE_TRAY_PRESETS, 0, REG_SZ, (const BYTE*)presetText,
+                   (DWORD)((wcslen(presetText) + 1) * sizeof(wchar_t)));
     RegSetValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
                    (const BYTE*)g_ignoredUpdateVersion,
                    (DWORD)((wcslen(g_ignoredUpdateVersion) + 1) * sizeof(wchar_t)));
@@ -4216,20 +4275,21 @@ static void webview_push_init_config(void) {
     if (!monitors) return;
 
     const Schedule* sc = &g_config.schedule;
-    wchar_t eUpdateCompletedVersion[64], eTrayTarget[256];
+    wchar_t eUpdateCompletedVersion[64], eTrayTarget[256], presetText[128];
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_WSTRING : L"",
                         eUpdateCompletedVersion, 64);
     json_escape_wstring(g_config.trayTarget, eTrayTarget, 256);
+    FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 128);
     BOOL updateCheckPending =
         InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE ||
         InterlockedCompareExchangePointer((PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL;
-    const size_t cap = wcslen(monitors) + 1280;
+    const size_t cap = wcslen(monitors) + 1536;
     wchar_t* script = (wchar_t*)malloc(cap * sizeof(wchar_t));
     if (script) {
         int written = swprintf_s(script, cap,
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
             L"\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
-            L"\"trayTarget\":\"%s\","
+            L"\"trayTarget\":\"%s\",\"trayPresets\":\"%s\","
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
             L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
             L"\"dawnStartOffset\":%d,\"dawnEndOffset\":%d,\"duskStartOffset\":%d,"
@@ -4240,7 +4300,7 @@ static void webview_push_init_config(void) {
             g_config.autoCheckForUpdates ? L"true" : L"false",
             updateCheckPending ? L"true" : L"false",
             g_updateNoticeTask ? L"true" : L"false",
-            eTrayTarget,
+            eTrayTarget, presetText,
             sc->enabled ? L"true" : L"false", sc->hasLocation ? L"true" : L"false",
             sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
             sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset,
@@ -4726,6 +4786,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                                 sizeof(g_config.trayTarget) / sizeof(wchar_t)) == 0) {
             g_config.trayTarget[0] = L'\0';
         }
+        char presetUtf8[256] = {0};
+        wchar_t presetText[256] = {0};
+        json_get_string(msg, "trayPresets", presetUtf8, sizeof(presetUtf8));
+        MultiByteToWideChar(CP_UTF8, 0, presetUtf8, -1, presetText, 256);
+        g_config.trayPresetCount = ParseTrayPresets(presetText, g_config.trayPresets, TRAY_MAX_PRESETS);
         SaveScheduleFromMessage(msg);
         InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
         if (!SaveConfigToRegistry(&g_config)) {
@@ -4735,8 +4800,9 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 L"can write to HKEY_CURRENT_USER.",
                 APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, trayTarget=\"%s\")\n",
-                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.trayTarget);
+        FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 256);
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
+                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.trayTarget, presetText);
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
@@ -5029,9 +5095,10 @@ static Monitor* TrayTargetMonitor(BOOL* allVisible) {
     return NULL;
 }
 
-/* Increase/Decrease from the tray menu: one step from each target's own
- * current value. A manual change, so scheduled monitors pause. */
-static void StepTrayTarget(int direction) {
+/* A tray menu brightness item: Increase/Decrease step each target from its
+ * own current value, a preset sets them all to that level. Either is a
+ * manual change, so scheduled monitors pause. */
+static void ApplyTrayMenuValue(int value, BOOL relative) {
     BOOL allVisible = FALSE;
     Monitor* target = TrayTargetMonitor(&allVisible);
     int changed = 0;
@@ -5040,14 +5107,34 @@ static void StepTrayTarget(int direction) {
         if (m->hidden || MonitorMode(m) == MODE_PROBING) continue;
         if (!allVisible && m != target) continue;
         int before = m->value;
-        SetMonitorValue(m, m->value + direction * TRAY_STEP_PERCENT);
+        SetMonitorValue(m, relative ? m->value + value : value);
         NoteManualChange(m);
         if (m->value != before) changed++;
     }
-    DebugPrint(L"[INFO] Tray menu: brightness %s by %d%% on %s (%d monitor(s) changed)\n",
-               direction > 0 ? L"up" : L"down", TRAY_STEP_PERCENT,
-               allVisible ? L"all monitors" : (target ? target->name : L"no monitor"), changed);
+    const wchar_t* what = allVisible ? L"all monitors" : (target ? target->name : L"no monitor");
+    if (relative) {
+        DebugPrint(L"[INFO] Tray menu: brightness %s by %d%% on %s (%d monitor(s) changed)\n",
+                   value > 0 ? L"up" : L"down", value > 0 ? value : -value, what, changed);
+    } else {
+        DebugPrint(L"[INFO] Tray menu: brightness set to %d%% on %s (%d monitor(s) changed)\n",
+                   value, what, changed);
+    }
     if (changed) PushMonitorsToDialog();
+}
+
+/* The level the tray target is at, for marking the matching preset; INT_MIN
+ * while it is unknown or the visible monitors disagree. */
+static int TrayTargetCurrentValue(const Monitor* target, BOOL allVisible) {
+    int current = INT_MIN;
+    for (int i = 0; i < g_monitorCount; i++) {
+        const Monitor* m = &g_monitors[i];
+        if (m->hidden) continue;
+        if (!allVisible && m != target) continue;
+        if (!m->hasValue || MonitorMode(m) == MODE_PROBING) return INT_MIN;
+        if (current != INT_MIN && current != m->value) return INT_MIN;
+        current = m->value;
+    }
+    return current;
 }
 
 static void RemoveTrayIcon(void) {
@@ -5090,6 +5177,21 @@ static void ShowContextMenu(HWND hwnd) {
             swprintf_s(dimmer, 96, L"Decrease brightness (%s)", target ? target->name : L"unavailable");
         }
         AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_BRIGHTER, brighter);
+        /* Preset levels sit between the two steps; the one the target is
+         * currently at (every target, for all monitors) gets a bullet. */
+        int current = usable ? TrayTargetCurrentValue(target, allVisible) : INT_MIN;
+        for (int i = 0; i < g_config.trayPresetCount; i++) {
+            wchar_t label[16];
+            swprintf_s(label, 16, L"%d%%", g_config.trayPresets[i]);
+            AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_PRESET_FIRST + i, label);
+        }
+        for (int i = 0; i < g_config.trayPresetCount; i++) {
+            if (g_config.trayPresets[i] != current) continue;
+            CheckMenuRadioItem(hMenu, ID_TRAY_MENU_PRESET_FIRST,
+                               ID_TRAY_MENU_PRESET_FIRST + g_config.trayPresetCount - 1,
+                               ID_TRAY_MENU_PRESET_FIRST + i, MF_BYCOMMAND);
+            break;
+        }
         AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_DIMMER, dimmer);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
@@ -5127,15 +5229,20 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             return 0;
 
         case WM_COMMAND:
+            if (LOWORD(wParam) >= ID_TRAY_MENU_PRESET_FIRST &&
+                LOWORD(wParam) < ID_TRAY_MENU_PRESET_FIRST + g_config.trayPresetCount) {
+                ApplyTrayMenuValue(g_config.trayPresets[LOWORD(wParam) - ID_TRAY_MENU_PRESET_FIRST], FALSE);
+                return 0;
+            }
             switch (LOWORD(wParam)) {
                 case ID_TRAY_MENU_CONFIGURE:
                     ShowConfigDialog();
                     return 0;
                 case ID_TRAY_MENU_BRIGHTER:
-                    StepTrayTarget(+1);
+                    ApplyTrayMenuValue(+TRAY_STEP_PERCENT, TRUE);
                     return 0;
                 case ID_TRAY_MENU_DIMMER:
-                    StepTrayTarget(-1);
+                    ApplyTrayMenuValue(-TRAY_STEP_PERCENT, TRUE);
                     return 0;
                 case ID_TRAY_MENU_EXIT:
                     DebugPrint(L"[INFO] Exit selected from the tray menu\n");
