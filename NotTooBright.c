@@ -67,6 +67,10 @@
 #define REG_VALUE_MON_BRIGHTNESS L"Brightness"
 #define REG_VALUE_MON_SOFTWARE_ONLY L"SoftwareOnly"
 #define REG_VALUE_MON_HIDDEN L"Hidden"
+/* The DDC/CI value the monitor reported the very first time it was seen,
+ * before anything was written to it; restored when the monitor is hidden. */
+#define REG_VALUE_MON_ORIGINAL L"OriginalBrightness"
+#define REG_VALUE_MON_ORIGINAL_MAX L"OriginalBrightnessMax"
 #define REG_VALUE_MON_NAME L"Name"
 
 #define TRAY_ICON_ID 100
@@ -349,6 +353,9 @@ typedef struct {
     DWORD ddcCurrent;
     BOOL forceSoftware;           /* user asked for software dimming only */
     BOOL hidden;                  /* removed from the dialog and left alone until a rescan */
+    BOOL hasOriginal;             /* original DDC/CI value recorded */
+    DWORD originalRaw;            /* raw VCP value at first sighting */
+    DWORD originalMax;            /* its maximum, for display as a percent */
     int value;                    /* desired brightness, -SOFT_MAX_DIM..100 */
     BOOL hasValue;
     int lastHwSent;               /* last percent handed to the worker, -1 = none */
@@ -370,7 +377,8 @@ typedef struct {
  * slider moves collapses into the latest value. */
 typedef struct {
     int uid;
-    int target;   /* percent 0..100 */
+    int target;     /* percent 0..100, or a raw VCP value when raw is set */
+    BOOL raw;
     BOOL pending;
 } DdcSetSlot;
 
@@ -611,6 +619,18 @@ static void LoadMonitorSettings(Monitor* m) {
     }
     ReadRegistryBool(hKey, REG_VALUE_MON_SOFTWARE_ONLY, &m->forceSoftware);
     ReadRegistryBool(hKey, REG_VALUE_MON_HIDDEN, &m->hidden);
+    DWORD original = 0, originalMax = 0;
+    DWORD originalSize = sizeof(original), originalMaxSize = sizeof(originalMax);
+    if (RegQueryValueExW(hKey, REG_VALUE_MON_ORIGINAL, NULL, &dataType,
+                         (LPBYTE)&original, &originalSize) == ERROR_SUCCESS &&
+        dataType == REG_DWORD &&
+        RegQueryValueExW(hKey, REG_VALUE_MON_ORIGINAL_MAX, NULL, &dataType,
+                         (LPBYTE)&originalMax, &originalMaxSize) == ERROR_SUCCESS &&
+        dataType == REG_DWORD && originalMax > 0) {
+        m->hasOriginal = TRUE;
+        m->originalRaw = original;
+        m->originalMax = originalMax;
+    }
     RegCloseKey(hKey);
 }
 
@@ -625,6 +645,10 @@ static void SaveMonitorSettings(const Monitor* m) {
     }
     WriteRegistryDword(hKey, REG_VALUE_MON_SOFTWARE_ONLY, m->forceSoftware ? 1 : 0);
     WriteRegistryDword(hKey, REG_VALUE_MON_HIDDEN, m->hidden ? 1 : 0);
+    if (m->hasOriginal) {
+        WriteRegistryDword(hKey, REG_VALUE_MON_ORIGINAL, m->originalRaw);
+        WriteRegistryDword(hKey, REG_VALUE_MON_ORIGINAL_MAX, m->originalMax);
+    }
     /* Informational: lets a user recognise entries when browsing the registry. */
     RegSetValueExW(hKey, REG_VALUE_MON_NAME, 0, REG_SZ, (const BYTE*)m->name,
                    (DWORD)((wcslen(m->name) + 1) * sizeof(wchar_t)));
@@ -1071,7 +1095,7 @@ typedef struct {
     DWORD max;
 } WorkerMonitor;
 
-static void DdcRequestSet(int uid, int percent) {
+static void DdcRequestWrite(int uid, int target, BOOL raw) {
     EnterCriticalSection(&g_ddcLock);
     DdcSetSlot* slot = NULL;
     for (int i = 0; i < g_ddcSetCount; i++) {
@@ -1085,11 +1109,22 @@ static void DdcRequestSet(int uid, int percent) {
         slot->uid = uid;
     }
     if (slot) {
-        slot->target = percent;
+        slot->target = target;
+        slot->raw = raw;
         slot->pending = TRUE;
     }
     LeaveCriticalSection(&g_ddcLock);
     if (g_ddcEvent) SetEvent(g_ddcEvent);
+}
+
+static void DdcRequestSet(int uid, int percent) {
+    DdcRequestWrite(uid, percent, FALSE);
+}
+
+/* Writes an exact VCP value, used to put a monitor back to the value it
+ * reported before the application ever touched it. */
+static void DdcRequestSetRaw(int uid, DWORD rawValue) {
+    DdcRequestWrite(uid, (int)rawValue, TRUE);
 }
 
 /* Replaces the worker's monitor set. Pending writes are dropped: every
@@ -1178,10 +1213,17 @@ static void ProbeWorkerMonitor(WorkerMonitor* wm) {
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_DDC_PROBED, 0, (LPARAM)r)) free(r);
 }
 
-static BOOL WriteWorkerBrightness(WorkerMonitor* wm, int percent) {
-    if (percent < 0) percent = 0;
-    if (percent > 100) percent = 100;
-    DWORD value = (DWORD)(((unsigned)percent * wm->max + 50) / 100);
+static BOOL WriteWorkerBrightness(WorkerMonitor* wm, int target, BOOL raw) {
+    DWORD value;
+    int percent;
+    if (raw) {
+        value = (DWORD)target;
+        if (value > wm->max) value = wm->max;
+        percent = (int)((value * 100 + wm->max / 2) / wm->max);
+    } else {
+        percent = target < 0 ? 0 : (target > 100 ? 100 : target);
+        value = (DWORD)(((unsigned)percent * wm->max + 50) / 100);
+    }
     ULONGLONG start = GetTickCount64();
     BOOL ok = SetVCPFeature(wm->handle, VCP_BRIGHTNESS, value);
     DWORD error = ok ? 0 : GetLastError();
@@ -1241,11 +1283,13 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
         for (;;) {
             if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
             int uid = -1, target = 0;
+            BOOL raw = FALSE;
             EnterCriticalSection(&g_ddcLock);
             for (int i = 0; i < g_ddcSetCount; i++) {
                 if (g_ddcSets[i].pending) {
                     uid = g_ddcSets[i].uid;
                     target = g_ddcSets[i].target;
+                    raw = g_ddcSets[i].raw;
                     g_ddcSets[i].pending = FALSE;
                     break;
                 }
@@ -1261,7 +1305,7 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
                 }
             }
             BOOL ok = FALSE;
-            if (wm && wm->handle && wm->supported) ok = WriteWorkerBrightness(wm, target);
+            if (wm && wm->handle && wm->supported) ok = WriteWorkerBrightness(wm, target, raw);
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DDC_SET_RESULT, (WPARAM)uid, ok ? 1 : 0);
         }
     }
@@ -1482,6 +1526,9 @@ static void RefreshMonitors(void) {
             dst->hasValue = old->hasValue;
             dst->forceSoftware = old->forceSoftware;
             dst->hidden = old->hidden;
+            dst->hasOriginal = old->hasOriginal;
+            dst->originalRaw = old->originalRaw;
+            dst->originalMax = old->originalMax;
             dst->overlay = old->overlay;
             dst->overlayDim = old->overlayDim;
             dst->dirty = old->dirty;
@@ -1585,6 +1632,17 @@ static void HandleDdcProbed(DdcProbeResult* r) {
             m->error[0] = L'\0';
             int percent = (int)((r->current * 100 + r->max / 2) / r->max);
             if (percent > 100) percent = 100;
+            if (!m->hasOriginal) {
+                /* The value the monitor had before this application ever
+                 * wrote to it; kept for good so hiding can put it back. */
+                m->hasOriginal = TRUE;
+                m->originalRaw = r->current;
+                m->originalMax = r->max;
+                SaveMonitorSettings(m);
+                DebugPrint(L"[INFO] %s (%s): recorded original brightness %lu/%lu\n",
+                           m->name, m->device, (unsigned long)r->current,
+                           (unsigned long)r->max);
+            }
             if (!m->hasValue) {
                 /* First sighting: adopt the monitor's current setting so
                  * nothing changes until the user moves the slider. */
@@ -1620,6 +1678,13 @@ static void HandleDdcProbed(DdcProbeResult* r) {
 static void HandleDdcSetResult(int uid, BOOL success) {
     Monitor* m = FindMonitorByUid(uid);
     if (!m) return;
+    if (m->hidden) {
+        /* Only the restore-before-hide write reaches a hidden monitor. */
+        DebugPrint(L"[%s] %s (%s): original brightness %s before hiding\n",
+                   success ? L"INFO" : L"WARNING", m->name, m->device,
+                   success ? L"restored" : L"could not be restored");
+        return;
+    }
     if (success) {
         m->failures = 0;
         if (m->lastHwSent >= 0) m->ddcCurrent = (DWORD)m->lastHwSent * m->ddcMax / 100;
@@ -2083,11 +2148,31 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             if (VisibleMonitorCount() <= 1) {
                 DebugPrint(L"[INFO] Refused to hide the last visible monitor (%s)\n", m->name);
             } else {
+                /* Put the monitor back the way it was found, then treat
+                 * the display as if it did not exist: the overlay window
+                 * goes and nothing is touched again until a rescan. */
+                if (m->hardwareState == HW_AVAILABLE && m->hasOriginal) {
+                    DWORD currentRaw = m->lastHwSent >= 0
+                        ? (DWORD)m->lastHwSent * m->ddcMax / 100 : m->ddcCurrent;
+                    if (m->originalMax != m->ddcMax) {
+                        /* Range changed since the original was recorded;
+                         * rescale so the restored level is the same. */
+                        m->originalRaw = (m->originalRaw * m->ddcMax + m->originalMax / 2) / m->originalMax;
+                        m->originalMax = m->ddcMax;
+                    }
+                    if (currentRaw != m->originalRaw) {
+                        DdcRequestSetRaw(m->uid, m->originalRaw);
+                        DebugPrint(L"[INFO] %s (%s): restoring original brightness %lu/%lu before hiding\n",
+                                   m->name, m->device, (unsigned long)m->originalRaw,
+                                   (unsigned long)m->originalMax);
+                    }
+                } else if (m->hardwareState == HW_AVAILABLE) {
+                    DebugPrint(L"[WARNING] %s (%s): no original brightness recorded; leaving it as is\n",
+                               m->name, m->device);
+                }
                 m->hidden = TRUE;
                 m->dirty = TRUE;
                 SchedulePersist();
-                /* From here on the display is treated as if it did not
-                 * exist: the overlay window goes, nothing else is touched. */
                 ReleaseMonitorOverlay(m);
                 DebugPrint(L"[INFO] %s (%s): hidden until the next rescan\n", m->name, m->device);
             }

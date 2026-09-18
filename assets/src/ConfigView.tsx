@@ -144,7 +144,7 @@ function MonitorCard({
             disabled={!canHide}
             title={
               canHide
-                ? "Stop controlling this monitor and remove it from the list until the next rescan"
+                ? "Restore this monitor's original brightness, then stop controlling it and remove it from the list until the next rescan"
                 : "The last monitor in the list cannot be hidden"
             }
             aria-label={`Hide ${monitor.name}`}
