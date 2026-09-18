@@ -12,7 +12,6 @@ brightness control.
 - **One Slider per Monitor** - Plus an "All monitors" slider; changes apply immediately while dragging
 - **Hide Monitors** - Restore a monitor's original brightness, then remove it from the list and stop controlling it entirely until the next rescan; the last monitor can never be hidden
 - **Automatic Brightness (optional)** - Follows the sun for your latitude and longitude: a daytime level after sunrise, a night level after sunset, smooth transitions at dawn and dusk, shown on an editable graph of today's curve; a manual change pauses it until a reset time of your choosing
-- **Keyboard Brightness Keys (optional)** - The Brightness Up / Brightness Down keys found on many keyboards step every listed monitor, whatever window is focused
 - **Remembered per Monitor** - Each monitor is identified by its EDID (model and serial), so settings follow the monitor and are re-applied after sleep, after the display turns back on, and after display changes
 - **Never Black** - Software dimming stops at 10% apparent brightness, and overlays vanish with the process, so a screen can never be left dark
 - **Screenshot Friendly** - Overlays are excluded from screen capture and screen sharing (Windows 10 2004+), so screenshots show the undimmed picture
@@ -113,7 +112,6 @@ brightness section applies immediately; the settings below it are saved with
 | Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
 | Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
 | Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
-| Use the keyboard's brightness keys | Reacts to the Brightness Up / Brightness Down keys (HID consumer-control keys found on many desktop and laptop keyboards) wherever they are pressed: every listed monitor moves by the chosen step (1–25%, 5% by default) from its own current value, and holding a key repeats. Counts as a manual change for scheduled monitors. Windows continues to handle a laptop's built-in display on its own. Saved with **Save**. Disabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (monitor detection, DDC/CI probe and write results, fallbacks, power events) to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
 The footer displays the application version.
@@ -131,9 +129,6 @@ the schedule itself is stored under `HKCU\SOFTWARE\JPIT\NotTooBright`.
 - DDC/CI must be enabled in the monitor's menu and pass through whatever
   sits between the computer and the monitor; many docks and KVM switches do
   not forward it.
-- Brightness keys are only seen when the keyboard reports them as standard
-  consumer-control keys. Laptop Fn combinations that go straight to the
-  firmware, and keys that vendor software remaps, never reach applications.
 
 ## Icon Customization
 
