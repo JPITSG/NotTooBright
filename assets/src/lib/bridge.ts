@@ -49,6 +49,9 @@ export interface ScheduleData {
 export interface ConfigData {
   allowBelowMinimum: boolean;
   debugLog: boolean;
+  autoCheckForUpdates: boolean;
+  updateCheckPending: boolean;
+  updatePromptPending: boolean;
   schedule: ScheduleData;
 }
 
@@ -69,6 +72,26 @@ export interface ScheduleSettings {
 export interface InitData {
   config: ConfigData;
   monitors: MonitorData[];
+  updateCompletedVersion: string;
+}
+
+export interface UpdateResult {
+  status:
+    | "newer"
+    | "same"
+    | "older"
+    | "cancelled"
+    | "error"
+    | "completed";
+  title: string;
+  message: string;
+  currentVersion: string;
+  remoteVersion: string;
+  automatic: boolean;
+}
+
+export interface UpdateProgress {
+  kilobytesPerSecond: number;
 }
 
 type InitCallback = (data: InitData) => void;
@@ -76,6 +99,8 @@ type MonitorsCallback = (monitors: MonitorData[]) => void;
 
 let initCallback: InitCallback | null = null;
 let monitorsCallback: MonitorsCallback | null = null;
+let updateResultCallback: ((result: UpdateResult) => void) | null = null;
+let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;
@@ -98,6 +123,32 @@ export function onMonitors(cb: MonitorsCallback) {
 ) => {
   if (monitorsCallback) monitorsCallback(monitors);
 };
+
+(window as unknown as Record<string, unknown>).onUpdateResult = (
+  result: UpdateResult
+) => {
+  if (updateResultCallback) updateResultCallback(result);
+};
+
+(window as unknown as Record<string, unknown>).onUpdateProgress = (
+  progress: UpdateProgress
+) => {
+  if (updateProgressCallback) updateProgressCallback(progress);
+};
+
+export function onUpdateResult(cb: (result: UpdateResult) => void) {
+  updateResultCallback = cb;
+  return () => {
+    if (updateResultCallback === cb) updateResultCallback = null;
+  };
+}
+
+export function onUpdateProgress(cb: (progress: UpdateProgress) => void) {
+  updateProgressCallback = cb;
+  return () => {
+    if (updateProgressCallback === cb) updateProgressCallback = null;
+  };
+}
 
 function post(message: Record<string, unknown>) {
   window.chrome.webview.postMessage(JSON.stringify(message));
@@ -135,10 +186,43 @@ export function resumeSchedule(uid: number) {
   post({ action: "resumeSchedule", uid });
 }
 
-export function saveSettings(debugLog: boolean, schedule: ScheduleSettings) {
+export function configReady(checkAutomatically = false) {
+  post({ action: "configReady", checkAutomatically });
+}
+
+export function checkForUpdate(automatic = false) {
+  post({ action: "checkUpdate", automatic });
+}
+
+export function cancelUpdateCheck() {
+  post({ action: "cancelUpdateCheck" });
+}
+
+export function installUpdate(reopenSettings = false) {
+  post({ action: "installUpdate", reopenSettings });
+}
+
+export function dismissUpdate() {
+  post({ action: "dismissUpdate" });
+}
+
+export function ignoreUpdateVersion(version: string) {
+  post({ action: "ignoreUpdateVersion", version });
+}
+
+export function dismissUpdateConfirmation() {
+  post({ action: "dismissUpdateConfirmation" });
+}
+
+export function saveSettings(
+  debugLog: boolean,
+  autoCheckForUpdates: boolean,
+  schedule: ScheduleSettings
+) {
   post({
     action: "saveSettings",
     debugLog,
+    autoCheckForUpdates,
     scheduleEnabled: schedule.enabled,
     latitude: schedule.latitude,
     longitude: schedule.longitude,

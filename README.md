@@ -21,6 +21,7 @@ else, and an optional schedule that follows the sun for your location.
 - **Hide what you do not want touched** - Remove a monitor from the app entirely until the next rescan; its original brightness is restored first
 - **Never black, never in screenshots** - Software dimming stops at 10% and its overlay is excluded from screen capture and screen sharing
 - **Zero install** - One 560 KB executable, no runtime to install, settings in your user registry, nothing written next to the exe
+- **Self update** - Checks this repository for a newer build, shows both version numbers, and replaces itself in place after a standard UAC prompt; automatic checks can be turned off
 - **Survives everything** - Settings follow the monitor (by EDID) and are re-applied after sleep, after displays are switched back on, and after display changes
 
 ## Getting Started
@@ -108,6 +109,36 @@ scheduled. The night level can only go below 0% when **Allow dimming below
 the hardware minimum** is enabled, and each monitor clamps the scheduled
 value to its own range.
 
+## Updates
+
+When **Automatically check for updates** is enabled (the default), Not Too
+Bright checks at startup, whenever the Configure dialog opens, and once every
+60 minutes using a single low-frequency Windows timer. A newer build opens
+Configure and its update prompt; matching or older builds and failed automatic
+checks are silently discarded. An automatically opened prompt offers **Ignore
+this version**, which suppresses that version during later automatic checks,
+including after restart. The manual **Update** button still displays every
+result and can install an ignored version. Checks use the repository's
+[`releases/NotTooBright.exe`](releases/NotTooBright.exe).
+
+The update check downloads the executable to the user's temporary directory
+and compares its embedded Windows file version with the running executable's
+version. While downloading, the button displays the current transfer speed
+rounded to whole kilobytes per second, such as **Checking (100kb/s)...**, and
+can be clicked again to stop the check and remove the partial download. The
+result dialog displays both version numbers. A newer build can be installed
+normally, while a matching build offers a **Force update** action to reinstall
+it; an older repository build is never installed. Installation requests
+standard Windows UAC approval, safely replaces the current executable, and
+restarts the application. After a successful update, settings remain closed by
+default. Select **Reopen settings after update** in the version confirmation
+dialog to reopen settings with a confirmation of the newly installed version.
+Dismissing that confirmation leaves settings open. This checkbox starts
+unchecked for each confirmation and is not a saved preference; it does not
+apply to cancelled or failed updates. Cancelling the download, result dialog,
+or UAC prompt leaves the current version running. File size is used only to
+validate the download and enforce its safety limit.
+
 ## Configuration
 
 Click the tray icon (or choose **Configure**) to open the dialog. The
@@ -128,6 +159,8 @@ brightness section applies immediately; the settings below it are saved with
 | Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
 | Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
 | Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
+| Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
+| Update (button) | Checks the repository for a newer build right now and shows the result; see [Updates](#updates). |
 | Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
 
 The footer displays the application version.
@@ -139,10 +172,11 @@ next to the executable, so it can run from any folder.
 
 | Location | Contents |
 |----------|----------|
-| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule, update checking and the ignored update version, debug logging |
 | `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, pause deadline, original brightness |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |
+| `%TEMP%\NotTooBright-download-*.exe`, `%TEMP%\NotTooBright-updater-*.exe` | Staged update and the short-lived updater copy; removed when an update finishes |
 
 Deleting the `HKCU\SOFTWARE\JPIT\NotTooBright` key returns the application to
 its factory state.
