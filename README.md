@@ -199,7 +199,7 @@ brightness section applies immediately; the settings below it are saved with
 | Daytime / Night brightness | The levels the schedule applies during the day and at night. |
 | Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
 | Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
-| Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
+| Cycle reset time | Time of day at which a schedule paused by a manual change takes over again. 04:00 by default. |
 | Tray menu brightness control | Chooses what the tray menu's **Increase brightness** and **Decrease brightness** items act on: **None** (the items are not shown; the default), **All monitors**, or one specific monitor. Each click moves the target by 10% from its current value; that counts as a manual change for scheduled monitors. Saved with **Save**. |
 | Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed, with a bullet on the level the target is currently at. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
 | Pause while connected through Remote Desktop | Leaves the monitors alone while the session is viewed remotely; see [Remote Desktop](#remote-desktop). Saved with **Save**. Enabled by default. |

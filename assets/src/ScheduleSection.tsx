@@ -467,8 +467,8 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
             </div>
             <p className="pt-5 text-neutral-500 text-[11px] leading-snug">
               When you change a scheduled monitor's brightness by hand, the
-              schedule leaves that monitor alone until this time of day, then
-              takes over again.
+              schedule pauses for every monitor it controls until this time of
+              day, then takes over again.
             </p>
           </div>
         </div>
