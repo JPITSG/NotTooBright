@@ -31,7 +31,9 @@ else, and an optional schedule that follows the sun for your location.
 3. Drag. That is it - values are remembered per monitor and restored next time.
 
 Hover the icon for a tooltip listing every monitor and its current
-brightness. Right-click it for **Configure** and **Exit**, plus **Increase
+brightness; with the schedule enabled it starts with a **State** line
+(*Daytime*, *Night*, or the transition in progress, *Daytime → Night* or
+*Night → Daytime*). Right-click it for **Configure** and **Exit**, plus **Increase
 brightness** / **Decrease brightness** and any preset levels you have listed
 once you have chosen which monitor the menu controls (see *Tray menu
 brightness control*). Requires Windows 10 or 11
@@ -105,7 +107,10 @@ side of sunrise and sunset). Where the sun does not rise or set on a given
 day, the night or daytime level simply applies all day.
 
 The schedule is evaluated every 30 seconds and writes to a monitor only when
-the rounded percentage changes. If you change a scheduled monitor's
+the rounded percentage changes. The tray icon's tooltip shows where the
+schedule currently is: **State: Daytime** or **State: Night** on the two
+plateaus, **State: Daytime → Night** while dusk is dimming the monitors and
+**State: Night → Daytime** while dawn is brightening them. If you change a scheduled monitor's
 brightness by hand (its slider or **All monitors**), automatic control of
 that monitor pauses until the **cycle reset time** you set (04:00 by
 default), so an adjustment you make in the evening is not undone a minute

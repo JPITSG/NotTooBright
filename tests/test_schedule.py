@@ -30,6 +30,11 @@ def structure(name):
     return re.search(r"typedef struct \{[^}]*\} " + name + r";", source)[0]
 
 
+def enumeration(name):
+    source = (ROOT / "NotTooBright.c").read_text()
+    return re.search(r"typedef enum \{[^}]*\} " + name + r";", source)[0]
+
+
 def run_c(code, data=None):
     with tempfile.TemporaryDirectory(prefix="ntb-test-") as directory:
         binary = str(Path(directory) / "test")
@@ -143,7 +148,7 @@ typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
     duskStartOffset, duskEndOffset; } Schedule;
 typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
 struct { int allowBelowMinimum; } g_config;
-''' + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleValueAt") + r'''
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleValueAt") + r'''
 int main(void) {
     Schedule sc = {100, -90, -30, 30, -30, 30};
     SolarDay days[5];
@@ -162,6 +167,142 @@ int main(void) {
 }
 ''')
 
+
+    def test_schedule_phase_follows_the_curve(self):
+        run_c(r'''
+#include <assert.h>
+#include <math.h>
+#define SCHEDULE_MIN_GAP 5
+#define SCHEDULE_DAY_RADIUS 2
+#define SCHEDULE_DAY_COUNT 5
+typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
+    duskStartOffset, duskEndOffset; } Schedule;
+typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + r'''
+static SchedulePhase phaseAt(const Schedule* sc, const SolarDay* days, double minutes) {
+    SchedulePhase phase;
+    ScheduleDaylightAt(sc, days, minutes, &phase);
+    return phase;
+}
+int main(void) {
+    Schedule sc = {100, 20, -30, 30, -30, 30};
+    SolarDay days[5];
+    for (int i = 0; i < 5; i++) days[i] = (SolarDay){360, 1080, 720, 0};
+    assert(phaseAt(&sc, days, 0) == SCHEDULE_PHASE_NIGHT);
+    assert(phaseAt(&sc, days, 330) == SCHEDULE_PHASE_NIGHT);   /* dawn starts here */
+    assert(phaseAt(&sc, days, 330.5) == SCHEDULE_PHASE_DAWN);
+    assert(phaseAt(&sc, days, 389.5) == SCHEDULE_PHASE_DAWN);
+    assert(phaseAt(&sc, days, 390) == SCHEDULE_PHASE_DAY);     /* dawn ends here */
+    assert(phaseAt(&sc, days, 720) == SCHEDULE_PHASE_DAY);
+    assert(phaseAt(&sc, days, 1050) == SCHEDULE_PHASE_DAY);    /* dusk starts here */
+    assert(phaseAt(&sc, days, 1050.5) == SCHEDULE_PHASE_DUSK);
+    assert(phaseAt(&sc, days, 1109.5) == SCHEDULE_PHASE_DUSK);
+    assert(phaseAt(&sc, days, 1110) == SCHEDULE_PHASE_NIGHT);  /* dusk ends here */
+    assert(phaseAt(&sc, days, 1439) == SCHEDULE_PHASE_NIGHT);
+    /* The phase follows the time of day even when both levels are equal. */
+    sc.nightLevel = 100;
+    assert(phaseAt(&sc, days, 360) == SCHEDULE_PHASE_DAWN);
+    sc.nightLevel = 20;
+    /* Yesterday's dusk running into today's dawn: whichever contributes
+     * more daylight decides, so the phase flips at the crossing. */
+    sc.duskEndOffset = 6 * 60;
+    sc.dawnStartOffset = -6 * 60;
+    days[1] = (SolarDay){60, 1380, 720, 0};    /* yesterday: dusk ends at 1740 = 300 today */
+    days[2] = (SolarDay){300, 1080, 720, 0};   /* today: dawn starts at -60 */
+    assert(phaseAt(&sc, days, 0) == SCHEDULE_PHASE_DUSK);
+    assert(phaseAt(&sc, days, 250) == SCHEDULE_PHASE_DAWN);
+    /* Polar day and night are plateaus. */
+    days[2].polar = 1;
+    assert(phaseAt(&sc, days, 0) == SCHEDULE_PHASE_DAY);
+    days[2].polar = -1;
+    assert(phaseAt(&sc, days, 720) == SCHEDULE_PHASE_NIGHT);
+}
+''')
+
+    def test_tooltip_shows_the_schedule_state_before_the_monitors(self):
+        run_c(r'''
+#include <assert.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <string.h>
+#include <wchar.h>
+#define APP_DISPLAY_NAME_WSTRING L"Not Too Bright"
+#define MODE_PROBING 1
+#define MODE_HARDWARE 2
+#define NIF_TIP 4
+#define NIM_MODIFY 1
+#define _TRUNCATE ((size_t)-1)
+typedef int BOOL;
+typedef unsigned UINT;
+typedef void* HWND;
+typedef struct { HWND hWnd; UINT uFlags; wchar_t szTip[128]; } NOTIFYICONDATAW;
+typedef struct { int hidden, hasValue, value, mode; wchar_t name[128]; } Monitor;
+''' + enumeration("SchedulePhase") + r'''
+NOTIFYICONDATAW g_nid = { (HWND)1 };
+Monitor g_monitors[4];
+int g_monitorCount, modifies, scheduleOn;
+SchedulePhase currentPhase;
+int MonitorMode(const Monitor* m) { return m->mode; }
+BOOL SchedulePhaseNow(SchedulePhase* phase) { *phase = currentPhase; return scheduleOn; }
+void Shell_NotifyIconW(int op, NOTIFYICONDATAW* nid) { assert(op == NIM_MODIFY && nid->uFlags == NIF_TIP); modifies++; }
+void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
+void wcscat_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscat(out, in); }
+void wcsncpy_s(wchar_t* out, size_t count, const wchar_t* in, size_t n) {
+    (void)n; wcsncpy(out, in, count - 1); out[count - 1] = 0;
+}
+/* The Windows CRT reads %s as a wide string in wide formats; glibc needs %ls. */
+int swprintf_s(wchar_t* out, size_t count, const wchar_t* format, ...) {
+    wchar_t fixed[256]; size_t n = 0;
+    for (const wchar_t* p = format; *p; p++) {
+        if (p[0] == L'%' && p[1] == L's') { fixed[n++] = L'%'; fixed[n++] = L'l'; fixed[n++] = L's'; p++; }
+        else fixed[n++] = *p;
+    }
+    fixed[n] = 0;
+    va_list args; va_start(args, format);
+    int written = vswprintf(out, count, fixed, args);
+    va_end(args);
+    return written;
+}
+''' + function("SchedulePhaseName") + function("UpdateTrayTooltip") + r'''
+int main(void) {
+    g_monitorCount = 2;
+    g_monitors[0] = (Monitor){0, 1, 75, MODE_HARDWARE, L"Left"};
+    g_monitors[1] = (Monitor){0, 0, 0, MODE_PROBING, L"Right"};
+    UpdateTrayTooltip();
+    assert(modifies == 1 && wcscmp(g_nid.szTip, L"Left: 75%\nRight: ...") == 0);
+    scheduleOn = 1;
+    currentPhase = SCHEDULE_PHASE_DUSK;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"State: Daytime \u2192 Night\nLeft: 75%\nRight: ...") == 0);
+    currentPhase = SCHEDULE_PHASE_DAWN;
+    UpdateTrayTooltip();
+    assert(wcsncmp(g_nid.szTip, L"State: Night \u2192 Daytime\n", 22) == 0);
+    currentPhase = SCHEDULE_PHASE_DAY;
+    g_monitors[1].hidden = 1;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"State: Daytime\nLeft: 75%") == 0);
+    currentPhase = SCHEDULE_PHASE_NIGHT;
+    g_monitorCount = 0;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"State: Night") == 0);
+    /* Unchanged text is not sent to the shell again. */
+    UpdateTrayTooltip();
+    assert(modifies == 5);
+    scheduleOn = 0;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, APP_DISPLAY_NAME_WSTRING) == 0);
+    /* Long lists are cut with an ellipsis and the state line always fits. */
+    scheduleOn = 1;
+    g_monitorCount = 4;
+    for (int i = 0; i < 4; i++) {
+        g_monitors[i] = (Monitor){0, 1, 50, MODE_HARDWARE, L""};
+        for (int j = 0; j < 45; j++) g_monitors[i].name[j] = L'a' + i;
+    }
+    UpdateTrayTooltip();
+    assert(wcslen(g_nid.szTip) < 128);
+    assert(wcsstr(g_nid.szTip, L"aaa...: 50%") && wcsstr(g_nid.szTip, L"\n...") && !wcsstr(g_nid.szTip, L"ccc"));
+}
+''')
 
     def test_c_curve_matches_preview_across_dates_and_ranges(self):
         cases = json.loads(subprocess.check_output(["node", "-e", r'''
@@ -206,7 +347,7 @@ typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
     duskStartOffset, duskEndOffset; } Schedule;
 typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
 struct { int allowBelowMinimum; } g_config;
-''' + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleValueAt") + r'''
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleValueAt") + r'''
 int main(void) {
     Schedule sc; SolarDay days[5]; double minutes; int expected;
     while (scanf("%d", &g_config.allowBelowMinimum) == 1) {

@@ -471,6 +471,14 @@ typedef struct {
     int noon;
 } SolarDay;
 
+/* Where the schedule's curve is: on a plateau or in one of the transitions. */
+typedef enum {
+    SCHEDULE_PHASE_NIGHT = 0,
+    SCHEDULE_PHASE_DAWN,      /* night -> daytime transition */
+    SCHEDULE_PHASE_DAY,
+    SCHEDULE_PHASE_DUSK       /* daytime -> night transition */
+} SchedulePhase;
+
 typedef enum {
     HW_UNKNOWN = 0,   /* probe in flight */
     HW_AVAILABLE,     /* monitor answers VCP 0x10 */
@@ -569,6 +577,7 @@ static HPOWERNOTIFY g_displayStateNotify = NULL;
 static LONG g_lastDisplayState = -1;
 static UINT g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
 static BOOL g_ddcRetryPending = FALSE;
+static int g_loggedSchedulePhase = -1;      /* last SchedulePhase written to the log */
 
 /* DDC/CI worker thread and its shared request state (guarded by g_ddcLock). */
 static CRITICAL_SECTION g_ddcLock;
@@ -2613,6 +2622,47 @@ static double SmoothStep(double x) {
     return x * x * (3 - 2 * x);
 }
 
+/* Daytime weight (0 night .. 1 day) at a local time (minutes, fractional)
+ * on the given day, and which part of the curve produced it. When
+ * yesterday's dusk overlaps today's dawn, the greater daytime contribution
+ * wins. Both curves are continuous, so their maximum is too; this also
+ * works when the daytime level is darker than the night level. */
+static double ScheduleDaylightAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT],
+                                 double minutes, SchedulePhase* phase) {
+    const SolarDay* today = &days[SCHEDULE_DAY_RADIUS];
+    if (today->polar) {
+        *phase = today->polar > 0 ? SCHEDULE_PHASE_DAY : SCHEDULE_PHASE_NIGHT;
+        return today->polar > 0 ? 1 : 0;
+    }
+    double daylight = 0;
+    *phase = SCHEDULE_PHASE_NIGHT;
+    for (int i = 0; i < SCHEDULE_DAY_COUNT; i++) {
+        if (days[i].polar) continue;
+        int a[4];
+        ScheduleAnchors(sc, &days[i], a);
+        double t = minutes - (i - SCHEDULE_DAY_RADIUS) * 1440;
+        double weight = 0;
+        SchedulePhase part = SCHEDULE_PHASE_NIGHT;
+        if (t > a[0] && t < a[3]) {
+            if (t < a[1]) {
+                weight = SmoothStep((t - a[0]) / (double)(a[1] - a[0]));
+                part = SCHEDULE_PHASE_DAWN;
+            } else if (t <= a[2]) {
+                weight = 1;
+                part = SCHEDULE_PHASE_DAY;
+            } else {
+                weight = 1 - SmoothStep((t - a[2]) / (double)(a[3] - a[2]));
+                part = SCHEDULE_PHASE_DUSK;
+            }
+        }
+        if (weight > daylight) {
+            daylight = weight;
+            *phase = part;
+        }
+    }
+    return daylight;
+}
+
 /* Brightness at a local time (minutes, fractional) on the given day. */
 static int ScheduleValueAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes) {
     /* Clamp endpoints before interpolation, just like the dialog preview.
@@ -2620,28 +2670,18 @@ static int ScheduleValueAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_
     int minimum = g_config.allowBelowMinimum ? -SOFT_MAX_DIM : 0;
     double night = sc->nightLevel < minimum ? minimum : sc->nightLevel;
     double dayLevel = sc->dayLevel < minimum ? minimum : sc->dayLevel;
-    const SolarDay* today = &days[SCHEDULE_DAY_RADIUS];
-    if (today->polar > 0) return (int)dayLevel;
-    if (today->polar < 0) return (int)night;
-
-    /* When yesterday's dusk overlaps today's dawn, use the greater daytime
-     * contribution. Both curves are continuous, so their maximum is too;
-     * this also works when the daytime level is darker than the night level. */
-    double daylight = 0;
-    for (int i = 0; i < SCHEDULE_DAY_COUNT; i++) {
-        if (days[i].polar) continue;
-        int a[4];
-        ScheduleAnchors(sc, &days[i], a);
-        double t = minutes - (i - SCHEDULE_DAY_RADIUS) * 1440;
-        double weight = 0;
-        if (t > a[0] && t < a[3]) {
-            if (t < a[1]) weight = SmoothStep((t - a[0]) / (double)(a[1] - a[0]));
-            else if (t <= a[2]) weight = 1;
-            else weight = 1 - SmoothStep((t - a[2]) / (double)(a[3] - a[2]));
-        }
-        if (weight > daylight) daylight = weight;
-    }
+    SchedulePhase phase;
+    double daylight = ScheduleDaylightAt(sc, days, minutes, &phase);
     return (int)lround(night + (dayLevel - night) * daylight);
+}
+
+static const wchar_t* SchedulePhaseName(SchedulePhase phase) {
+    switch (phase) {
+        case SCHEDULE_PHASE_DAY: return L"Daytime";
+        case SCHEDULE_PHASE_DAWN: return L"Night \u2192 Daytime";
+        case SCHEDULE_PHASE_DUSK: return L"Daytime \u2192 Night";
+        default: return L"Night";
+    }
 }
 
 static ULONGLONG NowFileTime(void) {
@@ -2702,24 +2742,55 @@ static BOOL IsSchedulePaused(const Monitor* m, ULONGLONG nowFt) {
     return m->pausedUntil != 0 && m->pausedUntil > nowFt;
 }
 
-/* The value the schedule wants right now, or FALSE when it is off. */
-static BOOL ScheduleTargetNow(int* value) {
+/* The solar days around today and the current local time, or FALSE when
+ * the schedule is off. */
+static BOOL ScheduleNow(SolarDay days[SCHEDULE_DAY_COUNT], double* minutes) {
     const Schedule* sc = &g_config.schedule;
     if (!sc->enabled || !sc->hasLocation) return FALSE;
     SYSTEMTIME now;
     GetLocalTime(&now);
-    SolarDay days[SCHEDULE_DAY_COUNT];
     if (!ComputeSolarDays(sc->latitude, sc->longitude, &now, days)) return FALSE;
-    double minutes = now.wHour * 60 + now.wMinute + now.wSecond / 60.0;
-    *value = ScheduleValueAt(sc, days, minutes);
+    *minutes = now.wHour * 60 + now.wMinute + now.wSecond / 60.0;
+    return TRUE;
+}
+
+/* The value the schedule wants right now, or FALSE when it is off. */
+static BOOL ScheduleTargetNow(int* value) {
+    SolarDay days[SCHEDULE_DAY_COUNT];
+    double minutes;
+    if (!ScheduleNow(days, &minutes)) return FALSE;
+    *value = ScheduleValueAt(&g_config.schedule, days, minutes);
+    return TRUE;
+}
+
+/* Where the schedule is in its day/night cycle right now, or FALSE when
+ * it is off. */
+static BOOL SchedulePhaseNow(SchedulePhase* phase) {
+    SolarDay days[SCHEDULE_DAY_COUNT];
+    double minutes;
+    if (!ScheduleNow(days, &minutes)) return FALSE;
+    ScheduleDaylightAt(&g_config.schedule, days, minutes, phase);
     return TRUE;
 }
 
 /* Applies the current schedule value to every scheduled, unpaused monitor.
  * Runs on the schedule timer and after anything that changes the inputs. */
 static void EvaluateSchedule(void) {
-    int target;
-    if (!ScheduleTargetNow(&target)) return;
+    /* The tooltip's state line follows the clock, not just the values. */
+    ScheduleTooltipUpdate();
+    SolarDay days[SCHEDULE_DAY_COUNT];
+    double minutes;
+    if (!ScheduleNow(days, &minutes)) {
+        g_loggedSchedulePhase = -1;
+        return;
+    }
+    int target = ScheduleValueAt(&g_config.schedule, days, minutes);
+    SchedulePhase phase;
+    ScheduleDaylightAt(&g_config.schedule, days, minutes, &phase);
+    if ((int)phase != g_loggedSchedulePhase) {
+        DebugPrint(L"[INFO] Schedule state: %s, target %d%%\n", SchedulePhaseName(phase), target);
+        g_loggedSchedulePhase = (int)phase;
+    }
     ULONGLONG now = NowFileTime();
     BOOL changed = FALSE;
     for (int i = 0; i < g_monitorCount; i++) {
@@ -5100,14 +5171,18 @@ static void ScheduleTooltipUpdate(void) {
     if (g_hwnd) SetTimer(g_hwnd, ID_TIMER_TOOLTIP, TOOLTIP_UPDATE_DELAY_MS, NULL);
 }
 
-/* "Not Too Bright" followed by one "name: NN%" line per visible monitor.
+/* "State: Daytime" (or Night, or the transition in progress) while the
+ * schedule is enabled, then one "name: NN%" line per visible monitor.
  * szTip holds 128 characters, so long names are shortened and, if the list
  * still does not fit, the tail is replaced by an ellipsis. */
 static void UpdateTrayTooltip(void) {
     if (!g_nid.hWnd) return;
     const size_t cap = sizeof(g_nid.szTip) / sizeof(wchar_t);
-    wchar_t tip[128];
-    wcscpy_s(tip, cap, APP_DISPLAY_NAME_WSTRING);
+    wchar_t tip[128] = L"";
+    SchedulePhase phase;
+    if (SchedulePhaseNow(&phase)) {
+        swprintf_s(tip, cap, L"State: %s", SchedulePhaseName(phase));
+    }
     for (int i = 0; i < g_monitorCount; i++) {
         const Monitor* m = &g_monitors[i];
         if (m->hidden) continue;
@@ -5115,10 +5190,11 @@ static void UpdateTrayTooltip(void) {
         wcsncpy_s(name, 40, m->name, _TRUNCATE);
         if (wcslen(m->name) > 39) wcscpy_s(name + 36, 4, L"...");
         wchar_t line[64];
+        const wchar_t* separator = tip[0] ? L"\n" : L"";
         if (m->hasValue && MonitorMode(m) != MODE_PROBING) {
-            swprintf_s(line, 64, L"\n%s: %d%%", name, m->value);
+            swprintf_s(line, 64, L"%s%s: %d%%", separator, name, m->value);
         } else {
-            swprintf_s(line, 64, L"\n%s: ...", name);
+            swprintf_s(line, 64, L"%s%s: ...", separator, name);
         }
         if (wcslen(tip) + wcslen(line) >= cap - 1) {
             /* Out of room: mark the list as cut and stop. */
@@ -5127,6 +5203,8 @@ static void UpdateTrayTooltip(void) {
         }
         wcscat_s(tip, cap, line);
     }
+    /* Nothing to list (no monitors, schedule off): keep the icon identifiable. */
+    if (!tip[0]) wcscpy_s(tip, cap, APP_DISPLAY_NAME_WSTRING);
     if (wcscmp(tip, g_nid.szTip) == 0) return;
     wcscpy_s(g_nid.szTip, cap, tip);
     NOTIFYICONDATAW nid = g_nid;
