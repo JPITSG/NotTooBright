@@ -24,6 +24,12 @@ def function(name):
     return source[start:pos]
 
 
+
+def structure(name):
+    source = (ROOT / "NotTooBright.c").read_text()
+    return re.search(r"typedef struct \{[^}]*\} " + name + r";", source)[0]
+
+
 def run_c(code, data=None):
     with tempfile.TemporaryDirectory(prefix="ntb-test-") as directory:
         binary = str(Path(directory) / "test")
@@ -213,6 +219,88 @@ int main(void) {
     }
 }
 ''', '\n'.join(rows))
+
+
+    def test_refresh_persists_pause_before_removal_and_preserves_matching_records(self):
+        run_c(r'''
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#include <wchar.h>
+#define TRUE 1
+#define FALSE 0
+#define MAX_MONITORS 16
+#define MAX_PHYSICAL_PER_DISPLAY 8
+#define CCHDEVICENAME 32
+#define HW_UNKNOWN 0
+#define MONITORINFOF_PRIMARY 1
+#define DebugPrint(...) ((void)0)
+#define ZeroMemory(p,n) memset(p,0,n)
+#define swprintf_s swprintf
+#define EnumMonitorProc NULL
+typedef int BOOL;
+typedef unsigned long DWORD;
+typedef unsigned long long ULONGLONG;
+typedef void *HMONITOR, *HWND;
+typedef intptr_t LPARAM;
+typedef int HardwareState;
+typedef struct { long left, top, right, bottom; } RECT;
+typedef struct { RECT rcMonitor; DWORD dwFlags; wchar_t szDevice[32]; } MONITORINFOEXW;
+''' + structure("Monitor") + structure("DdcProbeEntry") + structure("EnumEntry") + structure("EnumContext") + r'''
+Monitor g_monitors[MAX_MONITORS], saved;
+int g_monitorCount, g_nextUid = 20, connected = 0, saves = 0;
+void SaveMonitorSettings(const Monitor* m) { saved = *m; saves++; }
+void LoadMonitorSettings(Monitor* m) {
+    m->pausedUntil = saved.pausedUntil; m->scheduled = saved.scheduled;
+    m->value = saved.value; m->hasValue = saved.hasValue;
+}
+void LogDisplayDevices(void) {}
+void EnumDisplayMonitors(void* a,void* b,void* c,LPARAM data) {
+    (void)a; (void)b; (void)c;
+    EnumContext* ctx = (EnumContext*)data;
+    ctx->count = connected;
+    ctx->entries[0].hmon = (void*)1;
+    wcscpy(ctx->entries[0].info.szDevice,L"DISPLAY");
+}
+BOOL GetNumberOfPhysicalMonitorsFromHMONITOR(HMONITOR h,DWORD* count) {
+    (void)h; *count=1; return TRUE;
+}
+void wcscpy_s(wchar_t* out,size_t count,const wchar_t* in) { (void)count; wcscpy(out,in); }
+void ResolveMonitorIdentity(const wchar_t* device,int index,Monitor* m) {
+    (void)device; (void)index; wcscpy(m->key,L"monitor");
+}
+void SanitizeKeyChars(wchar_t* key) { (void)key; }
+void DestroyWindow(HWND hwnd) { (void)hwnd; }
+HWND CreateOverlayWindow(const RECT* rect) { (void)rect; return (void*)2; }
+void PositionOverlay(Monitor* m) { (void)m; }
+void SetOverlayDim(Monitor* m,int dim) { (void)m; (void)dim; }
+void ReleaseMonitorOverlay(Monitor* m) { m->overlay=NULL; }
+Monitor* FindMonitorByUid(int uid) {
+    for (int i=0;i<g_monitorCount;i++) if(g_monitors[i].uid==uid)return &g_monitors[i];
+    return NULL;
+}
+void DdcRequestProbe(const DdcProbeEntry* entries,int count) { (void)entries; (void)count; }
+void PushMonitorsToDialog(void) {}
+''' + function("PersistDirtyMonitors") + function("RefreshMonitors") + r'''
+int main(void) {
+    g_monitorCount = 1;
+    g_monitors[0] = (Monitor){.uid=1,.dirty=TRUE,.scheduled=TRUE,
+        .pausedUntil=123456789,.value=25,.hasValue=TRUE};
+    wcscpy(g_monitors[0].key,L"monitor");
+    RefreshMonitors(); /* Removed before the delayed persistence timer. */
+    assert(g_monitorCount==0 && saves==1 && saved.pausedUntil==123456789);
+    connected=1;
+    RefreshMonitors();
+    assert(g_monitorCount==1 && g_monitors[0].scheduled);
+    assert(g_monitors[0].pausedUntil==123456789 && g_monitors[0].value==25);
+    int uid=g_monitors[0].uid;
+    g_monitors[0].pausedUntil=987654321;
+    g_monitors[0].dirty=TRUE;
+    RefreshMonitors(); /* Existing whole-record merge must still survive. */
+    assert(saves==2 && g_monitors[0].uid==uid);
+    assert(g_monitors[0].pausedUntil==987654321 && g_monitors[0].scheduled);
+}
+''')
 
 
 if __name__ == "__main__":

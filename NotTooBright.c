@@ -2129,6 +2129,9 @@ static void LogDisplayDevices(void) {
 }
 
 static void RefreshMonitors(void) {
+    /* A removed monitor will no longer be in the array when the debounced
+     * save runs. Flush its pending brightness/pause before replacing it. */
+    PersistDirtyMonitors();
     DebugPrint(L"[INFO] Refreshing monitors (%d known so far)\n", g_monitorCount);
     LogDisplayDevices();
     EnumContext ctx;
