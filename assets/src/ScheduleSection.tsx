@@ -419,28 +419,30 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
 
           <div className="space-y-1">
             <Label className="text-xs">Apply to</Label>
-            {monitors.length > 0 && !monitors.some((m) => settings.scheduledKeys.includes(m.key)) && (
-              <p className="text-[11px] leading-snug text-amber-700">
-                No monitor is selected, so the schedule will not change anything.
-              </p>
-            )}
             {monitors.length === 0 ? (
               <p className="text-neutral-500 text-[11px]">No monitors are available.</p>
             ) : (
-              <div className="flex flex-wrap gap-x-4 gap-y-1">
+              <div className="grid grid-cols-2 gap-2">
                 {monitors.map((m) => {
                   const id = `schedule-monitor-${m.uid}`;
+                  const checked = settings.scheduledKeys.includes(m.key);
                   return (
-                    <div key={m.uid} className="flex items-center gap-2">
+                    <label
+                      key={m.uid}
+                      htmlFor={id}
+                      className={`flex min-w-0 cursor-pointer items-center gap-2 rounded-md border px-3 py-2 ${
+                        checked ? "border-neutral-400 bg-neutral-50" : "border-neutral-200"
+                      }`}
+                    >
                       <Checkbox
                         id={id}
-                        checked={settings.scheduledKeys.includes(m.key)}
+                        checked={checked}
                         onChange={(e) => toggleMonitor(m.key, e.target.checked)}
                       />
-                      <Label htmlFor={id} className="cursor-pointer text-[11px] font-normal">
+                      <span className="truncate text-xs" title={m.name}>
                         {m.name}
-                      </Label>
-                    </div>
+                      </span>
+                    </label>
                   );
                 })}
               </div>
