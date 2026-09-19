@@ -1631,6 +1631,9 @@ static void OpenJobSources(WorkerSource* sources, int* count, const DdcProbeEntr
         WorkerSource* src = FindWorkerSource(sources, *count, job[j].hmon);
         if (src) {
             src->inJob = TRUE;
+            /* A failed initial open (or reopen) leaves an empty cached
+             * source. Retry it without disturbing valid, settled handles. */
+            if (src->count == 0) OpenWorkerSource(src);
         } else if (*count < MAX_MONITORS) {
             WorkerSource* s = &sources[(*count)++];
             s->hmon = job[j].hmon;

@@ -71,5 +71,39 @@ int main(void) {
 ''')
 
 
+    def test_empty_source_is_reopened_but_valid_handles_are_kept(self):
+        run_c(r'''
+#include <assert.h>
+#include <stddef.h>
+#define MAX_MONITORS 16
+#define FALSE 0
+#define TRUE 1
+typedef int HMONITOR;
+typedef struct { HMONITOR hmon; int inJob, count; } WorkerSource;
+typedef struct { HMONITOR hmon; } DdcProbeEntry;
+int opens;
+int OpenWorkerSource(WorkerSource* s) {
+    opens++;
+    s->count = opens == 1 ? 0 : 1;
+    return s->count > 0;
+}
+''' + function("FindWorkerSource") + function("OpenJobSources") + r'''
+int main(void) {
+    WorkerSource sources[MAX_MONITORS] = {0};
+    int count = 0;
+    DdcProbeEntry job = {.hmon = 1};
+    OpenJobSources(sources, &count, &job, 1);
+    assert(opens == 1 && count == 1 && sources[0].count == 0);
+    OpenJobSources(sources, &count, &job, 1);
+    assert(opens == 2 && count == 1 && sources[0].count == 1);
+    OpenJobSources(sources, &count, &job, 1);
+    assert(opens == 2 && sources[0].inJob);
+    sources[0].count = 0; /* A later reopen failed. */
+    OpenJobSources(sources, &count, &job, 1);
+    assert(opens == 3 && sources[0].count == 1);
+}
+''')
+
+
 if __name__ == "__main__":
     unittest.main()
