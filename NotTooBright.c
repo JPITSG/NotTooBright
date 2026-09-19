@@ -2191,24 +2191,24 @@ static void RefreshMonitors(void) {
             }
         }
         if (old) {
-            dst->uid = old->uid;
-            /* Keep the last known hardware state while the re-probe runs so
-             * the dialog does not flash "detecting" on every retry. */
-            dst->hardwareState = old->hardwareState;
-            dst->ddcMax = old->ddcMax;
-            dst->ddcCurrent = old->ddcCurrent;
-            dst->value = old->value;
-            dst->hasValue = old->hasValue;
-            dst->forceSoftware = old->forceSoftware;
-            dst->hidden = old->hidden;
-            dst->hasOriginal = old->hasOriginal;
-            dst->knownHardware = old->knownHardware;
-            dst->probeFailures = old->probeFailures;
-            dst->originalRaw = old->originalRaw;
-            dst->originalMax = old->originalMax;
-            dst->overlay = old->overlay;
-            dst->overlayDim = old->overlayDim;
-            dst->dirty = old->dirty;
+            /* A monitor seen before keeps everything it had - persisted
+             * flags (scheduled, hidden, software-only, pause), probe state,
+             * overlay - and takes only identity and geometry from the fresh
+             * enumeration. Copying the whole record is deliberate: listing
+             * fields one by one is how the scheduled flag got lost on every
+             * refresh (0.0.19). The hardware state stays as it was while the
+             * re-probe runs so the dialog does not flash "detecting". */
+            Monitor seen = *dst;
+            *dst = *old;
+            dst->hmon = seen.hmon;
+            dst->physicalIndex = seen.physicalIndex;
+            dst->rect = seen.rect;
+            dst->primary = seen.primary;
+            wcscpy_s(dst->device, CCHDEVICENAME, seen.device);
+            wcscpy_s(dst->name, sizeof(dst->name) / sizeof(wchar_t), seen.name);
+            dst->lastHwSent = -1;   /* the re-probe decides whether to write */
+            dst->failures = 0;
+            dst->error[0] = L'\0';
             old->overlay = NULL;   /* ownership moved */
         } else {
             dst->uid = g_nextUid++;
@@ -4580,6 +4580,9 @@ static void SaveScheduleFromMessage(const char* msg) {
 
     for (int i = 0; i < g_monitorCount; i++) {
         Monitor* m = &g_monitors[i];
+        /* Hidden monitors are not in the dialog, so the list says nothing
+         * about them; their flag waits untouched for the next rescan. */
+        if (m->hidden) continue;
         BOOL scheduled = FALSE;
         const char* p = scheduledUids;
         while (*p) {
@@ -4600,7 +4603,7 @@ static void SaveScheduleFromMessage(const char* msg) {
 
     int scheduledCount = 0;
     for (int i = 0; i < g_monitorCount; i++) {
-        if (g_monitors[i].scheduled) scheduledCount++;
+        if (g_monitors[i].scheduled && !g_monitors[i].hidden) scheduledCount++;
     }
     DebugPrint(L"[INFO] Schedule %s: lat %.4f lon %.4f, day %d%% night %d%%, dawn %+d/%+d, dusk %+d/%+d, reset %02d:%02d, %d monitor(s) selected%s\n",
                sc->enabled ? L"enabled" : L"disabled", sc->latitude, sc->longitude,

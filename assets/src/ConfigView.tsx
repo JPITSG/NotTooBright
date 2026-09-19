@@ -272,7 +272,9 @@ function initialSchedule(config: ConfigData, monitors: MonitorData[]): ScheduleS
     duskStartOffset: s?.duskStartOffset ?? -30,
     duskEndOffset: s?.duskEndOffset ?? 30,
     cycleResetMinutes: s?.cycleResetMinutes ?? 240,
-    scheduledUids: monitors.filter((m) => m.scheduled).map((m) => m.uid),
+    // Hidden monitors are not listed, so only visible ones count here;
+    // a hidden one keeps its own flag until the next rescan.
+    scheduledUids: monitors.filter((m) => m.scheduled && !m.hidden).map((m) => m.uid),
   };
 }
 
