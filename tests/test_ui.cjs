@@ -58,3 +58,27 @@ test('ordinary dawn, daytime, dusk and night levels stay unchanged', () => {
   assert.equal(solar.scheduleValueAt(defaultShape, days, 1080), 55);
   assert.equal(solar.scheduleValueAt(defaultShape, days, 1440), 10);
 });
+
+test('solar event times use local clock minutes across both DST changes', () => {
+  // Reconstruct the event instant from the UTC result, independently of
+  // the local implementation. Compare the local calendar and clock fields.
+  for (const [zone, dates, lat, lon] of [
+    ['Europe/Warsaw', [[2026, 2, 29], [2026, 9, 25]], 52.23, 21.01],
+    ['Australia/Lord_Howe', [[2026, 3, 5], [2026, 9, 4]], -31.55, 159.08],
+    ['Pacific/Apia', [[2026, 5, 21]], -13.83, -171.76],
+  ]) {
+    for (const [year, month, date] of dates) {
+      process.env.TZ = 'UTC';
+      const utc = solar.computeSolarDay(lat, lon, new Date(year, month, date, 12));
+      process.env.TZ = zone;
+      const local = solar.computeSolarDay(lat, lon, new Date(year, month, date, 12));
+      for (const event of ['sunrise', 'sunset', 'noon']) {
+        const instant = new Date(Date.UTC(year, month, date) + utc[event] * 60000);
+        const delta = (Date.UTC(instant.getFullYear(), instant.getMonth(), instant.getDate()) -
+          Date.UTC(year, month, date)) / 86400000;
+        const expected = delta * 1440 + instant.getHours() * 60 + instant.getMinutes();
+        assert.equal(local[event], expected, `${zone} ${month + 1}/${date} ${event}`);
+      }
+    }
+  }
+});

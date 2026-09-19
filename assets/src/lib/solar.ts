@@ -82,15 +82,15 @@ function solarNoonAndHourAngle(latitude: number, longitude: number, jd: number) 
 // Minutes after local midnight of `date` for "0h UTC of that calendar date
 // plus utcMinutes"; the JS engine applies the local time zone and DST.
 function utcMinutesToLocalMinutes(date: Date, utcMinutes: number) {
-  const instant =
-    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) +
-    utcMinutes * 60000;
-  const localMidnight = new Date(
-    date.getFullYear(),
-    date.getMonth(),
-    date.getDate()
-  ).getTime();
-  return Math.round((instant - localMidnight) / 60000);
+  const instant = new Date(
+    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) + utcMinutes * 60000
+  );
+  // Use calendar dates and wall-clock fields, matching the host. Elapsed
+  // time since local midnight differs by an hour on DST transition days.
+  const calendarDay = Date.UTC(instant.getFullYear(), instant.getMonth(), instant.getDate());
+  const referenceDay = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  return ((calendarDay - referenceDay) / 86400000) * 1440 +
+    instant.getHours() * 60 + instant.getMinutes();
 }
 
 export function computeSolarDay(
