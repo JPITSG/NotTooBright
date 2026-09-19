@@ -306,6 +306,7 @@ export default function ConfigView({
   const [pauseInRemoteSession, setPauseInRemoteSession] = useState(
     config.pauseInRemoteSession ?? true
   );
+  const [brightnessKeys, setBrightnessKeys] = useState(config.brightnessKeys ?? false);
   const [trayTarget, setTrayTarget] = useState(config.trayTarget ?? TRAY_TARGET_NONE);
   // Shown as "100, 75, 50"; only what parses is saved.
   const [trayPresets, setTrayPresets] = useState(
@@ -510,6 +511,7 @@ export default function ConfigView({
       debugLog,
       autoCheckForUpdates,
       pauseInRemoteSession,
+      brightnessKeys,
       trayTarget,
       trayPresetsParsed.values,
       schedule,
@@ -708,6 +710,26 @@ export default function ConfigView({
             : "Choose All monitors or one monitor to add Increase brightness, " +
               "Decrease brightness and preset levels to the tray menu."}
         </p>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="brightnessKeys"
+          className="mt-0.5"
+          checked={brightnessKeys}
+          onChange={(e) => setBrightnessKeys(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="brightnessKeys" className="cursor-pointer">
+            Use the keyboard's brightness keys
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            The Brightness Up and Brightness Down keys change every monitor by
+            10% per press, whatever window is focused, and count as a manual
+            change for the schedule. Windows keeps showing its own brightness
+            indicator, which only affects a built-in display.
+          </p>
+        </div>
       </div>
 
       <div className="flex items-start gap-2 pt-1">

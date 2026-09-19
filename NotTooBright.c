@@ -45,6 +45,10 @@
 #include <winver.h>
 #include <userenv.h>
 #include <wtsapi32.h>
+#include <hidsdi.h>
+#include <hidpi.h>
+#include <hidusage.h>
+#include <cfgmgr32.h>
 #include <physicalmonitorenumerationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
@@ -108,6 +112,7 @@
 #define UPDATE_HELPER_WAIT_MS 120000
 #define REG_VALUE_AUTO_UPDATE L"AutoCheckForUpdates"
 #define REG_VALUE_PAUSE_REMOTE L"PauseInRemoteSession"
+#define REG_VALUE_BRIGHTNESS_KEYS L"BrightnessKeys"
 #define REG_VALUE_IGNORED_UPDATE_VERSION L"IgnoredUpdateVersion"
 #define ID_TIMER_AUTO_UPDATE 8
 #define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
@@ -120,6 +125,7 @@
 /* Posted by the update check thread. */
 #define WM_APP_UPDATE_RESULT (WM_APP + 4)
 #define WM_APP_UPDATE_PROGRESS (WM_APP + 5)
+#define WM_APP_BRIGHTNESS_KEY (WM_APP + 6)   /* wParam: +1 up / -1 down, from a reader thread */
 #define ID_TRAY_MENU_CONFIGURE 1
 #define ID_TRAY_MENU_EXIT 2
 #define ID_TRAY_MENU_BRIGHTER 3
@@ -139,6 +145,16 @@
 /* The tray tooltip lists every visible monitor; rebuilding it is deferred
  * briefly so a slider drag does not rewrite it dozens of times a second. */
 #define ID_TIMER_TOOLTIP 9
+
+/* Keyboard brightness keys: HID consumer-control usages read straight from
+ * the keyboard's collection (see "Keyboard brightness keys" below). A key
+ * counts again while it stays down only every KEY_REPEAT_MIN_MS. */
+#define ID_TIMER_KEY_DEVICES 6
+#define KEY_DEVICES_DEBOUNCE_MS 1500
+#define KEY_MAX_READERS 8
+#define KEY_REPEAT_MIN_MS 250
+#define HID_USAGE_CONSUMER_BRIGHTNESS_UP 0x6F
+#define HID_USAGE_CONSUMER_BRIGHTNESS_DOWN 0x70
 #define TOOLTIP_UPDATE_DELAY_MS 200
 
 /* The config dialog is normally shown by its first resize message; the
@@ -434,6 +450,7 @@ typedef struct {
     BOOL debugLogEnabled;
     BOOL autoCheckForUpdates;
     BOOL pauseInRemoteSession; /* leave the monitors alone while viewed through Remote Desktop */
+    BOOL brightnessKeys;      /* the keyboard's brightness keys step every monitor */
     wchar_t trayTarget[128];  /* "", "*", or a monitor key */
     int trayPresets[TRAY_MAX_PRESETS];  /* -SOFT_MAX_DIM..100, menu order */
     int trayPresetCount;
@@ -584,6 +601,18 @@ static BOOL g_ddcRetryPending = FALSE;
 static int g_loggedSchedulePhase = -1;      /* last SchedulePhase written to the log */
 static BOOL g_remoteSession = FALSE;        /* paused: the session is viewed through Remote Desktop */
 
+/* One open consumer-control collection with its reader thread. */
+typedef struct {
+    HANDLE device;
+    HANDLE thread;
+    HANDLE stop;                  /* manual-reset: the reader should exit */
+    PHIDP_PREPARSED_DATA preparsed;
+    USHORT reportLength;
+    wchar_t name[128];
+} KeyReader;
+static KeyReader g_keyReaders[KEY_MAX_READERS];
+static int g_keyReaderCount = 0;
+
 /* DDC/CI worker thread and its shared request state (guarded by g_ddcLock). */
 static CRITICAL_SECTION g_ddcLock;
 static HANDLE g_ddcEvent = NULL;
@@ -642,6 +671,8 @@ static void SetMonitorValue(Monitor* m, int value);
 static void RefreshMonitors(void);
 static void ScheduleMonitorRefresh(UINT delayMs);
 static void UpdateRemoteSessionState(void);
+static void UpdateBrightnessKeyReaders(void);
+static void CloseBrightnessKeyReaders(void);
 static void ScheduleDdcRetry(void);
 static void SchedulePersist(void);
 static void PersistDirtyMonitors(void);
@@ -897,6 +928,7 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     ReadRegistryBool(hKey, REG_VALUE_ALLOW_BELOW_MIN, &config->allowBelowMinimum);
     ReadRegistryBool(hKey, REG_VALUE_AUTO_UPDATE, &config->autoCheckForUpdates);
     ReadRegistryBool(hKey, REG_VALUE_PAUSE_REMOTE, &config->pauseInRemoteSession);
+    ReadRegistryBool(hKey, REG_VALUE_BRIGHTNESS_KEYS, &config->brightnessKeys);
 
     DWORD dataType = 0;
     DWORD dataSize = sizeof(config->trayTarget) - sizeof(wchar_t);
@@ -962,6 +994,7 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     if (!WriteRegistryDword(hKey, REG_VALUE_ALLOW_BELOW_MIN, config->allowBelowMinimum ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_AUTO_UPDATE, config->autoCheckForUpdates ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_PAUSE_REMOTE, config->pauseInRemoteSession ? 1 : 0)) success = FALSE;
+    if (!WriteRegistryDword(hKey, REG_VALUE_BRIGHTNESS_KEYS, config->brightnessKeys ? 1 : 0)) success = FALSE;
     RegSetValueExW(hKey, REG_VALUE_TRAY_TARGET, 0, REG_SZ, (const BYTE*)config->trayTarget,
                    (DWORD)((wcslen(config->trayTarget) + 1) * sizeof(wchar_t)));
     wchar_t presetText[128];
@@ -2016,6 +2049,235 @@ static int ClampMonitorValue(const Monitor* m, int value) {
  * monitors: 0..100 is the backlight, negative values keep the backlight at
  * its minimum and add software dimming. Software monitors: the overlay
  * alone provides the whole range. */
+/* ── Keyboard brightness keys ────────────────────────────────────────────── */
+
+/* Brightness keys have no virtual-key code: they are usages on the
+ * keyboard's HID Consumer Control collection, which Windows itself handles
+ * (that is what shows the brightness flyout, and on a laptop moves the
+ * built-in panel). The collection is opened directly and its input
+ * reports are read on a thread per device, the way hidapi does it. This is
+ * a plain device read, not part of input routing, so it works whatever
+ * window is focused, including elevated ones that withhold raw input
+ * (RIDEV_INPUTSINK) from a normal process - the likely reason the raw
+ * input attempt in 0.0.9 seemed unreliable. Keyboards and mice refuse to be
+ * opened this way (their collections belong to kbdhid/mouhid); consumer
+ * collections are shared with Windows' own reader. Everything is logged
+ * under [INPUT] because a keyboard that does not send the standard usages
+ * can only be diagnosed from a log. */
+
+/* Whether a report counts as a press: the first report with the usage
+ * set, then again every KEY_REPEAT_MIN_MS while it stays set. That covers
+ * keyboards that send press and release, ones that repeat while held, and
+ * ones that never send a release at all. */
+static BOOL BrightnessKeyPressed(BOOL down, BOOL* wasDown, ULONGLONG* lastPress, ULONGLONG now) {
+    BOOL press = down && (!*wasDown || now - *lastPress >= KEY_REPEAT_MIN_MS);
+    if (press) *lastPress = now;
+    *wasDown = down;
+    return press;
+}
+
+static DWORD WINAPI KeyReaderThread(LPVOID param) {
+    KeyReader* r = (KeyReader*)param;
+    ULONG maxUsages = HidP_MaxUsageListLength(HidP_Input, 0, r->preparsed);
+    if (maxUsages == 0 || maxUsages > 64) maxUsages = 64;
+    USAGE_AND_PAGE* usages = (USAGE_AND_PAGE*)calloc(maxUsages, sizeof(USAGE_AND_PAGE));
+    BYTE* report = (BYTE*)calloc(r->reportLength, 1);
+    OVERLAPPED ov;
+    ZeroMemory(&ov, sizeof(ov));
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!usages || !report || !ov.hEvent) {
+        free(usages);
+        free(report);
+        if (ov.hEvent) CloseHandle(ov.hEvent);
+        return 0;
+    }
+    HANDLE waits[2] = { r->stop, ov.hEvent };
+    BOOL upDown = FALSE, downDown = FALSE;
+    ULONGLONG lastUp = 0, lastDown = 0;
+    for (;;) {
+        ResetEvent(ov.hEvent);
+        DWORD read = 0;
+        if (!ReadFile(r->device, report, r->reportLength, &read, &ov)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_IO_PENDING) {
+                DebugPrint(L"[INPUT] %s: read failed (error %lu); the device is gone\n", r->name, (unsigned long)error);
+                break;
+            }
+            if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) {
+                CancelIoEx(r->device, &ov);
+                break;
+            }
+            if (!GetOverlappedResult(r->device, &ov, &read, FALSE)) {
+                DebugPrint(L"[INPUT] %s: read failed (error %lu); the device is gone\n", r->name, (unsigned long)GetLastError());
+                break;
+            }
+        }
+        if (read == 0) continue;
+        ULONG count = maxUsages;
+        NTSTATUS status = HidP_GetUsagesEx(HidP_Input, 0, usages, &count, r->preparsed, (PCHAR)report, read);
+        if (status != HIDP_STATUS_SUCCESS) {
+            /* Reports of another report id in the same collection, typically. */
+            if (status != HIDP_STATUS_INCOMPATIBLE_REPORT_ID) {
+                DebugPrint(L"[INPUT] %s: %lu-byte report not decoded (status 0x%08lX)\n", r->name,
+                           (unsigned long)read, (unsigned long)status);
+            }
+            continue;
+        }
+        BOOL up = FALSE, down = FALSE;
+        wchar_t list[256] = L"";
+        size_t len = 0;
+        for (ULONG i = 0; i < count; i++) {
+            if (usages[i].UsagePage == HID_USAGE_PAGE_CONSUMER) {
+                if (usages[i].Usage == HID_USAGE_CONSUMER_BRIGHTNESS_UP) up = TRUE;
+                else if (usages[i].Usage == HID_USAGE_CONSUMER_BRIGHTNESS_DOWN) down = TRUE;
+            }
+            if (len + 16 < 256) {
+                len += (size_t)swprintf_s(list + len, 256 - len, L" %02X:%04X",
+                                          (unsigned)usages[i].UsagePage, (unsigned)usages[i].Usage);
+            }
+        }
+        DebugPrint(L"[INPUT] %s: report id %u, %lu byte(s), %lu usage(s)%s%s\n", r->name,
+                   (unsigned)report[0], (unsigned long)read, (unsigned long)count, list,
+                   up ? L" -> brightness up" : down ? L" -> brightness down" : L"");
+        ULONGLONG now = GetTickCount64();
+        if (BrightnessKeyPressed(up, &upDown, &lastUp, now)) {
+            PostMessageW(g_hwnd, WM_APP_BRIGHTNESS_KEY, (WPARAM)1, 0);
+        }
+        if (BrightnessKeyPressed(down, &downDown, &lastDown, now)) {
+            PostMessageW(g_hwnd, WM_APP_BRIGHTNESS_KEY, (WPARAM)-1, 0);
+        }
+    }
+    free(usages);
+    free(report);
+    CloseHandle(ov.hEvent);
+    return 0;
+}
+
+/* Opens every present HID collection on the Consumer page that has input
+ * reports and starts a reader for it. */
+static void OpenBrightnessKeyReaders(void) {
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    ULONG chars = 0;
+    if (CM_Get_Device_Interface_List_SizeW(&chars, &hidGuid, NULL, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS ||
+        chars == 0) {
+        DebugPrint(L"[INPUT] No HID device interfaces could be listed\n");
+        return;
+    }
+    wchar_t* list = (wchar_t*)calloc(chars, sizeof(wchar_t));
+    if (!list) return;
+    if (CM_Get_Device_Interface_ListW(&hidGuid, NULL, list, chars, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS) {
+        DebugPrint(L"[INPUT] HID device interfaces could not be listed\n");
+        free(list);
+        return;
+    }
+    int seen = 0, refused = 0;
+    for (const wchar_t* path = list; *path; path += wcslen(path) + 1) {
+        seen++;
+        if (g_keyReaderCount >= KEY_MAX_READERS) break;
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            /* Keyboards and mice are expected to refuse; anything else is
+             * worth a line, it may be the collection with the keys. */
+            DWORD error = GetLastError();
+            refused++;
+            if (error != ERROR_ACCESS_DENIED) {
+                DebugPrint(L"[INPUT] %s: cannot be opened (error %lu)\n", path, (unsigned long)error);
+            }
+            continue;
+        }
+        PHIDP_PREPARSED_DATA preparsed = NULL;
+        HIDP_CAPS caps;
+        if (!HidD_GetPreparsedData(h, &preparsed) || HidP_GetCaps(preparsed, &caps) != HIDP_STATUS_SUCCESS) {
+            if (preparsed) HidD_FreePreparsedData(preparsed);
+            CloseHandle(h);
+            continue;
+        }
+        if (caps.UsagePage != HID_USAGE_PAGE_CONSUMER || caps.InputReportByteLength == 0) {
+            HidD_FreePreparsedData(preparsed);
+            CloseHandle(h);
+            continue;
+        }
+        KeyReader* r = &g_keyReaders[g_keyReaderCount];
+        ZeroMemory(r, sizeof(*r));
+        r->device = h;
+        r->preparsed = preparsed;
+        r->reportLength = caps.InputReportByteLength;
+        if (!HidD_GetProductString(h, r->name, sizeof(r->name)) || !r->name[0]) {
+            wcsncpy_s(r->name, 128, path, _TRUNCATE);
+        }
+        r->name[127] = L'\0';
+        r->stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        r->thread = r->stop ? CreateThread(NULL, 0, KeyReaderThread, r, 0, NULL) : NULL;
+        if (!r->thread) {
+            DebugPrint(L"[INPUT] %s: reader could not be started (error %lu)\n", r->name, (unsigned long)GetLastError());
+            if (r->stop) CloseHandle(r->stop);
+            HidD_FreePreparsedData(preparsed);
+            CloseHandle(h);
+            continue;
+        }
+        DebugPrint(L"[INPUT] Listening on \"%s\" (consumer usage 0x%04X, input reports of %u bytes) %s\n",
+                   r->name, (unsigned)caps.Usage, (unsigned)caps.InputReportByteLength, path);
+        g_keyReaderCount++;
+    }
+    free(list);
+    DebugPrint(L"[INPUT] %d HID interface(s), %d refused to open, %d consumer control reader(s) running\n",
+               seen, refused, g_keyReaderCount);
+}
+
+static void CloseBrightnessKeyReaders(void) {
+    for (int i = 0; i < g_keyReaderCount; i++) {
+        KeyReader* r = &g_keyReaders[i];
+        SetEvent(r->stop);
+        CancelIoEx(r->device, NULL);
+        if (WaitForSingleObject(r->thread, 2000) != WAIT_OBJECT_0) {
+            DebugPrint(L"[WARNING] Brightness key reader for %s did not stop in time\n", r->name);
+        }
+        CloseHandle(r->thread);
+        CloseHandle(r->stop);
+        HidD_FreePreparsedData(r->preparsed);
+        CloseHandle(r->device);
+    }
+    if (g_keyReaderCount) DebugPrint(L"[INPUT] %d reader(s) closed\n", g_keyReaderCount);
+    g_keyReaderCount = 0;
+}
+
+/* Reopens the readers to match the option and the devices present now;
+ * called on enable/disable, after device changes, and after a resume. */
+static void UpdateBrightnessKeyReaders(void) {
+    CloseBrightnessKeyReaders();
+    if (g_config.brightnessKeys) OpenBrightnessKeyReaders();
+}
+
+static void ScheduleBrightnessKeyReaderRestart(void) {
+    if (g_hwnd && g_config.brightnessKeys) {
+        SetTimer(g_hwnd, ID_TIMER_KEY_DEVICES, KEY_DEVICES_DEBOUNCE_MS, NULL);
+    }
+}
+
+/* One press: every listed monitor moves by the tray step from its own
+ * value, as a manual change (so scheduled monitors pause), like the tray
+ * menu's Increase/Decrease. */
+static void ApplyBrightnessKey(int direction) {
+    if (!g_config.brightnessKeys) return;   /* posted just before the option went off */
+    if (g_remoteSession) {
+        DebugPrint(L"[INPUT] Brightness key ignored during the remote session\n");
+        return;
+    }
+    int changed = 0;
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        if (m->hidden || MonitorMode(m) == MODE_PROBING) continue;
+        int before = m->value;
+        SetMonitorValue(m, m->value + direction * TRAY_STEP_PERCENT);
+        NoteManualChange(m);
+        if (m->value != before) changed++;
+    }
+    DebugPrint(L"[INPUT] Brightness key %s: %d monitor(s) changed\n", direction > 0 ? L"up" : L"down", changed);
+    if (changed) PushMonitorsToDialog();
+}
+
 /* ── Remote Desktop sessions ─────────────────────────────────────────────── */
 
 /* Microsoft's documented test: SM_REMOTESESSION, and for the sessions that
@@ -4526,6 +4788,7 @@ static void webview_push_init_config(void) {
         int written = swprintf_s(script, cap,
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
             L"\"autoCheckForUpdates\":%s,\"pauseInRemoteSession\":%s,\"remoteSession\":%s,"
+            L"\"brightnessKeys\":%s,"
             L"\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
             L"\"trayTarget\":\"%s\",\"trayPresets\":\"%s\","
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
@@ -4538,6 +4801,7 @@ static void webview_push_init_config(void) {
             g_config.autoCheckForUpdates ? L"true" : L"false",
             g_config.pauseInRemoteSession ? L"true" : L"false",
             g_remoteSession ? L"true" : L"false",
+            g_config.brightnessKeys ? L"true" : L"false",
             updateCheckPending ? L"true" : L"false",
             g_updateNoticeTask ? L"true" : L"false",
             eTrayTarget, presetText,
@@ -5035,6 +5299,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
         g_config.autoCheckForUpdates = json_get_bool(msg, "autoCheckForUpdates", TRUE);
         g_config.pauseInRemoteSession = json_get_bool(msg, "pauseInRemoteSession", TRUE);
+        BOOL brightnessKeysBefore = g_config.brightnessKeys;
+        g_config.brightnessKeys = json_get_bool(msg, "brightnessKeys", FALSE);
         char trayTarget[256] = {0};
         json_get_string(msg, "trayTarget", trayTarget, sizeof(trayTarget));
         if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, trayTarget, -1, g_config.trayTarget,
@@ -5056,11 +5322,12 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
         FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 256);
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, pauseInRemoteSession=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, pauseInRemoteSession=%d, brightnessKeys=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
                    g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.pauseInRemoteSession,
-                   g_config.trayTarget, presetText);
+                   g_config.brightnessKeys, g_config.trayTarget, presetText);
         /* Turning the pause off from inside a remote session resumes at once. */
         UpdateRemoteSessionState();
+        if (brightnessKeysBefore != g_config.brightnessKeys) UpdateBrightnessKeyReaders();
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
@@ -5558,6 +5825,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             HandleDdcSetResult((int)wParam, lParam != 0);
             return 0;
 
+        case WM_APP_BRIGHTNESS_KEY:
+            ApplyBrightnessKey((int)(INT_PTR)wParam);
+            return 0;
+
         case WM_TIMER:
             switch (wParam) {
                 case ID_TIMER_REFRESH_MONITORS:
@@ -5587,6 +5858,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     KillTimer(hwnd, ID_TIMER_TOOLTIP);
                     UpdateTrayTooltip();
                     return 0;
+                case ID_TIMER_KEY_DEVICES:
+                    KillTimer(hwnd, ID_TIMER_KEY_DEVICES);
+                    UpdateBrightnessKeyReaders();
+                    return 0;
             }
             break;
 
@@ -5612,6 +5887,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
         case WM_DEVICECHANGE:
             if (wParam == DBT_DEVNODES_CHANGED) {
                 ScheduleMonitorRefresh(REFRESH_MONITORS_DEBOUNCE_MS);
+                ScheduleBrightnessKeyReaderRestart();   /* a keyboard may have come or gone */
             }
             break;
 
@@ -5619,6 +5895,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
                 DebugPrint(L"[INFO] Resumed from sleep; monitors will be re-applied\n");
                 ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
+                ScheduleBrightnessKeyReaderRestart();
             } else if (wParam == PBT_POWERSETTINGCHANGE) {
                 /* Display power state: 0 off, 1 on, 2 dimmed. Monitors that
                  * were switched off need a moment before DDC/CI answers, and
@@ -5689,8 +5966,8 @@ static void LogEnvironment(void) {
                (unsigned long)sessionId, metric, (unsigned long)glassId, glassKnown ? L"" : L" (unknown)",
                remote ? L"remote" : L"local", g_config.pauseInRemoteSession);
     const Schedule* sc = &g_config.schedule;
-    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
-               g_config.allowBelowMinimum, g_config.debugLogEnabled, sc->enabled, sc->hasLocation,
+    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
+               g_config.allowBelowMinimum, g_config.debugLogEnabled, g_config.brightnessKeys, sc->enabled, sc->hasLocation,
                sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
                sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset, sc->duskEndOffset,
                sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60);
@@ -5809,6 +6086,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RefreshMonitors();
     SetTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST, OVERLAY_TOPMOST_INTERVAL_MS, NULL);
     UpdateScheduleTimer();
+    UpdateBrightnessKeyReaders();
 
     /* A successful replacement starts exactly once with --finish-update.
      * Reopen settings and show the confirmation only when that update's
@@ -5840,6 +6118,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_SCHEDULE);
     KillTimer(g_hwnd, ID_TIMER_DDC_RETRY);
     KillTimer(g_hwnd, ID_TIMER_TOOLTIP);
+    KillTimer(g_hwnd, ID_TIMER_KEY_DEVICES);
+    CloseBrightnessKeyReaders();
     PersistDirtyMonitors();
     DestroyAllOverlays();
     StopDdcWorker();

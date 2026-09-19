@@ -126,6 +126,24 @@ scheduled. The night level can only go below 0% when **Allow dimming below
 the hardware minimum** is enabled, and each monitor clamps the scheduled
 value to its own range.
 
+## Keyboard Brightness Keys
+
+Many keyboards have Brightness Up and Brightness Down keys. Windows reacts
+to them by showing its brightness flyout, but only a laptop's built-in
+panel actually changes; external monitors are ignored. With **Use the
+keyboard's brightness keys** enabled, each press moves every listed monitor
+by 10% from its own value, whatever window is focused, and counts as a
+manual change for the schedule. Holding a key repeats on keyboards that
+send repeated reports. Windows keeps showing its flyout.
+
+The keys are not ordinary key codes but usages on the keyboard's HID
+consumer-control collection, so Not Too Bright opens that collection
+directly and reads its reports; a keyboard whose brightness keys are
+handled by the vendor's own software rather than sent as standard HID
+usages cannot be seen this way. With debug logging on, the `[INPUT]` lines
+show which collections were opened and every report they send, which is
+the first thing to check when a key does nothing.
+
 ## Remote Desktop
 
 When the session is viewed through Remote Desktop, Windows replaces the
@@ -202,6 +220,7 @@ brightness section applies immediately; the settings below it are saved with
 | Cycle reset time | Time of day at which a schedule paused by a manual change takes over again. 04:00 by default. |
 | Tray menu brightness control | Chooses what the tray menu's **Increase brightness** and **Decrease brightness** items act on: **None** (the items are not shown; the default), **All monitors**, or one specific monitor. Each click moves the target by 10% from its current value; that counts as a manual change for scheduled monitors. Saved with **Save**. |
 | Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed, with a bullet on the level the target is currently at. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
+| Use the keyboard's brightness keys | The keyboard's Brightness Up/Down keys step every monitor by 10%; see [Keyboard Brightness Keys](#keyboard-brightness-keys). Saved with **Save**. Disabled by default. |
 | Pause while connected through Remote Desktop | Leaves the monitors alone while the session is viewed remotely; see [Remote Desktop](#remote-desktop). Saved with **Save**. Enabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Update (button) | Checks the repository for a newer build right now and shows the result; see [Updates](#updates). |
@@ -216,7 +235,7 @@ next to the executable, so it can run from any folder.
 
 | Location | Contents |
 |----------|----------|
-| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, the Remote Desktop pause, update checking and the ignored update version, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, the brightness keys option, the Remote Desktop pause, update checking and the ignored update version, debug logging |
 | `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, original brightness |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |

@@ -612,6 +612,70 @@ int main(void) {
 }
 ''')
 
+    def test_brightness_keys_step_every_monitor_once_per_press(self):
+        run_c(r'''
+#include <assert.h>
+#include <wchar.h>
+#define TRUE 1
+#define FALSE 0
+#define KEY_REPEAT_MIN_MS 250
+#define TRAY_STEP_PERCENT 10
+#define MODE_PROBING 1
+#define MODE_HARDWARE 2
+#define DebugPrint(...) ((void)0)
+typedef int BOOL;
+typedef unsigned long long ULONGLONG;
+typedef struct { int hidden, value, mode; } Monitor;
+struct { BOOL brightnessKeys; } g_config = { TRUE };
+BOOL g_remoteSession;
+Monitor g_monitors[3];
+int g_monitorCount = 3, manual, pushes;
+int MonitorMode(const Monitor* m) { return m->mode; }
+void SetMonitorValue(Monitor* m, int value) { m->value = value < 0 ? 0 : value > 100 ? 100 : value; }
+void NoteManualChange(Monitor* m) { (void)m; manual++; }
+void PushMonitorsToDialog(void) { pushes++; }
+''' + function("BrightnessKeyPressed") + function("ApplyBrightnessKey") + r'''
+int main(void) {
+    /* Press and release: one step. Held with repeating reports: a step
+     * every KEY_REPEAT_MIN_MS. Never released: each new report counts once
+     * the interval has passed, so a keyboard without release reports works. */
+    BOOL down = FALSE;
+    ULONGLONG last = 0;
+    assert(BrightnessKeyPressed(TRUE, &down, &last, 1000) && last == 1000);
+    assert(!BrightnessKeyPressed(TRUE, &down, &last, 1100));
+    assert(!BrightnessKeyPressed(FALSE, &down, &last, 1150) && !down);
+    assert(BrightnessKeyPressed(TRUE, &down, &last, 1160));
+    assert(!BrightnessKeyPressed(TRUE, &down, &last, 1300));
+    assert(BrightnessKeyPressed(TRUE, &down, &last, 1410) && last == 1410);
+    assert(!BrightnessKeyPressed(FALSE, &down, &last, 1420));
+    assert(!BrightnessKeyPressed(FALSE, &down, &last, 9999));
+
+    g_monitors[0] = (Monitor){0, 50, MODE_HARDWARE};
+    g_monitors[1] = (Monitor){0, 95, MODE_HARDWARE};
+    g_monitors[2] = (Monitor){1, 50, MODE_HARDWARE};   /* hidden */
+    ApplyBrightnessKey(+1);
+    assert(g_monitors[0].value == 60 && g_monitors[1].value == 100 && g_monitors[2].value == 50);
+    assert(manual == 2 && pushes == 1);
+    /* Clamped at the top: nothing changes, nothing pushed, still a manual change. */
+    g_monitors[0].value = 100;
+    ApplyBrightnessKey(+1);
+    assert(g_monitors[0].value == 100 && manual == 4 && pushes == 1);
+    ApplyBrightnessKey(-1);
+    assert(g_monitors[0].value == 90 && g_monitors[1].value == 90 && pushes == 2);
+    /* Probing monitors are skipped; remote sessions and a disabled option ignore the key. */
+    g_monitors[1].mode = MODE_PROBING;
+    ApplyBrightnessKey(-1);
+    assert(g_monitors[0].value == 80 && g_monitors[1].value == 90);
+    g_remoteSession = TRUE;
+    ApplyBrightnessKey(-1);
+    assert(g_monitors[0].value == 80);
+    g_remoteSession = FALSE;
+    g_config.brightnessKeys = FALSE;
+    ApplyBrightnessKey(-1);
+    assert(g_monitors[0].value == 80 && pushes == 3);
+}
+''')
+
     def test_c_curve_matches_preview_across_dates_and_ranges(self):
         cases = json.loads(subprocess.check_output(["node", "-e", r'''
 const { loadTs } = require('./tests/load_ts.cjs');

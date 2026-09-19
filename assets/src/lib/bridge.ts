@@ -54,6 +54,8 @@ export interface ConfigData {
   // Desktop (the default); remoteSession says whether that is the case now.
   pauseInRemoteSession: boolean;
   remoteSession: boolean;
+  // The keyboard's Brightness Up/Down keys step every monitor by 10%.
+  brightnessKeys: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
   // Tray menu Increase/Decrease target: "" (items hidden), "*" (all
@@ -279,6 +281,7 @@ export function saveSettings(
   debugLog: boolean,
   autoCheckForUpdates: boolean,
   pauseInRemoteSession: boolean,
+  brightnessKeys: boolean,
   trayTarget: string,
   trayPresets: number[],
   schedule: ScheduleSettings,
@@ -289,6 +292,7 @@ export function saveSettings(
     debugLog,
     autoCheckForUpdates,
     pauseInRemoteSession,
+    brightnessKeys,
     trayTarget,
     trayPresets: trayPresets.join(","),
     scheduleEnabled: schedule.enabled,
