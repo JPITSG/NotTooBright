@@ -105,7 +105,7 @@ export interface ScheduleSettings {
   duskStartOffset: number;
   duskEndOffset: number;
   cycleResetMinutes: number;
-  scheduledUids: number[];
+  scheduledKeys: string[];
 }
 
 export interface InitData {
@@ -258,7 +258,8 @@ export function saveSettings(
   autoCheckForUpdates: boolean,
   trayTarget: string,
   trayPresets: number[],
-  schedule: ScheduleSettings
+  schedule: ScheduleSettings,
+  monitors: MonitorData[]
 ) {
   post({
     action: "saveSettings",
@@ -276,7 +277,8 @@ export function saveSettings(
     duskStartOffset: schedule.duskStartOffset,
     duskEndOffset: schedule.duskEndOffset,
     cycleResetMinutes: schedule.cycleResetMinutes,
-    scheduledUids: schedule.scheduledUids.join(","),
+    scheduledKeys: monitors.filter((m) => !m.hidden && schedule.scheduledKeys.includes(m.key)).map((m) => m.key).join(","),
+    scheduleMonitorKeys: monitors.filter((m) => !m.hidden).map((m) => m.key).join(","),
   });
 }
 

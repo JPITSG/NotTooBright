@@ -1,3 +1,4 @@
+import { reconcileScheduleSelection } from "./lib/scheduleSelection";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   type ConfigData,
@@ -274,7 +275,7 @@ function initialSchedule(config: ConfigData, monitors: MonitorData[]): ScheduleS
     cycleResetMinutes: s?.cycleResetMinutes ?? 240,
     // Hidden monitors are not listed, so only visible ones count here;
     // a hidden one keeps its own flag until the next rescan.
-    scheduledUids: monitors.filter((m) => m.scheduled && !m.hidden).map((m) => m.uid),
+    scheduledKeys: monitors.filter((m) => m.scheduled && !m.hidden).map((m) => m.key),
   };
 }
 
@@ -399,15 +400,20 @@ export default function ConfigView({
     ignoreUpdateVersion(updateAlert.remoteVersion);
     setUpdateAlert(null);
   }
-  const [schedule, setSchedule] = useState<ScheduleSettings>(() => {
-    const initial = initialSchedule(config, monitors);
-    // An enabled schedule with nothing selected controls nothing; start
-    // from every visible monitor so a saved dialog does something.
-    if (initial.enabled && initial.scheduledUids.length === 0) {
-      initial.scheduledUids = monitors.filter((m) => !m.hidden).map((m) => m.uid);
-    }
-    return initial;
-  });
+  const [schedule, setSchedule] = useState<ScheduleSettings>(() => initialSchedule(config, monitors));
+  const seenScheduleKeys = useRef(new Set(monitors.filter((m) => !m.hidden).map((m) => m.key)));
+  useEffect(() => {
+    const seen = seenScheduleKeys.current;
+    const visible = monitors.filter((m) => !m.hidden);
+    if (!visible.some((m) => !seen.has(m.key))) return;
+    // Capture the previous set: state updaters may run after this effect.
+    const previous = new Set(seen);
+    setSchedule((current) => ({
+      ...current,
+      scheduledKeys: reconcileScheduleSelection(current.scheduledKeys, previous, visible),
+    }));
+    for (const monitor of visible) seen.add(monitor.key);
+  }, [monitors]);
   const [scheduleError, setScheduleError] = useState("");
   const throttledSend = useThrottledSender();
   // The schedule section is tall; on a wide enough screen the dialog shows
@@ -491,7 +497,8 @@ export default function ConfigView({
       autoCheckForUpdates,
       trayTarget,
       trayPresetsParsed.values,
-      schedule
+      schedule,
+      monitors
     );
   }
   const scheduleSection = (

@@ -268,17 +268,17 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
 
   function toggleEnabled(enabled: boolean) {
     const patch: Partial<ScheduleSettings> = { enabled };
-    if (enabled && settings.scheduledUids.length === 0) {
-      patch.scheduledUids = monitors.map((m) => m.uid);
+    if (enabled && !monitors.some((m) => settings.scheduledKeys.includes(m.key))) {
+      patch.scheduledKeys = monitors.map((m) => m.key);
     }
     update(patch);
   }
 
-  function toggleMonitor(uid: number, on: boolean) {
-    const set = new Set(settings.scheduledUids);
-    if (on) set.add(uid);
-    else set.delete(uid);
-    update({ scheduledUids: Array.from(set) });
+  function toggleMonitor(key: string, on: boolean) {
+    const set = new Set(settings.scheduledKeys);
+    if (on) set.add(key);
+    else set.delete(key);
+    update({ scheduledKeys: Array.from(set) });
   }
 
   const resetTime = `${String(Math.floor(settings.cycleResetMinutes / 60)).padStart(2, "0")}:${String(settings.cycleResetMinutes % 60).padStart(2, "0")}`;
@@ -415,7 +415,7 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
 
           <div className="space-y-1">
             <Label className="text-xs">Apply to</Label>
-            {monitors.length > 0 && settings.scheduledUids.length === 0 && (
+            {monitors.length > 0 && !monitors.some((m) => settings.scheduledKeys.includes(m.key)) && (
               <p className="text-[11px] leading-snug text-amber-700">
                 No monitor is selected, so the schedule will not change anything.
               </p>
@@ -430,8 +430,8 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
                     <div key={m.uid} className="flex items-center gap-2">
                       <Checkbox
                         id={id}
-                        checked={settings.scheduledUids.includes(m.uid)}
-                        onChange={(e) => toggleMonitor(m.uid, e.target.checked)}
+                        checked={settings.scheduledKeys.includes(m.key)}
+                        onChange={(e) => toggleMonitor(m.key, e.target.checked)}
                       />
                       <Label htmlFor={id} className="cursor-pointer text-[11px] font-normal">
                         {m.name}

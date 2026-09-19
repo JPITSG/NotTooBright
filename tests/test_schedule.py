@@ -105,5 +105,24 @@ int main(void) {
 ''')
 
 
+    def test_monitor_key_lists_match_whole_identities(self):
+        run_c(r'''
+#include <assert.h>
+#include <string.h>
+#include <wchar.h>
+typedef int BOOL;
+#define TRUE 1
+#define FALSE 0
+''' + function("MonitorKeyInList") + r'''
+int main(void) {
+    assert(MonitorKeyInList(L"ABC_123", "XYZ,ABC_123,END"));
+    assert(MonitorKeyInList(L"END", "XYZ,ABC_123,END"));
+    assert(!MonitorKeyInList(L"ABC", "XYZ,ABC_123,END"));
+    assert(!MonitorKeyInList(L"ABC_123", ""));
+    assert(!MonitorKeyInList(L"ABC_123", "ABC_1234"));
+}
+''')
+
+
 if __name__ == "__main__":
     unittest.main()

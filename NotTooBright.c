@@ -4553,14 +4553,35 @@ static int ClampInt(int value, int min, int max) {
     return value < min ? min : (value > max ? max : value);
 }
 
+/* Identity keys contain only ASCII letters, digits, underscores, hyphens,
+ * ampersands and dots (SanitizeKeyChars), so commas delimit them safely. */
+static BOOL MonitorKeyInList(const wchar_t* key, const char* list) {
+    size_t length = wcslen(key);
+    while (*list) {
+        const char* end = strchr(list, ',');
+        size_t count = end ? (size_t)(end - list) : strlen(list);
+        if (count == length) {
+            size_t i = 0;
+            while (i < count && key[i] == (wchar_t)(unsigned char)list[i]) i++;
+            if (i == count) return TRUE;
+        }
+        if (!end) break;
+        list = end + 1;
+    }
+    return FALSE;
+}
+
 /* Reads the schedule part of a saveSettings message. Saving the schedule
  * counts as a deliberate change, so any paused monitors resume. */
 static void SaveScheduleFromMessage(const char* msg) {
     Schedule* sc = &g_config.schedule;
-    char latitude[64] = {0}, longitude[64] = {0}, scheduledUids[512] = {0};
+    char latitude[64] = {0}, longitude[64] = {0};
+    char scheduledKeys[MAX_MONITORS * 128] = {0};
+    char shownKeys[MAX_MONITORS * 128] = {0};
     json_get_string(msg, "latitude", latitude, sizeof(latitude));
     json_get_string(msg, "longitude", longitude, sizeof(longitude));
-    json_get_string(msg, "scheduledUids", scheduledUids, sizeof(scheduledUids));
+    json_get_string(msg, "scheduledKeys", scheduledKeys, sizeof(scheduledKeys));
+    json_get_string(msg, "scheduleMonitorKeys", shownKeys, sizeof(shownKeys));
 
     char* end = NULL;
     double lat = strtod(latitude, &end);
@@ -4587,17 +4608,10 @@ static void SaveScheduleFromMessage(const char* msg) {
         Monitor* m = &g_monitors[i];
         /* Hidden monitors are not in the dialog, so the list says nothing
          * about them; their flag waits untouched for the next rescan. */
-        if (m->hidden) continue;
-        BOOL scheduled = FALSE;
-        const char* p = scheduledUids;
-        while (*p) {
-            char* next = NULL;
-            long uid = strtol(p, &next, 10);
-            if (next == p) break;
-            if ((int)uid == m->uid) scheduled = TRUE;
-            p = next;
-            while (*p == ',' || *p == ' ') p++;
-        }
+        if (m->hidden || !MonitorKeyInList(m->key, shownKeys)) continue;
+        /* Stable keys survive disconnect/reconnect. A display arriving
+         * after the dialog sent Save keeps its existing selection. */
+        BOOL scheduled = MonitorKeyInList(m->key, scheduledKeys);
         if (m->scheduled != scheduled || m->pausedUntil) {
             m->scheduled = scheduled;
             m->pausedUntil = 0;
