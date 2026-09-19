@@ -122,6 +122,7 @@
 #define ID_TRAY_MENU_EXIT 2
 #define ID_TRAY_MENU_BRIGHTER 3
 #define ID_TRAY_MENU_DIMMER 4
+#define ID_TRAY_MENU_RESUME_SCHEDULE 5
 /* Step applied by the tray menu's Increase/Decrease brightness items. */
 #define TRAY_STEP_PERCENT 10
 /* Which monitor the tray menu items control: "" for none (items hidden),
@@ -5342,11 +5343,15 @@ static void ShowContextMenu(HWND hwnd) {
         AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_DIMMER, dimmer);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
+    /* While a manual change has paused the schedule, it can be resumed
+     * from here as well as from the dialog. No bold default item: Configure
+     * is deliberately shown like the others. */
+    if (IsSchedulePaused(NowFileTime())) {
+        AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_RESUME_SCHEDULE, L"Resume schedule");
+    }
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CONFIGURE, L"Configure");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_EXIT, L"Exit");
-    /* Bold the item that a tray double-click also triggers. */
-    SetMenuDefaultItem(hMenu, ID_TRAY_MENU_CONFIGURE, FALSE);
 
     /* Documented requirement for tray menus (KB135788): the window must be
      * foreground for the menu to dismiss when the user clicks outside it,
@@ -5390,6 +5395,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     return 0;
                 case ID_TRAY_MENU_DIMMER:
                     ApplyTrayMenuValue(-TRAY_STEP_PERCENT, TRUE);
+                    return 0;
+                case ID_TRAY_MENU_RESUME_SCHEDULE:
+                    DebugPrint(L"[INFO] Resume schedule selected from the tray menu\n");
+                    ResumeSchedule();
                     return 0;
                 case ID_TRAY_MENU_EXIT:
                     DebugPrint(L"[INFO] Exit selected from the tray menu\n");

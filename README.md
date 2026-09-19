@@ -37,7 +37,8 @@ after a manual change) and, while the schedule is enabled, a **State** line
 *Night → Daytime*). Right-click it for **Configure** and **Exit**, plus **Increase
 brightness** / **Decrease brightness** and any preset levels you have listed
 once you have chosen which monitor the menu controls (see *Tray menu
-brightness control*). Requires Windows 10 or 11
+brightness control*), and **Resume schedule** while a manual change has
+paused the schedule. Requires Windows 10 or 11
 (64-bit) and the [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
 which is already installed on virtually every Windows 10/11 machine.
 
@@ -117,8 +118,9 @@ scheduled monitor's brightness by hand (its slider, **All monitors**, or
 the tray menu), the schedule pauses for every monitor it controls until
 the **cycle reset time** you set (04:00 by default), so an adjustment you
 make in the evening is not undone a minute later; each scheduled card
-shows *Auto paused* with a **Resume now** link, and resuming from any card
-(or saving the schedule again) resumes the schedule for all of them.
+shows *Auto paused* with a **Resume now** link, and resuming from any card,
+from the tray menu's **Resume schedule** item, or by saving the schedule
+again resumes the schedule for all of them.
 Hidden monitors are never
 scheduled. The night level can only go below 0% when **Allow dimming below
 the hardware minimum** is enabled, and each monitor clamps the scheduled

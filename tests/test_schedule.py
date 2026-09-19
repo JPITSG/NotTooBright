@@ -400,6 +400,83 @@ int main(void) {
 }
 ''')
 
+    def test_tray_menu_offers_resume_above_configure_only_while_paused(self):
+        run_c(r'''
+#include <assert.h>
+#include <limits.h>
+#include <stddef.h>
+#include <wchar.h>
+#define TRUE 1
+#define FALSE 0
+#define MF_STRING 0
+#define MF_SEPARATOR 0x800
+#define MF_ENABLED 0
+#define MF_GRAYED 1
+#define MF_BYCOMMAND 0
+#define TPM_BOTTOMALIGN 0
+#define TPM_LEFTALIGN 0
+#define TPM_RIGHTBUTTON 0
+#define ID_TRAY_MENU_CONFIGURE 1
+#define ID_TRAY_MENU_EXIT 2
+#define ID_TRAY_MENU_BRIGHTER 3
+#define ID_TRAY_MENU_DIMMER 4
+#define ID_TRAY_MENU_RESUME_SCHEDULE 5
+#define ID_TRAY_MENU_PRESET_FIRST 1000
+#define TRAY_MAX_PRESETS 8
+#define PostMessageW(h, m, w, l) ((void)0)
+#define DestroyMenu(m) ((void)0)
+#define swprintf_s(...) ((void)0)
+typedef int BOOL;
+typedef unsigned UINT;
+typedef unsigned long long ULONGLONG;
+typedef void *HWND, *HMENU;
+typedef struct { long x, y; } POINT;
+typedef struct { wchar_t name[128]; } Monitor;
+struct { wchar_t trayTarget[128]; int trayPresets[TRAY_MAX_PRESETS]; int trayPresetCount; } g_config;
+int paused, items, defaults;
+UINT ids[16];
+void GetCursorPos(POINT* pt) { pt->x = pt->y = 0; }
+HMENU CreatePopupMenu(void) { return (HMENU)1; }
+BOOL AppendMenuW(HMENU menu, UINT flags, UINT id, const wchar_t* text) {
+    (void)menu;
+    if (flags & MF_SEPARATOR) { ids[items++] = 0; return TRUE; }
+    if (id == ID_TRAY_MENU_RESUME_SCHEDULE) assert(wcscmp(text, L"Resume schedule") == 0);
+    if (id == ID_TRAY_MENU_CONFIGURE) assert(wcscmp(text, L"Configure") == 0);
+    ids[items++] = id;
+    return TRUE;
+}
+BOOL CheckMenuRadioItem(HMENU m, UINT a, UINT b, UINT c, UINT d) { (void)m; (void)a; (void)b; (void)c; (void)d; return TRUE; }
+BOOL SetMenuDefaultItem(HMENU m, UINT id, UINT byPos) { (void)m; (void)id; (void)byPos; defaults++; return TRUE; }
+BOOL SetForegroundWindow(HWND h) { (void)h; return TRUE; }
+BOOL TrackPopupMenu(HMENU m, UINT f, int x, int y, int r, HWND h, const void* rc) {
+    (void)m; (void)f; (void)x; (void)y; (void)r; (void)h; (void)rc; return TRUE;
+}
+Monitor* TrayTargetMonitor(BOOL* allVisible) { *allVisible = TRUE; return NULL; }
+int VisibleMonitorCount(void) { return 1; }
+int TrayTargetCurrentValue(const Monitor* target, BOOL allVisible) { (void)target; (void)allVisible; return 0; }
+BOOL IsSchedulePaused(ULONGLONG now) { (void)now; return paused; }
+ULONGLONG NowFileTime(void) { return 0; }
+void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
+''' + function("ShowContextMenu") + r'''
+int main(void) {
+    ShowContextMenu((HWND)1);
+    assert(items == 3 && ids[0] == ID_TRAY_MENU_CONFIGURE && ids[1] == 0 && ids[2] == ID_TRAY_MENU_EXIT);
+    /* Configure is no longer the bold default item. */
+    assert(defaults == 0);
+    paused = 1;
+    items = 0;
+    ShowContextMenu((HWND)1);
+    assert(items == 4 && ids[0] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[1] == ID_TRAY_MENU_CONFIGURE);
+    assert(ids[2] == 0 && ids[3] == ID_TRAY_MENU_EXIT && defaults == 0);
+    /* With brightness items above, Resume stays in Configure's group. */
+    wcscpy(g_config.trayTarget, L"*");
+    items = 0;
+    ShowContextMenu((HWND)1);
+    assert(items == 7 && ids[0] == ID_TRAY_MENU_BRIGHTER && ids[1] == ID_TRAY_MENU_DIMMER && ids[2] == 0);
+    assert(ids[3] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[4] == ID_TRAY_MENU_CONFIGURE && ids[5] == 0 && ids[6] == ID_TRAY_MENU_EXIT);
+}
+''')
+
     def test_c_curve_matches_preview_across_dates_and_ranges(self):
         cases = json.loads(subprocess.check_output(["node", "-e", r'''
 const { loadTs } = require('./tests/load_ts.cjs');
