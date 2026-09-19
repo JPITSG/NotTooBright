@@ -468,7 +468,9 @@ BOOL AppendMenuW(HMENU menu, UINT flags, UINT id, const wchar_t* text) {
     ids[items++] = id;
     return TRUE;
 }
-BOOL CheckMenuRadioItem(HMENU m, UINT a, UINT b, UINT c, UINT d) { (void)m; (void)a; (void)b; (void)c; (void)d; return TRUE; }
+BOOL CheckMenuRadioItem(HMENU m, UINT a, UINT b, UINT c, UINT d) {
+    (void)m; (void)a; (void)b; (void)c; (void)d; assert(!"no bullet on the presets"); return TRUE;
+}
 BOOL SetMenuDefaultItem(HMENU m, UINT id, UINT byPos) { (void)m; (void)id; (void)byPos; defaults++; return TRUE; }
 BOOL SetForegroundWindow(HWND h) { (void)h; return TRUE; }
 BOOL TrackPopupMenu(HMENU m, UINT f, int x, int y, int r, HWND h, const void* rc) {
@@ -476,7 +478,6 @@ BOOL TrackPopupMenu(HMENU m, UINT f, int x, int y, int r, HWND h, const void* rc
 }
 Monitor* TrayTargetMonitor(BOOL* allVisible) { *allVisible = TRUE; return NULL; }
 int VisibleMonitorCount(void) { return 1; }
-int TrayTargetCurrentValue(const Monitor* target, BOOL allVisible) { (void)target; (void)allVisible; return 0; }
 BOOL IsSchedulePaused(ULONGLONG now) { (void)now; return paused; }
 ULONGLONG NowFileTime(void) { return 0; }
 void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
@@ -491,18 +492,23 @@ int main(void) {
     ShowContextMenu((HWND)1);
     assert(items == 4 && ids[0] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[1] == ID_TRAY_MENU_CONFIGURE);
     assert(ids[2] == 0 && ids[3] == ID_TRAY_MENU_EXIT && defaults == 0);
-    /* With brightness items above, Resume stays in Configure's group. */
+    /* With brightness items above, Resume stays in Configure's group; the
+     * presets are plain items between the two steps, without a bullet. */
     wcscpy(g_config.trayTarget, L"*");
+    g_config.trayPresets[0] = 100;
+    g_config.trayPresets[1] = 50;
+    g_config.trayPresetCount = 2;
     items = 0;
     ShowContextMenu((HWND)1);
-    assert(items == 7 && ids[0] == ID_TRAY_MENU_BRIGHTER && ids[1] == ID_TRAY_MENU_DIMMER && ids[2] == 0);
-    assert(ids[3] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[4] == ID_TRAY_MENU_CONFIGURE && ids[5] == 0 && ids[6] == ID_TRAY_MENU_EXIT);
-    assert(!greyed[0] && !greyed[1]);
+    assert(items == 9 && ids[0] == ID_TRAY_MENU_BRIGHTER && ids[1] == ID_TRAY_MENU_PRESET_FIRST);
+    assert(ids[2] == ID_TRAY_MENU_PRESET_FIRST + 1 && ids[3] == ID_TRAY_MENU_DIMMER && ids[4] == 0);
+    assert(ids[5] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[6] == ID_TRAY_MENU_CONFIGURE && ids[7] == 0 && ids[8] == ID_TRAY_MENU_EXIT);
+    assert(!greyed[0] && !greyed[1] && !greyed[3]);
     /* Through Remote Desktop the brightness items stay but are greyed out. */
     g_remoteSession = 1;
     items = 0;
     ShowContextMenu((HWND)1);
-    assert(items == 7 && greyed[0] && greyed[1] && !greyed[3] && !greyed[4]);
+    assert(items == 9 && greyed[0] && greyed[1] && greyed[2] && greyed[3] && !greyed[5] && !greyed[6]);
 }
 ''')
 

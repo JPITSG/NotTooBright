@@ -5660,21 +5660,6 @@ static void ApplyTrayMenuValue(int value, BOOL relative) {
     if (changed) PushMonitorsToDialog();
 }
 
-/* The level the tray target is at, for marking the matching preset; INT_MIN
- * while it is unknown or the visible monitors disagree. */
-static int TrayTargetCurrentValue(const Monitor* target, BOOL allVisible) {
-    int current = INT_MIN;
-    for (int i = 0; i < g_monitorCount; i++) {
-        const Monitor* m = &g_monitors[i];
-        if (m->hidden) continue;
-        if (!allVisible && m != target) continue;
-        if (!m->hasValue || MonitorMode(m) == MODE_PROBING) return INT_MIN;
-        if (current != INT_MIN && current != m->value) return INT_MIN;
-        current = m->value;
-    }
-    return current;
-}
-
 static void RemoveTrayIcon(void) {
     if (!g_nid.hWnd) return;
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -5715,20 +5700,12 @@ static void ShowContextMenu(HWND hwnd) {
             swprintf_s(dimmer, 96, L"Decrease brightness (%s)", target ? target->name : L"unavailable");
         }
         AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_BRIGHTER, brighter);
-        /* Preset levels sit between the two steps; the one the target is
-         * currently at (every target, for all monitors) gets a bullet. */
-        int current = usable ? TrayTargetCurrentValue(target, allVisible) : INT_MIN;
+        /* Preset levels sit between the two steps, as plain items: no
+         * bullet on the current level (removed on request). */
         for (int i = 0; i < g_config.trayPresetCount; i++) {
             wchar_t label[16];
             swprintf_s(label, 16, L"%d%%", g_config.trayPresets[i]);
             AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_PRESET_FIRST + i, label);
-        }
-        for (int i = 0; i < g_config.trayPresetCount; i++) {
-            if (g_config.trayPresets[i] != current) continue;
-            CheckMenuRadioItem(hMenu, ID_TRAY_MENU_PRESET_FIRST,
-                               ID_TRAY_MENU_PRESET_FIRST + g_config.trayPresetCount - 1,
-                               ID_TRAY_MENU_PRESET_FIRST + i, MF_BYCOMMAND);
-            break;
         }
         AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_DIMMER, dimmer);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
