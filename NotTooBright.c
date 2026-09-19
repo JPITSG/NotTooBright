@@ -201,6 +201,8 @@
 #define SCHEDULE_DEFAULT_DUSK_END 30
 #define SCHEDULE_MAX_OFFSET (6 * 60)
 #define SCHEDULE_MIN_GAP 5
+#define SCHEDULE_DAY_RADIUS 2
+#define SCHEDULE_DAY_COUNT (2 * SCHEDULE_DAY_RADIUS + 1)
 #define SCHEDULE_DEFAULT_RESET_MINUTES (4 * 60)
 
 /* ── WebView2 COM interface definitions (minimal vtable approach) ─────── */
@@ -2565,6 +2567,31 @@ static void ComputeSolarDay(double latitude, double longitude, const SYSTEMTIME*
     }
 }
 
+/* Include neighbouring calendar dates so a transition keeps the same
+ * sunrise/sunset anchors across midnight. Two days either side also cover
+ * locations whose longitude and the computer's time zone straddle the date line. */
+static BOOL ComputeSolarDays(double latitude, double longitude, const SYSTEMTIME* date,
+                             SolarDay days[SCHEDULE_DAY_COUNT]) {
+    SYSTEMTIME midnight = *date;
+    midnight.wHour = midnight.wMinute = midnight.wSecond = midnight.wMilliseconds = 0;
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&midnight, &ft)) return FALSE;
+    ULARGE_INTEGER base;
+    base.LowPart = ft.dwLowDateTime;
+    base.HighPart = ft.dwHighDateTime;
+    for (int i = 0; i < SCHEDULE_DAY_COUNT; i++) {
+        ULARGE_INTEGER shifted;
+        shifted.QuadPart = (ULONGLONG)((LONGLONG)base.QuadPart +
+            (LONGLONG)(i - SCHEDULE_DAY_RADIUS) * 24 * 60 * 60 * 10000000);
+        ft.dwLowDateTime = shifted.LowPart;
+        ft.dwHighDateTime = shifted.HighPart;
+        SYSTEMTIME localDate;
+        if (!FileTimeToSystemTime(&ft, &localDate)) return FALSE;
+        ComputeSolarDay(latitude, longitude, &localDate, &days[i]);
+    }
+    return TRUE;
+}
+
 /* The four anchors in local minutes, forced into order with a small gap so
  * a dragged transition can never invert. */
 static void ScheduleAnchors(const Schedule* sc, const SolarDay* day, int anchors[4]) {
@@ -2584,37 +2611,34 @@ static double SmoothStep(double x) {
 }
 
 /* Brightness at a local time (minutes, fractional) on the given day. */
-static int ScheduleValueAt(const Schedule* sc, const SolarDay* day, double minutes) {
+static int ScheduleValueAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes) {
     /* Clamp endpoints before interpolation, just like the dialog preview.
      * Keeping the stored levels lets the extended range be enabled again. */
     int minimum = g_config.allowBelowMinimum ? -SOFT_MAX_DIM : 0;
     double night = sc->nightLevel < minimum ? minimum : sc->nightLevel;
     double dayLevel = sc->dayLevel < minimum ? minimum : sc->dayLevel;
-    if (day->polar > 0) return (int)dayLevel;
-    if (day->polar < 0) return (int)night;
-    int a[4];
-    ScheduleAnchors(sc, day, a);
-    /* A dusk that ends after midnight (or a dawn that starts before it)
-     * belongs to the neighbouring calendar day; test the shifted times too. */
-    double candidates[3] = { minutes, minutes + 1440, minutes - 1440 };
-    double t = minutes;
-    for (int i = 0; i < 3; i++) {
-        if (candidates[i] >= a[0] && candidates[i] <= a[3]) {
-            t = candidates[i];
-            break;
+    const SolarDay* today = &days[SCHEDULE_DAY_RADIUS];
+    if (today->polar > 0) return (int)dayLevel;
+    if (today->polar < 0) return (int)night;
+
+    /* When yesterday's dusk overlaps today's dawn, use the greater daytime
+     * contribution. Both curves are continuous, so their maximum is too;
+     * this also works when the daytime level is darker than the night level. */
+    double daylight = 0;
+    for (int i = 0; i < SCHEDULE_DAY_COUNT; i++) {
+        if (days[i].polar) continue;
+        int a[4];
+        ScheduleAnchors(sc, &days[i], a);
+        double t = minutes - (i - SCHEDULE_DAY_RADIUS) * 1440;
+        double weight = 0;
+        if (t > a[0] && t < a[3]) {
+            if (t < a[1]) weight = SmoothStep((t - a[0]) / (double)(a[1] - a[0]));
+            else if (t <= a[2]) weight = 1;
+            else weight = 1 - SmoothStep((t - a[2]) / (double)(a[3] - a[2]));
         }
+        if (weight > daylight) daylight = weight;
     }
-    double v;
-    if (t <= a[0] || t >= a[3]) {
-        v = night;
-    } else if (t < a[1]) {
-        v = night + (dayLevel - night) * SmoothStep((t - a[0]) / (double)(a[1] - a[0]));
-    } else if (t <= a[2]) {
-        v = dayLevel;
-    } else {
-        v = dayLevel + (night - dayLevel) * SmoothStep((t - a[2]) / (double)(a[3] - a[2]));
-    }
-    return (int)lround(v);
+    return (int)lround(night + (dayLevel - night) * daylight);
 }
 
 static ULONGLONG NowFileTime(void) {
@@ -2681,10 +2705,10 @@ static BOOL ScheduleTargetNow(int* value) {
     if (!sc->enabled || !sc->hasLocation) return FALSE;
     SYSTEMTIME now;
     GetLocalTime(&now);
-    SolarDay day;
-    ComputeSolarDay(sc->latitude, sc->longitude, &now, &day);
+    SolarDay days[SCHEDULE_DAY_COUNT];
+    if (!ComputeSolarDays(sc->latitude, sc->longitude, &now, days)) return FALSE;
     double minutes = now.wHour * 60 + now.wMinute + now.wSecond / 60.0;
-    *value = ScheduleValueAt(sc, &day, minutes);
+    *value = ScheduleValueAt(sc, days, minutes);
     return TRUE;
 }
 

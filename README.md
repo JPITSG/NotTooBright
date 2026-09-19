@@ -98,7 +98,9 @@ The four points shape the transitions - when the morning ramp starts and
 reaches full brightness, and when the evening ramp starts and reaches the
 night level. Drag them to taste; they are stored as offsets from sunrise and
 sunset, so the curve keeps following the seasons instead of freezing at a
-clock time. **Reset curve** restores the defaults (half an hour on either
+clock time. When an evening transition overlaps the next morning, the stronger
+daytime contribution takes precedence so the curve stays continuous across
+midnight. **Reset curve** restores the defaults (half an hour on either
 side of sunrise and sunset). Where the sun does not rise or set on a given
 day, the night or daytime level simply applies all day.
 

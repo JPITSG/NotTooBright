@@ -1,20 +1,7 @@
 // Run with node --test tests/test_ui.cjs after installing assets dependencies.
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
 const test = require('node:test');
-const ts = require('../assets/node_modules/typescript');
-
-function loadTs(relative, globals = {}) {
-  const source = fs.readFileSync(path.join(__dirname, '..', relative), 'utf8');
-  const output = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
-  }).outputText;
-  const exports = {};
-  vm.runInNewContext(output, { exports, Date, Math, Set, ...globals });
-  return exports;
-}
+const { loadTs } = require('./load_ts.cjs');
 
 const { reconcileScheduleSelection } = loadTs('assets/src/lib/scheduleSelection.ts');
 const monitor = (key, uid, scheduled = true, hidden = false) => ({ key, uid, scheduled, hidden });
@@ -45,4 +32,29 @@ test('Save sends stable keys and limits changes to monitors shown in the dialog'
   ]);
   assert.equal(message.scheduledKeys, 'a');
   assert.equal(message.scheduleMonitorKeys, 'a,b');
+});
+
+const solar = loadTs('assets/src/lib/solar.ts');
+const defaultShape = { dayLevel: 100, nightLevel: 10, dawnStartOffset: -30,
+  dawnEndOffset: 30, duskStartOffset: -30, duskEndOffset: 30 };
+
+test('overlapping dusk and dawn remain continuous across calendar midnight', () => {
+  process.env.TZ = 'Atlantic/Reykjavik';
+  const shape = { ...defaultShape, dawnStartOffset: -360, duskEndOffset: 360 };
+  const previous = solar.computeSolarDays(64.15, -21.94, new Date(2026, 5, 21, 12));
+  const next = solar.computeSolarDays(64.15, -21.94, new Date(2026, 5, 22, 12));
+  assert.equal(solar.scheduleValueAt(shape, previous, 1440), solar.scheduleValueAt(shape, next, 0));
+  assert.ok(Math.abs(solar.scheduleValueAt(shape, previous, 1439.5) - solar.scheduleValueAt(shape, next, 0)) <= 1);
+  // The overlap rule uses daytime contribution, not the brighter numeric value.
+  const inverse = { ...shape, dayLevel: 10, nightLevel: 100 };
+  assert.equal(solar.scheduleValueAt(inverse, previous, 1440), solar.scheduleValueAt(inverse, next, 0));
+});
+
+test('ordinary dawn, daytime, dusk and night levels stay unchanged', () => {
+  const days = Array.from({ length: 5 }, () => ({ sunrise: 360, sunset: 1080, noon: 720, polar: 0 }));
+  assert.equal(solar.scheduleValueAt(defaultShape, days, 0), 10);
+  assert.equal(solar.scheduleValueAt(defaultShape, days, 360), 55);
+  assert.equal(solar.scheduleValueAt(defaultShape, days, 720), 100);
+  assert.equal(solar.scheduleValueAt(defaultShape, days, 1080), 55);
+  assert.equal(solar.scheduleValueAt(defaultShape, days, 1440), 10);
 });

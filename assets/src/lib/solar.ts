@@ -19,6 +19,7 @@ export interface CurveShape {
 
 export const MAX_OFFSET = 6 * 60;
 export const MIN_GAP = 5;
+export const DAY_RADIUS = 2;
 
 const RAD = Math.PI / 180;
 
@@ -114,6 +115,15 @@ export function computeSolarDay(
   };
 }
 
+// Keep the neighbouring dates' real anchors when a transition crosses midnight.
+export function computeSolarDays(latitude: number, longitude: number, date: Date) {
+  return Array.from({ length: DAY_RADIUS * 2 + 1 }, (_, i) =>
+    computeSolarDay(latitude, longitude, new Date(
+      date.getFullYear(), date.getMonth(), date.getDate() + i - DAY_RADIUS, 12
+    ))
+  );
+}
+
 // The four transition anchors in local minutes, kept in order.
 export function scheduleAnchors(shape: CurveShape, day: SolarDay) {
   const anchors = [
@@ -136,26 +146,28 @@ function smoothStep(x: number) {
 
 export function scheduleValueAt(
   shape: CurveShape,
-  day: SolarDay,
+  days: readonly SolarDay[],
   minutes: number
 ) {
-  if (day.polar > 0) return shape.dayLevel;
-  if (day.polar < 0) return shape.nightLevel;
-  const a = scheduleAnchors(shape, day);
-  let t = minutes;
-  for (const candidate of [minutes, minutes + 1440, minutes - 1440]) {
-    if (candidate >= a[0] && candidate <= a[3]) {
-      t = candidate;
-      break;
+  const today = days[DAY_RADIUS];
+  if (today.polar > 0) return shape.dayLevel;
+  if (today.polar < 0) return shape.nightLevel;
+  let daylight = 0;
+  for (let i = 0; i < days.length; i++) {
+    if (days[i].polar) continue;
+    const a = scheduleAnchors(shape, days[i]);
+    const t = minutes - (i - DAY_RADIUS) * 1440;
+    let weight = 0;
+    if (t > a[0] && t < a[3]) {
+      if (t < a[1]) weight = smoothStep((t - a[0]) / (a[1] - a[0]));
+      else if (t <= a[2]) weight = 1;
+      else weight = 1 - smoothStep((t - a[2]) / (a[3] - a[2]));
     }
+    daylight = Math.max(daylight, weight);
   }
-  const { nightLevel: night, dayLevel: dayLevel } = shape;
-  let v: number;
-  if (t <= a[0] || t >= a[3]) v = night;
-  else if (t < a[1]) v = night + (dayLevel - night) * smoothStep((t - a[0]) / (a[1] - a[0]));
-  else if (t <= a[2]) v = dayLevel;
-  else v = dayLevel + (night - dayLevel) * smoothStep((t - a[2]) / (a[3] - a[2]));
-  return Math.round(v);
+  const value = shape.nightLevel + (shape.dayLevel - shape.nightLevel) * daylight;
+  // Match C lround for negative half-integers too.
+  return Math.sign(value) * Math.floor(Math.abs(value) + 0.5);
 }
 
 export function formatMinutes(minutes: number) {

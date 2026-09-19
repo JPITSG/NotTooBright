@@ -4,6 +4,7 @@ Run with python3 -m unittest discover -s tests. Requires a native C compiler.
 Windows I/O is stubbed; real DDC/CI still requires Windows testing.
 """
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -23,12 +24,12 @@ def function(name):
     return source[start:pos]
 
 
-def run_c(code):
+def run_c(code, data=None):
     with tempfile.TemporaryDirectory(prefix="ntb-test-") as directory:
         binary = str(Path(directory) / "test")
         subprocess.run([os.environ.get("CC", "cc"), "-x", "c", "-", "-o", binary, "-lm"],
                        input=code, text=True, check=True)
-        subprocess.run([binary], check=True)
+        subprocess.run([binary], input=data, text=True, check=True)
 
 
 class ScheduleTests(unittest.TestCase):
@@ -130,6 +131,8 @@ int main(void) {
 #include <math.h>
 #define SOFT_MAX_DIM 90
 #define SCHEDULE_MIN_GAP 5
+#define SCHEDULE_DAY_RADIUS 2
+#define SCHEDULE_DAY_COUNT 5
 typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
     duskStartOffset, duskEndOffset; } Schedule;
 typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
@@ -137,20 +140,79 @@ struct { int allowBelowMinimum; } g_config;
 ''' + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleValueAt") + r'''
 int main(void) {
     Schedule sc = {100, -90, -30, 30, -30, 30};
-    SolarDay day = {360, 1080, 720, 0};
-    assert(ScheduleValueAt(&sc, &day, 360) == 50);
-    assert(ScheduleValueAt(&sc, &day, 1080) == 50);
-    assert(ScheduleValueAt(&sc, &day, 0) == 0);
+    SolarDay days[5];
+    for (int i = 0; i < 5; i++) days[i] = (SolarDay){360, 1080, 720, 0};
+    assert(ScheduleValueAt(&sc, days, 360) == 50);
+    assert(ScheduleValueAt(&sc, days, 1080) == 50);
+    assert(ScheduleValueAt(&sc, days, 0) == 0);
     assert(sc.nightLevel == -90);
     g_config.allowBelowMinimum = 1;
-    assert(ScheduleValueAt(&sc, &day, 360) == 5);
-    assert(ScheduleValueAt(&sc, &day, 0) == -90);
-    day.polar = -1;
-    assert(ScheduleValueAt(&sc, &day, 0) == -90);
+    assert(ScheduleValueAt(&sc, days, 360) == 5);
+    assert(ScheduleValueAt(&sc, days, 0) == -90);
+    days[2].polar = -1;
+    assert(ScheduleValueAt(&sc, days, 0) == -90);
     g_config.allowBelowMinimum = 0;
-    assert(ScheduleValueAt(&sc, &day, 0) == 0);
+    assert(ScheduleValueAt(&sc, days, 0) == 0);
 }
 ''')
+
+
+    def test_c_curve_matches_preview_across_dates_and_ranges(self):
+        cases = json.loads(subprocess.check_output(["node", "-e", r'''
+const { loadTs } = require('./tests/load_ts.cjs');
+const solar = loadTs('assets/src/lib/solar.ts');
+const cases = [];
+for (const [tz, lat, lon] of [['Atlantic/Reykjavik',64.15,-21.94],
+    ['Europe/Warsaw',52.23,21.01], ['Pacific/Apia',-13.83,-171.76],
+    ['Arctic/Longyearbyen',78.22,15.65]]) {
+  process.env.TZ = tz;
+  for (const month of [0,2,5,9]) {
+    const days = solar.computeSolarDays(lat,lon,new Date(2026,month,21,12));
+    for (const extended of [0,1]) for (const offsets of [[-30,30,-30,30],[-360,30,-30,360],[180,360,-360,-180]]) {
+      const shape = {dayLevel:100,nightLevel:-90,dawnStartOffset:offsets[0],
+        dawnEndOffset:offsets[1],duskStartOffset:offsets[2],duskEndOffset:offsets[3]};
+      for (let minute=0; minute<=1440; minute+=7.5) {
+        cases.push([extended,shape,days,minute,solar.scheduleValueAt(
+          {...shape,nightLevel:extended ? -90 : 0},days,minute)]);
+      }
+    }
+  }
+}
+console.log(JSON.stringify(cases));
+'''], cwd=ROOT, text=True))
+        rows = []
+        for extended, shape, days, minute, expected in cases:
+            row = [extended, shape['dayLevel'], shape['nightLevel'],
+                   shape['dawnStartOffset'], shape['dawnEndOffset'],
+                   shape['duskStartOffset'], shape['duskEndOffset']]
+            for day in days:
+                row += [day['sunrise'], day['sunset'], day['noon'], day['polar']]
+            rows.append(' '.join(map(str, row + [minute, expected])))
+        run_c(r'''
+#include <assert.h>
+#include <stdio.h>
+#include <math.h>
+#define SOFT_MAX_DIM 90
+#define SCHEDULE_MIN_GAP 5
+#define SCHEDULE_DAY_RADIUS 2
+#define SCHEDULE_DAY_COUNT 5
+typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
+    duskStartOffset, duskEndOffset; } Schedule;
+typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
+struct { int allowBelowMinimum; } g_config;
+''' + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleValueAt") + r'''
+int main(void) {
+    Schedule sc; SolarDay days[5]; double minutes; int expected;
+    while (scanf("%d", &g_config.allowBelowMinimum) == 1) {
+        assert(scanf("%d%d%d%d%d%d", &sc.dayLevel, &sc.nightLevel,
+            &sc.dawnStartOffset, &sc.dawnEndOffset, &sc.duskStartOffset, &sc.duskEndOffset) == 6);
+        for (int i = 0; i < 5; i++)
+            assert(scanf("%d%d%d%d", &days[i].sunrise, &days[i].sunset, &days[i].noon, &days[i].polar) == 4);
+        assert(scanf("%lf%d", &minutes, &expected) == 2);
+        assert(ScheduleValueAt(&sc, days, minutes) == expected);
+    }
+}
+''', '\n'.join(rows))
 
 
 if __name__ == "__main__":

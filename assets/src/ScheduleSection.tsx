@@ -5,7 +5,8 @@ import {
   type SolarDay,
   MAX_OFFSET,
   MIN_GAP,
-  computeSolarDay,
+  computeSolarDays,
+  DAY_RADIUS,
   scheduleAnchors,
   scheduleValueAt,
   formatMinutes,
@@ -48,21 +49,17 @@ const HANDLE_NAMES = ["Dawn starts", "Full brightness", "Evening starts", "Night
 
 interface SunCurveProps {
   shape: CurveShape;
-  day: SolarDay;
+  days: SolarDay[];
+  now: Date;
   minLevel: number;
   onOffsetsChange: (offsets: Partial<CurveShape>) => void;
 }
 
-function SunCurve({ shape, day, minLevel, onOffsetsChange }: SunCurveProps) {
+function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [dragging, setDragging] = useState<number | null>(null);
   const [hovered, setHovered] = useState<number | null>(null);
-  const [now, setNow] = useState(() => new Date());
-
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(new Date()), 30000);
-    return () => window.clearInterval(id);
-  }, []);
+  const day = days[DAY_RADIUS];
 
   const x = (minute: number) => PAD.left + (clamp(minute, 0, 1440) / 1440) * PLOT_W;
   const y = (level: number) =>
@@ -73,13 +70,13 @@ function SunCurve({ shape, day, minLevel, onOffsetsChange }: SunCurveProps) {
 
   const points: string[] = [];
   for (let m = 0; m <= 1440; m += 5) {
-    points.push(`${x(m).toFixed(1)},${y(scheduleValueAt(shape, day, m)).toFixed(1)}`);
+    points.push(`${x(m).toFixed(1)},${y(scheduleValueAt(shape, days, m)).toFixed(1)}`);
   }
   const linePath = `M${points.join("L")}`;
   const areaPath = `${linePath}L${x(1440).toFixed(1)},${PLOT_BOTTOM}L${x(0).toFixed(1)},${PLOT_BOTTOM}Z`;
 
   const nowMinutes = now.getHours() * 60 + now.getMinutes();
-  const nowValue = scheduleValueAt(shape, day, nowMinutes);
+  const nowValue = scheduleValueAt(shape, days, nowMinutes);
 
   function minuteFromPointer(e: ReactPointerEvent) {
     const svg = svgRef.current;
@@ -248,10 +245,16 @@ interface Props {
 }
 
 export default function ScheduleSection({ settings, onChange, monitors, minLevel, error }: Props) {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(new Date()), 30000);
+    return () => window.clearInterval(id);
+  }, []);
   const latitude = parseCoordinate(settings.latitude, 90);
   const longitude = parseCoordinate(settings.longitude, 180);
   const hasLocation = latitude !== null && longitude !== null;
-  const day = hasLocation ? computeSolarDay(latitude, longitude, new Date()) : null;
+  const days = hasLocation ? computeSolarDays(latitude, longitude, now) : null;
+  const day = days?.[DAY_RADIUS] ?? null;
   const shape: CurveShape = {
     dayLevel: clamp(settings.dayLevel, minLevel, 100),
     nightLevel: clamp(settings.nightLevel, minLevel, 100),
@@ -373,11 +376,12 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
           </div>
 
           <div className="space-y-1.5 rounded-md border border-neutral-200 px-2 pt-2 pb-1.5">
-            {day ? (
+            {day && days ? (
               <>
                 <SunCurve
                   shape={shape}
-                  day={day}
+                  days={days}
+                  now={now}
                   minLevel={minLevel}
                   onOffsetsChange={(offsets) => update(offsets)}
                 />
