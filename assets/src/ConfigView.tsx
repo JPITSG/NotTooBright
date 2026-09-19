@@ -563,7 +563,7 @@ export default function ConfigView({
 
       {remoteSession && (
         <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-snug text-amber-800">
-          Paused: this session is being viewed through Remote Desktop. The
+          Paused: This session is being viewed through Remote Desktop. The
           monitors are listed as they were at the computer and keep their
           brightness; they can be adjusted again once you are back at it.
         </p>
