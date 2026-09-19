@@ -2454,11 +2454,13 @@ static void HandleDdcSetResult(int uid, BOOL success) {
         m->error[0] = L'\0';
         DebugPrint(L"[WARNING] %s (%s): %d consecutive DDC/CI failures; leaving the monitor alone and retrying\n",
                    m->name, m->device, m->failures);
-        ScheduleDdcRetry();
     } else {
         wcscpy_s(m->error, sizeof(m->error) / sizeof(wchar_t),
                  L"The monitor did not accept the last brightness change.");
     }
+    /* A constant schedule target will not call ApplyMonitor again. Retry
+     * even the first failed write, independently of future slider changes. */
+    ScheduleDdcRetry();
     PushMonitorsToDialog();
 }
 
