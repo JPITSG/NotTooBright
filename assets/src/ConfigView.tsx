@@ -123,7 +123,7 @@ function ScheduleBadge({ monitor }: { monitor: MonitorData }) {
     return (
       <span
         className="shrink-0 whitespace-nowrap rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium leading-none text-amber-700"
-        title={`Changed by hand; the schedule takes over again at ${monitor.pausedUntil}`}
+        title={`Paused after a manual change; the schedule takes over again at ${monitor.pausedUntil}`}
       >
         Auto paused
       </span>
@@ -243,11 +243,12 @@ function MonitorCard({
       )}
       {scheduleEnabled && monitor.scheduled && monitor.pausedUntil && (
         <p className="text-[11px] leading-snug text-neutral-500">
-          Set by hand; the schedule resumes at {monitor.pausedUntil}.{" "}
+          The schedule is paused after a manual change and resumes at{" "}
+          {monitor.pausedUntil} for every monitor it controls.{" "}
           <button
             type="button"
             className="underline hover:text-neutral-900"
-            onClick={() => resumeSchedule(monitor.uid)}
+            onClick={() => resumeSchedule()}
           >
             Resume now
           </button>

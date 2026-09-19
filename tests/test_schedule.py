@@ -234,16 +234,20 @@ int main(void) {
 #define _TRUNCATE ((size_t)-1)
 typedef int BOOL;
 typedef unsigned UINT;
+typedef unsigned long long ULONGLONG;
 typedef void* HWND;
 typedef struct { HWND hWnd; UINT uFlags; wchar_t szTip[128]; } NOTIFYICONDATAW;
 typedef struct { int hidden, hasValue, value, mode; wchar_t name[128]; } Monitor;
 ''' + enumeration("SchedulePhase") + r'''
 NOTIFYICONDATAW g_nid = { (HWND)1 };
 Monitor g_monitors[4];
-int g_monitorCount, modifies, scheduleOn;
+struct { struct { BOOL enabled; } schedule; } g_config;
+int g_monitorCount, modifies, paused;
 SchedulePhase currentPhase;
 int MonitorMode(const Monitor* m) { return m->mode; }
-BOOL SchedulePhaseNow(SchedulePhase* phase) { *phase = currentPhase; return scheduleOn; }
+BOOL SchedulePhaseNow(SchedulePhase* phase) { *phase = currentPhase; return g_config.schedule.enabled; }
+ULONGLONG NowFileTime(void) { return 0; }
+BOOL IsSchedulePaused(ULONGLONG now) { (void)now; return paused; }
 void Shell_NotifyIconW(int op, NOTIFYICONDATAW* nid) { assert(op == NIM_MODIFY && nid->uFlags == NIF_TIP); modifies++; }
 void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
 void wcscat_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscat(out, in); }
@@ -269,30 +273,32 @@ int main(void) {
     g_monitors[0] = (Monitor){0, 1, 75, MODE_HARDWARE, L"Left"};
     g_monitors[1] = (Monitor){0, 0, 0, MODE_PROBING, L"Right"};
     UpdateTrayTooltip();
-    assert(modifies == 1 && wcscmp(g_nid.szTip, L"Left: 75%\nRight: ...") == 0);
-    scheduleOn = 1;
+    assert(modifies == 1 && wcscmp(g_nid.szTip, L"Schedule: Disabled\nLeft: 75%\nRight: ...") == 0);
+    g_config.schedule.enabled = 1;
     currentPhase = SCHEDULE_PHASE_DUSK;
     UpdateTrayTooltip();
-    assert(wcscmp(g_nid.szTip, L"State: Daytime \u2192 Night\nLeft: 75%\nRight: ...") == 0);
+    assert(wcscmp(g_nid.szTip, L"State: Daytime \u2192 Night\nSchedule: Active\nLeft: 75%\nRight: ...") == 0);
     currentPhase = SCHEDULE_PHASE_DAWN;
+    paused = 1;
     UpdateTrayTooltip();
-    assert(wcsncmp(g_nid.szTip, L"State: Night \u2192 Daytime\n", 22) == 0);
+    assert(wcsncmp(g_nid.szTip, L"State: Night \u2192 Daytime\nSchedule: Paused\n", 39) == 0);
+    paused = 0;
     currentPhase = SCHEDULE_PHASE_DAY;
     g_monitors[1].hidden = 1;
     UpdateTrayTooltip();
-    assert(wcscmp(g_nid.szTip, L"State: Daytime\nLeft: 75%") == 0);
+    assert(wcscmp(g_nid.szTip, L"State: Daytime\nSchedule: Active\nLeft: 75%") == 0);
     currentPhase = SCHEDULE_PHASE_NIGHT;
     g_monitorCount = 0;
     UpdateTrayTooltip();
-    assert(wcscmp(g_nid.szTip, L"State: Night") == 0);
+    assert(wcscmp(g_nid.szTip, L"State: Night\nSchedule: Active") == 0);
     /* Unchanged text is not sent to the shell again. */
     UpdateTrayTooltip();
     assert(modifies == 5);
-    scheduleOn = 0;
+    g_config.schedule.enabled = 0;
     UpdateTrayTooltip();
-    assert(wcscmp(g_nid.szTip, APP_DISPLAY_NAME_WSTRING) == 0);
-    /* Long lists are cut with an ellipsis and the state line always fits. */
-    scheduleOn = 1;
+    assert(wcscmp(g_nid.szTip, L"Schedule: Disabled") == 0);
+    /* Long lists are cut with an ellipsis and the schedule lines always fit. */
+    g_config.schedule.enabled = 1;
     g_monitorCount = 4;
     for (int i = 0; i < 4; i++) {
         g_monitors[i] = (Monitor){0, 1, 50, MODE_HARDWARE, L""};
@@ -301,6 +307,96 @@ int main(void) {
     UpdateTrayTooltip();
     assert(wcslen(g_nid.szTip) < 128);
     assert(wcsstr(g_nid.szTip, L"aaa...: 50%") && wcsstr(g_nid.szTip, L"\n...") && !wcsstr(g_nid.szTip, L"ccc"));
+}
+''')
+
+    def test_manual_change_pauses_and_resume_restores_the_whole_schedule(self):
+        run_c(r'''
+#include <assert.h>
+#include <stddef.h>
+#include <wchar.h>
+#define TRUE 1
+#define FALSE 0
+#define SCHEDULE_DAY_COUNT 5
+#define MODE_PROBING 1
+#define MODE_WAITING 2
+#define MODE_HARDWARE 3
+#define DebugPrint(...) ((void)0)
+typedef int BOOL;
+typedef unsigned long long ULONGLONG;
+typedef int BrightnessMode;
+typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
+typedef struct { int scheduled, hidden, value, hasValue, dirty, mode; wchar_t name[8], device[8]; } Monitor;
+''' + enumeration("SchedulePhase") + structure("Schedule") + r'''
+struct { Schedule schedule; } g_config;
+Monitor g_monitors[3];
+int g_monitorCount = 3, g_loggedSchedulePhase = -1, target = 30, saves, applied;
+ULONGLONG now = 1000, nextReset = 5000;
+ULONGLONG NowFileTime(void) { return now; }
+ULONGLONG NextCycleResetFileTime(void) { return nextReset; }
+BOOL SaveConfigToRegistry(const void* config) { (void)config; saves++; return TRUE; }
+void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count) { (void)ft; (void)count; out[0] = 0; }
+void PushMonitorsToDialog(void) {}
+void ScheduleTooltipUpdate(void) {}
+void SchedulePersist(void) {}
+BOOL ScheduleNow(SolarDay days[SCHEDULE_DAY_COUNT], double* minutes) {
+    (void)days; *minutes = 0; return g_config.schedule.enabled;
+}
+int ScheduleValueAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes) {
+    (void)sc; (void)days; (void)minutes; return target;
+}
+double ScheduleDaylightAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes, SchedulePhase* phase) {
+    (void)sc; (void)days; (void)minutes; *phase = SCHEDULE_PHASE_DAY; return 1;
+}
+const wchar_t* SchedulePhaseName(SchedulePhase phase) { (void)phase; return L""; }
+BrightnessMode MonitorMode(const Monitor* m) { return m->mode; }
+int ClampMonitorValue(const Monitor* m, int value) { (void)m; return value; }
+void ApplyMonitor(Monitor* m) { (void)m; applied++; }
+''' + function("IsSchedulePaused") + function("EvaluateSchedule") + function("NoteManualChange") + function("ResumeSchedule") + r'''
+int main(void) {
+    g_config.schedule.enabled = TRUE;
+    g_config.schedule.hasLocation = TRUE;
+    for (int i = 0; i < 3; i++) g_monitors[i] = (Monitor){1, 0, 50, 1, 0, MODE_HARDWARE, L"", L""};
+    g_monitors[2].scheduled = 0;
+    EvaluateSchedule();
+    assert(applied == 2 && g_monitors[0].value == 30 && g_monitors[1].value == 30 && g_monitors[2].value == 50);
+    /* A manual change on one scheduled monitor pauses the schedule for all of them. */
+    g_monitors[0].value = 80;
+    NoteManualChange(&g_monitors[0]);
+    assert(g_config.schedule.pausedUntil == 5000 && saves == 1 && IsSchedulePaused(now));
+    target = 40;
+    EvaluateSchedule();
+    assert(applied == 2 && g_monitors[0].value == 80 && g_monitors[1].value == 30);
+    /* A second change while paused does not move the deadline. */
+    nextReset = 9000;
+    NoteManualChange(&g_monitors[1]);
+    assert(g_config.schedule.pausedUntil == 5000 && saves == 1);
+    /* Resume now brings every scheduled monitor back at once. */
+    ResumeSchedule();
+    assert(!g_config.schedule.pausedUntil && saves == 2 && applied == 4);
+    assert(g_monitors[0].value == 40 && g_monitors[1].value == 40 && g_monitors[2].value == 50);
+    ResumeSchedule();
+    assert(saves == 2);
+    /* Unscheduled and hidden monitors never pause the schedule. */
+    NoteManualChange(&g_monitors[2]);
+    g_monitors[1].hidden = 1;
+    NoteManualChange(&g_monitors[1]);
+    assert(!g_config.schedule.pausedUntil && saves == 2);
+    g_monitors[1].hidden = 0;
+    /* The pause expires at the cycle reset time for everyone. */
+    NoteManualChange(&g_monitors[0]);
+    assert(g_config.schedule.pausedUntil == 9000 && saves == 3);
+    now = 9000;
+    target = 55;
+    EvaluateSchedule();
+    assert(!g_config.schedule.pausedUntil && saves == 4);
+    assert(g_monitors[0].value == 55 && g_monitors[1].value == 55 && g_monitors[2].value == 50);
+    /* A disabled schedule is never paused, whatever the stored deadline says. */
+    g_config.schedule.pausedUntil = 99999;
+    g_config.schedule.enabled = FALSE;
+    assert(!IsSchedulePaused(now));
+    NoteManualChange(&g_monitors[0]);
+    assert(saves == 4);
 }
 ''')
 
@@ -392,7 +488,7 @@ Monitor g_monitors[MAX_MONITORS], saved;
 int g_monitorCount, g_nextUid = 20, connected = 0, saves = 0;
 void SaveMonitorSettings(const Monitor* m) { saved = *m; saves++; }
 void LoadMonitorSettings(Monitor* m) {
-    m->pausedUntil = saved.pausedUntil; m->scheduled = saved.scheduled;
+    m->scheduled = saved.scheduled;
     m->value = saved.value; m->hasValue = saved.hasValue;
 }
 void LogDisplayDevices(void) {}
@@ -425,21 +521,19 @@ void PushMonitorsToDialog(void) {}
 ''' + function("PersistDirtyMonitors") + function("RefreshMonitors") + r'''
 int main(void) {
     g_monitorCount = 1;
-    g_monitors[0] = (Monitor){.uid=1,.dirty=TRUE,.scheduled=TRUE,
-        .pausedUntil=123456789,.value=25,.hasValue=TRUE};
+    g_monitors[0] = (Monitor){.uid=1,.dirty=TRUE,.scheduled=TRUE,.value=25,.hasValue=TRUE};
     wcscpy(g_monitors[0].key,L"monitor");
     RefreshMonitors(); /* Removed before the delayed persistence timer. */
-    assert(g_monitorCount==0 && saves==1 && saved.pausedUntil==123456789);
+    assert(g_monitorCount==0 && saves==1 && saved.scheduled && saved.value==25);
     connected=1;
     RefreshMonitors();
-    assert(g_monitorCount==1 && g_monitors[0].scheduled);
-    assert(g_monitors[0].pausedUntil==123456789 && g_monitors[0].value==25);
+    assert(g_monitorCount==1 && g_monitors[0].scheduled && g_monitors[0].value==25);
     int uid=g_monitors[0].uid;
-    g_monitors[0].pausedUntil=987654321;
+    g_monitors[0].value=40;
     g_monitors[0].dirty=TRUE;
     RefreshMonitors(); /* Existing whole-record merge must still survive. */
     assert(saves==2 && g_monitors[0].uid==uid);
-    assert(g_monitors[0].pausedUntil==987654321 && g_monitors[0].scheduled);
+    assert(g_monitors[0].value==40 && g_monitors[0].scheduled);
 }
 ''')
 

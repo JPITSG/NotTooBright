@@ -83,9 +83,9 @@
 #define REG_VALUE_MON_ORIGINAL L"OriginalBrightness"
 #define REG_VALUE_MON_ORIGINAL_MAX L"OriginalBrightnessMax"
 #define REG_VALUE_MON_SCHEDULED L"Scheduled"
-#define REG_VALUE_MON_PAUSED_UNTIL L"SchedulePausedUntil"   /* REG_QWORD, UTC FILETIME */
 /* Sun-based automatic brightness. */
 #define REG_VALUE_SCHEDULE_ENABLED L"ScheduleEnabled"
+#define REG_VALUE_SCHEDULE_PAUSED_UNTIL L"SchedulePausedUntil"   /* REG_QWORD, UTC FILETIME */
 #define REG_VALUE_LATITUDE L"Latitude"                        /* REG_SZ, decimal degrees */
 #define REG_VALUE_LONGITUDE L"Longitude"
 #define REG_VALUE_SCHEDULE_DAY L"ScheduleDayLevel"
@@ -423,6 +423,7 @@ typedef struct {
     int duskStartOffset;      /* day level until here (sunset + offset) */
     int duskEndOffset;        /* night level from here (sunset + offset) */
     int cycleResetMinutes;    /* time of day when manual overrides expire */
+    ULONGLONG pausedUntil;    /* UTC FILETIME; 0 unless paused by a manual change (persisted) */
 } Schedule;
 
 typedef struct {
@@ -516,7 +517,6 @@ typedef struct {
     DWORD originalRaw;            /* raw VCP value at first sighting */
     DWORD originalMax;            /* its maximum, for display as a percent */
     BOOL scheduled;               /* follows the automatic brightness schedule */
-    ULONGLONG pausedUntil;        /* UTC FILETIME; automation resumes after a manual change */
     int value;                    /* desired brightness, -SOFT_MAX_DIM..100 */
     BOOL hasValue;
     int lastHwSent;               /* last percent handed to the worker, -1 = none */
@@ -669,7 +669,7 @@ static void EvaluateSchedule(void);
 static void NoteManualChange(Monitor* m);
 static void UpdateScheduleTimer(void);
 static ULONGLONG NowFileTime(void);
-static BOOL IsSchedulePaused(const Monitor* m, ULONGLONG nowFt);
+static BOOL IsSchedulePaused(ULONGLONG nowFt);
 static void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count);
 
 /* ── Debug logging ───────────────────────────────────────────────────────── */
@@ -934,6 +934,7 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DUSK_START, &sc->duskStartOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
     ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DUSK_END, &sc->duskEndOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
     ReadRegistryInt(hKey, REG_VALUE_CYCLE_RESET, &sc->cycleResetMinutes, 0, 1439);
+    ReadRegistryQword(hKey, REG_VALUE_SCHEDULE_PAUSED_UNTIL, &sc->pausedUntil);
     if (!sc->hasLocation) sc->enabled = FALSE;
     RegCloseKey(hKey);
     return TRUE;
@@ -975,6 +976,7 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DUSK_START, (DWORD)(LONG)sc->duskStartOffset);
     WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DUSK_END, (DWORD)(LONG)sc->duskEndOffset);
     WriteRegistryDword(hKey, REG_VALUE_CYCLE_RESET, (DWORD)sc->cycleResetMinutes);
+    WriteRegistryQword(hKey, REG_VALUE_SCHEDULE_PAUSED_UNTIL, sc->pausedUntil);
     RegCloseKey(hKey);
     return success;
 }
@@ -1013,7 +1015,6 @@ static void LoadMonitorSettings(Monitor* m) {
     ReadRegistryBool(hKey, REG_VALUE_MON_HIDDEN, &m->hidden);
     ReadRegistryBool(hKey, REG_VALUE_MON_HARDWARE, &m->knownHardware);
     ReadRegistryBool(hKey, REG_VALUE_MON_SCHEDULED, &m->scheduled);
-    ReadRegistryQword(hKey, REG_VALUE_MON_PAUSED_UNTIL, &m->pausedUntil);
     DWORD original = 0, originalMax = 0;
     DWORD originalSize = sizeof(original), originalMaxSize = sizeof(originalMax);
     if (RegQueryValueExW(hKey, REG_VALUE_MON_ORIGINAL, NULL, &dataType,
@@ -1042,7 +1043,8 @@ static void SaveMonitorSettings(const Monitor* m) {
     WriteRegistryDword(hKey, REG_VALUE_MON_HIDDEN, m->hidden ? 1 : 0);
     WriteRegistryDword(hKey, REG_VALUE_MON_HARDWARE, m->knownHardware ? 1 : 0);
     WriteRegistryDword(hKey, REG_VALUE_MON_SCHEDULED, m->scheduled ? 1 : 0);
-    WriteRegistryQword(hKey, REG_VALUE_MON_PAUSED_UNTIL, m->pausedUntil);
+    /* Up to 0.0.28 the pause was per monitor; the value is now on the root key. */
+    RegDeleteValueW(hKey, L"SchedulePausedUntil");
     if (m->hasOriginal) {
         WriteRegistryDword(hKey, REG_VALUE_MON_ORIGINAL, m->originalRaw);
         WriteRegistryDword(hKey, REG_VALUE_MON_ORIGINAL_MAX, m->originalMax);
@@ -2337,7 +2339,7 @@ static void UnhideAllMonitors(void) {
 static void ApplyScheduleAfterProbe(Monitor* m) {
     int target;
     if (!m->scheduled || m->hidden || !ScheduleTargetNow(&target)) return;
-    if (IsSchedulePaused(m, NowFileTime())) return;
+    if (IsSchedulePaused(NowFileTime())) return;
     int value = ClampMonitorValue(m, target);
     if (!m->hasValue || m->value != value) {
         m->value = value;
@@ -2738,8 +2740,11 @@ static void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count) {
     }
 }
 
-static BOOL IsSchedulePaused(const Monitor* m, ULONGLONG nowFt) {
-    return m->pausedUntil != 0 && m->pausedUntil > nowFt;
+/* A manual change pauses the whole schedule (every monitor it controls)
+ * until the next cycle reset time. */
+static BOOL IsSchedulePaused(ULONGLONG nowFt) {
+    const Schedule* sc = &g_config.schedule;
+    return sc->enabled && sc->pausedUntil != 0 && sc->pausedUntil > nowFt;
 }
 
 /* The solar days around today and the current local time, or FALSE when
@@ -2773,36 +2778,38 @@ static BOOL SchedulePhaseNow(SchedulePhase* phase) {
     return TRUE;
 }
 
-/* Applies the current schedule value to every scheduled, unpaused monitor.
- * Runs on the schedule timer and after anything that changes the inputs. */
+/* Applies the current schedule value to every scheduled monitor unless the
+ * schedule is paused. Runs on the schedule timer and after anything that
+ * changes the inputs. */
 static void EvaluateSchedule(void) {
-    /* The tooltip's state line follows the clock, not just the values. */
+    /* The tooltip's schedule lines follow the clock, not just the values. */
     ScheduleTooltipUpdate();
+    Schedule* sc = &g_config.schedule;
     SolarDay days[SCHEDULE_DAY_COUNT];
     double minutes;
     if (!ScheduleNow(days, &minutes)) {
         g_loggedSchedulePhase = -1;
         return;
     }
-    int target = ScheduleValueAt(&g_config.schedule, days, minutes);
+    int target = ScheduleValueAt(sc, days, minutes);
     SchedulePhase phase;
-    ScheduleDaylightAt(&g_config.schedule, days, minutes, &phase);
+    ScheduleDaylightAt(sc, days, minutes, &phase);
     if ((int)phase != g_loggedSchedulePhase) {
         DebugPrint(L"[INFO] Schedule state: %s, target %d%%\n", SchedulePhaseName(phase), target);
         g_loggedSchedulePhase = (int)phase;
     }
     ULONGLONG now = NowFileTime();
     BOOL changed = FALSE;
+    if (sc->pausedUntil) {
+        if (sc->pausedUntil > now) return;
+        sc->pausedUntil = 0;
+        SaveConfigToRegistry(&g_config);
+        changed = TRUE;
+        DebugPrint(L"[INFO] Schedule resumed at the cycle reset time\n");
+    }
     for (int i = 0; i < g_monitorCount; i++) {
         Monitor* m = &g_monitors[i];
         if (!m->scheduled || m->hidden) continue;
-        if (m->pausedUntil) {
-            if (m->pausedUntil > now) continue;
-            m->pausedUntil = 0;
-            m->dirty = TRUE;
-            changed = TRUE;
-            DebugPrint(L"[INFO] %s (%s): automatic brightness resumed\n", m->name, m->device);
-        }
         BrightnessMode mode = MonitorMode(m);
         if (mode == MODE_PROBING || mode == MODE_WAITING) continue;
         int value = ClampMonitorValue(m, target);
@@ -2821,19 +2828,29 @@ static void EvaluateSchedule(void) {
     }
 }
 
-/* A manual brightness change on a scheduled monitor suspends automation
- * for it until the next cycle reset time. */
+/* A manual brightness change on a scheduled monitor pauses the schedule
+ * for every monitor it controls until the next cycle reset time. */
 static void NoteManualChange(Monitor* m) {
-    if (!g_config.schedule.enabled || !m->scheduled || m->hidden) return;
-    ULONGLONG now = NowFileTime();
-    if (IsSchedulePaused(m, now)) return;
-    m->pausedUntil = NextCycleResetFileTime();
-    m->dirty = TRUE;
-    SchedulePersist();
+    Schedule* sc = &g_config.schedule;
+    if (!sc->enabled || !m->scheduled || m->hidden) return;
+    if (IsSchedulePaused(NowFileTime())) return;
+    sc->pausedUntil = NextCycleResetFileTime();
+    SaveConfigToRegistry(&g_config);
     wchar_t until[16];
-    FormatLocalTimeOfDay(m->pausedUntil, until, 16);
-    DebugPrint(L"[INFO] %s (%s): manual change; automatic brightness paused until %s\n",
+    FormatLocalTimeOfDay(sc->pausedUntil, until, 16);
+    DebugPrint(L"[INFO] %s (%s): manual change; schedule paused until %s\n",
                m->name, m->device, until);
+    PushMonitorsToDialog();
+}
+
+/* "Resume now" in the dialog: the schedule takes over again everywhere. */
+static void ResumeSchedule(void) {
+    Schedule* sc = &g_config.schedule;
+    if (!sc->pausedUntil) return;
+    sc->pausedUntil = 0;
+    SaveConfigToRegistry(&g_config);
+    DebugPrint(L"[INFO] Schedule resumed by the user\n");
+    EvaluateSchedule();
     PushMonitorsToDialog();
 }
 
@@ -4346,11 +4363,14 @@ static wchar_t* BuildMonitorsJson(void) {
     size_t len = 0;
     buf[len++] = L'[';
     buf[len] = L'\0';
-    ULONGLONG nowFt = NowFileTime();
+    wchar_t schedulePausedUntil[16] = L"";
+    if (IsSchedulePaused(NowFileTime())) {
+        FormatLocalTimeOfDay(g_config.schedule.pausedUntil, schedulePausedUntil, 16);
+    }
     for (int i = 0; i < g_monitorCount; i++) {
         const Monitor* m = &g_monitors[i];
-        wchar_t eKey[256], eName[128], eDevice[64], eError[320], pausedUntil[16] = L"";
-        if (IsSchedulePaused(m, nowFt)) FormatLocalTimeOfDay(m->pausedUntil, pausedUntil, 16);
+        wchar_t eKey[256], eName[128], eDevice[64], eError[320];
+        const wchar_t* pausedUntil = m->scheduled ? schedulePausedUntil : L"";
         json_escape_wstring(m->key, eKey, 256);
         json_escape_wstring(m->name, eName, 128);
         json_escape_wstring(m->device, eDevice, 64);
@@ -4715,13 +4735,13 @@ static void SaveScheduleFromMessage(const char* msg) {
         /* Stable keys survive disconnect/reconnect. A display arriving
          * after the dialog sent Save keeps its existing selection. */
         BOOL scheduled = MonitorKeyInList(m->key, scheduledKeys);
-        if (m->scheduled != scheduled || m->pausedUntil) {
+        if (m->scheduled != scheduled) {
             m->scheduled = scheduled;
-            m->pausedUntil = 0;
             m->dirty = TRUE;
         }
     }
     PersistDirtyMonitors();
+    sc->pausedUntil = 0;
 
     int scheduledCount = 0;
     for (int i = 0; i < g_monitorCount; i++) {
@@ -4894,16 +4914,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         UnhideAllMonitors();
         RefreshMonitors();
     } else if (strcmp(action, "resumeSchedule") == 0) {
-        int uid = -1;
-        Monitor* m = json_get_int(msg, "uid", &uid) ? FindMonitorByUid(uid) : NULL;
-        if (m && m->pausedUntil) {
-            m->pausedUntil = 0;
-            m->dirty = TRUE;
-            DebugPrint(L"[INFO] %s (%s): automatic brightness resumed by the user\n", m->name, m->device);
-            EvaluateSchedule();
-            SchedulePersist();
-            PushMonitorsToDialog();
-        }
+        ResumeSchedule();
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
         g_config.autoCheckForUpdates = json_get_bool(msg, "autoCheckForUpdates", TRUE);
@@ -5172,17 +5183,22 @@ static void ScheduleTooltipUpdate(void) {
 }
 
 /* "State: Daytime" (or Night, or the transition in progress) while the
- * schedule is enabled, then one "name: NN%" line per visible monitor.
- * szTip holds 128 characters, so long names are shortened and, if the list
- * still does not fit, the tail is replaced by an ellipsis. */
+ * schedule is enabled, "Schedule: Disabled/Active/Paused" always, then one
+ * "name: NN%" line per visible monitor. szTip holds 128 characters, so
+ * long names are shortened and, if the list still does not fit, the tail
+ * is replaced by an ellipsis. */
 static void UpdateTrayTooltip(void) {
     if (!g_nid.hWnd) return;
     const size_t cap = sizeof(g_nid.szTip) / sizeof(wchar_t);
     wchar_t tip[128] = L"";
     SchedulePhase phase;
     if (SchedulePhaseNow(&phase)) {
-        swprintf_s(tip, cap, L"State: %s", SchedulePhaseName(phase));
+        swprintf_s(tip, cap, L"State: %s\n", SchedulePhaseName(phase));
     }
+    const wchar_t* scheduleState = !g_config.schedule.enabled ? L"Disabled"
+                                 : IsSchedulePaused(NowFileTime()) ? L"Paused" : L"Active";
+    wcscat_s(tip, cap, L"Schedule: ");
+    wcscat_s(tip, cap, scheduleState);
     for (int i = 0; i < g_monitorCount; i++) {
         const Monitor* m = &g_monitors[i];
         if (m->hidden) continue;
@@ -5190,11 +5206,10 @@ static void UpdateTrayTooltip(void) {
         wcsncpy_s(name, 40, m->name, _TRUNCATE);
         if (wcslen(m->name) > 39) wcscpy_s(name + 36, 4, L"...");
         wchar_t line[64];
-        const wchar_t* separator = tip[0] ? L"\n" : L"";
         if (m->hasValue && MonitorMode(m) != MODE_PROBING) {
-            swprintf_s(line, 64, L"%s%s: %d%%", separator, name, m->value);
+            swprintf_s(line, 64, L"\n%s: %d%%", name, m->value);
         } else {
-            swprintf_s(line, 64, L"%s%s: ...", separator, name);
+            swprintf_s(line, 64, L"\n%s: ...", name);
         }
         if (wcslen(tip) + wcslen(line) >= cap - 1) {
             /* Out of room: mark the list as cut and stop. */
@@ -5203,8 +5218,6 @@ static void UpdateTrayTooltip(void) {
         }
         wcscat_s(tip, cap, line);
     }
-    /* Nothing to list (no monitors, schedule off): keep the icon identifiable. */
-    if (!tip[0]) wcscpy_s(tip, cap, APP_DISPLAY_NAME_WSTRING);
     if (wcscmp(tip, g_nid.szTip) == 0) return;
     wcscpy_s(g_nid.szTip, cap, tip);
     NOTIFYICONDATAW nid = g_nid;

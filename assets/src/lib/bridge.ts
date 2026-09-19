@@ -20,7 +20,7 @@ export interface MonitorData {
   // Removed from the dialog and left alone until the next rescan.
   hidden: boolean;
   // Follows the sun-based schedule; pausedUntil is "HH:MM" while a manual
-  // change has suspended it, otherwise "".
+  // change has paused the schedule (for every scheduled monitor), otherwise "".
   scheduled: boolean;
   pausedUntil: string;
   // Desired brightness. 0..100 drives the backlight on hardware monitors;
@@ -221,8 +221,9 @@ export function refreshMonitors() {
   post({ action: "refreshMonitors" });
 }
 
-export function resumeSchedule(uid: number) {
-  post({ action: "resumeSchedule", uid });
+// Ends the pause for every scheduled monitor, not just the card it was clicked on.
+export function resumeSchedule() {
+  post({ action: "resumeSchedule" });
 }
 
 export function configReady(checkAutomatically = false) {

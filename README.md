@@ -16,7 +16,7 @@ else, and an optional schedule that follows the sun for your location.
 - **Works on anything** - Monitors without DDC/CI (docks, KVMs, virtual displays, remote sessions) get a click-through software overlay instead
 - **One slider per monitor** - Plus *All monitors*; changes apply live while you drag and are remembered per monitor
 - **Follows the sun** - Optional day/night levels with smooth dawn and dusk transitions computed for your latitude and longitude, shown on an editable graph
-- **Manual override that makes sense** - Touch a scheduled monitor's slider and the schedule leaves it alone until a reset time you choose
+- **Manual override that makes sense** - Touch a scheduled monitor's slider and the schedule pauses until a reset time you choose
 - **Below the minimum** - Optionally continue below 0% on hardware monitors by adding software dimming on top of the lowest backlight setting
 - **Hide what you do not want touched** - Remove a monitor from the app entirely until the next rescan; its original brightness is restored first
 - **Never black, never in screenshots** - Software dimming stops at 10% and its overlay is excluded from screen capture and screen sharing
@@ -31,7 +31,8 @@ else, and an optional schedule that follows the sun for your location.
 3. Drag. That is it - values are remembered per monitor and restored next time.
 
 Hover the icon for a tooltip listing every monitor and its current
-brightness; with the schedule enabled it starts with a **State** line
+brightness, headed by a **Schedule** line (*Disabled*, *Active*, or *Paused*
+after a manual change) and, while the schedule is enabled, a **State** line
 (*Daytime*, *Night*, or the transition in progress, *Daytime → Night* or
 *Night → Daytime*). Right-click it for **Configure** and **Exit**, plus **Increase
 brightness** / **Decrease brightness** and any preset levels you have listed
@@ -110,12 +111,15 @@ The schedule is evaluated every 30 seconds and writes to a monitor only when
 the rounded percentage changes. The tray icon's tooltip shows where the
 schedule currently is: **State: Daytime** or **State: Night** on the two
 plateaus, **State: Daytime → Night** while dusk is dimming the monitors and
-**State: Night → Daytime** while dawn is brightening them. If you change a scheduled monitor's
-brightness by hand (its slider or **All monitors**), automatic control of
-that monitor pauses until the **cycle reset time** you set (04:00 by
-default), so an adjustment you make in the evening is not undone a minute
-later; the card shows *Auto paused* with a **Resume now** link, and saving
-the schedule again also resumes every monitor. Hidden monitors are never
+**State: Night → Daytime** while dawn is brightening them, and a **Schedule**
+line that reads **Disabled**, **Active**, or **Paused**. If you change a
+scheduled monitor's brightness by hand (its slider, **All monitors**, or
+the tray menu), the schedule pauses for every monitor it controls until
+the **cycle reset time** you set (04:00 by default), so an adjustment you
+make in the evening is not undone a minute later; each scheduled card
+shows *Auto paused* with a **Resume now** link, and resuming from any card
+(or saving the schedule again) resumes the schedule for all of them.
+Hidden monitors are never
 scheduled. The night level can only go below 0% when **Allow dimming below
 the hardware minimum** is enabled, and each monitor clamps the scheduled
 value to its own range.
@@ -185,8 +189,8 @@ next to the executable, so it can run from any folder.
 
 | Location | Contents |
 |----------|----------|
-| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule, the tray menu target and preset levels, update checking and the ignored update version, debug logging |
-| `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, pause deadline, original brightness |
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, update checking and the ignored update version, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, original brightness |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |
 | `%TEMP%\NotTooBright-download-*.exe`, `%TEMP%\NotTooBright-updater-*.exe` | Staged update and the short-lived updater copy; removed when an update finishes |
