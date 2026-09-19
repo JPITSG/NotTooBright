@@ -27,7 +27,7 @@ else, and an optional schedule that follows the sun for your location.
 ## Getting Started
 
 1. Download [`releases/NotTooBright.exe`](releases/NotTooBright.exe) and run it. An icon appears in the system tray.
-2. Click the icon. Every connected monitor gets a card with a slider and a badge showing how it is controlled.
+2. Double-click the icon. Every connected monitor gets a card with a slider and a badge showing how it is controlled.
 3. Drag. That is it - values are remembered per monitor and restored next time.
 
 Hover the icon for a tooltip listing every monitor and its current
@@ -200,7 +200,8 @@ validate the download and enforce its safety limit.
 
 ## Configuration
 
-Click the tray icon (or choose **Configure**) to open the dialog. The
+Double-click the tray icon (or choose **Configure** from its menu) to open
+the dialog. The
 brightness section applies immediately; the settings below it are saved with
 **Save**.
 

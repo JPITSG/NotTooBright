@@ -5736,7 +5736,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
     switch (uMsg) {
         case WM_TRAYICON:
             switch (lParam) {
-                case WM_LBUTTONUP:
+                /* A single left click does nothing (on request); the dialog
+                 * opens on a double click or the menu's Configure item. */
                 case WM_LBUTTONDBLCLK:
                     ShowConfigDialog();
                     break;
