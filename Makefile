@@ -43,7 +43,7 @@ CFLAGS += -mwindows -Wall -Wextra -I.
 # only changes when the program does. -s strips symbols and debug data,
 # which otherwise carry file paths from the build machine's toolchain.
 LDFLAGS += -mwindows -static -s -Wl,--no-insert-timestamp
-LIBS = -luser32 -lgdi32 -lshell32 -lshlwapi -ladvapi32 -lole32 -luuid -ldxva2 -lwinhttp -lversion -lbcrypt -luserenv
+LIBS = -luser32 -lgdi32 -lshell32 -lshlwapi -ladvapi32 -lole32 -luuid -ldxva2 -lwinhttp -lversion -lbcrypt -luserenv -lwtsapi32
 
 .PHONY: all frontend icon clean clean-all
 

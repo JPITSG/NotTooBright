@@ -42,6 +42,9 @@ import ScheduleSection, { parseCoordinate } from "./ScheduleSection";
 interface Props {
   config: ConfigData;
   monitors: MonitorData[];
+  // Viewed through Remote Desktop: the monitors are shown as they were at
+  // the console and everything that would touch them is disabled.
+  remoteSession: boolean;
   updateCompletedVersion: string;
 }
 
@@ -143,6 +146,7 @@ interface MonitorCardProps {
   monitor: MonitorData;
   value: number;
   canHide: boolean;
+  locked: boolean;
   scheduleEnabled: boolean;
   onChange: (value: number) => void;
   onSoftwareOnlyChange: (softwareOnly: boolean) => void;
@@ -153,6 +157,7 @@ function MonitorCard({
   monitor,
   value,
   canHide,
+  locked,
   scheduleEnabled,
   onChange,
   onSoftwareOnlyChange,
@@ -191,11 +196,13 @@ function MonitorCard({
             variant="ghost"
             size="sm"
             className="h-6 px-1.5 text-[11px] text-neutral-500"
-            disabled={!canHide}
+            disabled={!canHide || locked}
             title={
-              canHide
-                ? "Restore this monitor's original brightness, then stop controlling it and remove it from the list until the next rescan"
-                : "The last monitor in the list cannot be hidden"
+              locked
+                ? "Not available during a Remote Desktop session"
+                : canHide
+                  ? "Restore this monitor's original brightness, then stop controlling it and remove it from the list until the next rescan"
+                  : "The last monitor in the list cannot be hidden"
             }
             aria-label={`Hide ${monitor.name}`}
             onClick={onHide}
@@ -210,6 +217,7 @@ function MonitorCard({
         max={monitor.max}
         step={1}
         value={value}
+        disabled={locked}
         onChange={(e) => onChange(Number(e.target.value))}
       />
       {(monitor.hardware === "available" || monitor.knownHardware) && (
@@ -217,6 +225,7 @@ function MonitorCard({
           <Checkbox
             id={softwareId}
             checked={monitor.forceSoftware}
+            disabled={locked}
             onChange={(e) => onSoftwareOnlyChange(e.target.checked)}
           />
           <Label
@@ -283,6 +292,7 @@ function initialSchedule(config: ConfigData, monitors: MonitorData[]): ScheduleS
 export default function ConfigView({
   config,
   monitors,
+  remoteSession,
   updateCompletedVersion,
 }: Props) {
   const [values, setValues] = useState<Record<number, number>>({});
@@ -292,6 +302,9 @@ export default function ConfigView({
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true
+  );
+  const [pauseInRemoteSession, setPauseInRemoteSession] = useState(
+    config.pauseInRemoteSession ?? true
   );
   const [trayTarget, setTrayTarget] = useState(config.trayTarget ?? TRAY_TARGET_NONE);
   // Shown as "100, 75, 50"; only what parses is saved.
@@ -496,6 +509,7 @@ export default function ConfigView({
     saveSettings(
       debugLog,
       autoCheckForUpdates,
+      pauseInRemoteSession,
       trayTarget,
       trayPresetsParsed.values,
       schedule,
@@ -533,18 +547,33 @@ export default function ConfigView({
           variant="outline"
           size="sm"
           className="shrink-0"
-          title="Detect monitors again and show any hidden ones"
+          disabled={remoteSession}
+          title={
+            remoteSession
+              ? "Not available during a Remote Desktop session"
+              : "Detect monitors again and show any hidden ones"
+          }
           onClick={refreshMonitors}
         >
           Rescan
         </Button>
       </div>
 
+      {remoteSession && (
+        <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-snug text-amber-800">
+          Paused: this session is being viewed through Remote Desktop. The
+          monitors are listed as they were at the computer and keep their
+          brightness; they can be adjusted again once you are back at it.
+        </p>
+      )}
+
       {visibleMonitors.length === 0 && (
         <p className="rounded-md border border-neutral-200 px-3 py-2 text-[11px] leading-snug text-neutral-500">
-          {monitors.length === 0
-            ? "No monitors were detected. Connect a display and choose Rescan."
-            : "Every connected monitor is hidden. Choose Rescan to show them again."}
+          {remoteSession
+            ? "No monitors are known yet. They are detected once you are back at the computer."
+            : monitors.length === 0
+              ? "No monitors were detected. Connect a display and choose Rescan."
+              : "Every connected monitor is hidden. Choose Rescan to show them again."}
         </p>
       )}
 
@@ -564,6 +593,7 @@ export default function ConfigView({
             max={100}
             step={1}
             value={clamp(masterValue, masterMin, 100)}
+            disabled={remoteSession}
             onChange={(e) => handleMasterChange(Number(e.target.value))}
           />
         </div>
@@ -575,6 +605,7 @@ export default function ConfigView({
           monitor={monitor}
           value={valueOf(monitor)}
           canHide={canHide}
+          locked={remoteSession}
           scheduleEnabled={config.schedule?.enabled ?? false}
           onChange={(value) => handleMonitorChange(monitor, value)}
           onSoftwareOnlyChange={(softwareOnly) =>
@@ -677,6 +708,25 @@ export default function ConfigView({
             : "Choose All monitors or one monitor to add Increase brightness, " +
               "Decrease brightness and preset levels to the tray menu."}
         </p>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="pauseInRemoteSession"
+          className="mt-0.5"
+          checked={pauseInRemoteSession}
+          onChange={(e) => setPauseInRemoteSession(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="pauseInRemoteSession" className="cursor-pointer">
+            Pause while connected through Remote Desktop
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Leaves the monitors exactly as they are while this session is
+            viewed remotely and picks up again at the computer. Turn off only
+            if this Windows session is always used through Remote Desktop.
+          </p>
+        </div>
       </div>
 
       <div className="flex items-start gap-2 pt-1">

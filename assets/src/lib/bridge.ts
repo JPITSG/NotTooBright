@@ -50,6 +50,10 @@ export interface ConfigData {
   allowBelowMinimum: boolean;
   debugLog: boolean;
   autoCheckForUpdates: boolean;
+  // Leave the monitors alone while the session is viewed through Remote
+  // Desktop (the default); remoteSession says whether that is the case now.
+  pauseInRemoteSession: boolean;
+  remoteSession: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
   // Tray menu Increase/Decrease target: "" (items hidden), "*" (all
@@ -135,9 +139,11 @@ export interface UpdateProgress {
 
 type InitCallback = (data: InitData) => void;
 type MonitorsCallback = (monitors: MonitorData[]) => void;
+type RemoteSessionCallback = (remote: boolean) => void;
 
 let initCallback: InitCallback | null = null;
 let monitorsCallback: MonitorsCallback | null = null;
+let remoteSessionCallback: RemoteSessionCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 
@@ -152,6 +158,15 @@ export function onMonitors(cb: MonitorsCallback) {
   };
 }
 
+// The session moved between the console and Remote Desktop while the
+// dialog is open.
+export function onRemoteSession(cb: RemoteSessionCallback) {
+  remoteSessionCallback = cb;
+  return () => {
+    if (remoteSessionCallback === cb) remoteSessionCallback = null;
+  };
+}
+
 // Called by C via ExecuteScript
 (window as unknown as Record<string, unknown>).onInit = (data: InitData) => {
   if (initCallback) initCallback(data);
@@ -161,6 +176,12 @@ export function onMonitors(cb: MonitorsCallback) {
   monitors: MonitorData[]
 ) => {
   if (monitorsCallback) monitorsCallback(monitors);
+};
+
+(window as unknown as Record<string, unknown>).onRemoteSession = (
+  remote: boolean
+) => {
+  if (remoteSessionCallback) remoteSessionCallback(remote);
 };
 
 (window as unknown as Record<string, unknown>).onUpdateResult = (
@@ -257,6 +278,7 @@ export function dismissUpdateConfirmation() {
 export function saveSettings(
   debugLog: boolean,
   autoCheckForUpdates: boolean,
+  pauseInRemoteSession: boolean,
   trayTarget: string,
   trayPresets: number[],
   schedule: ScheduleSettings,
@@ -266,6 +288,7 @@ export function saveSettings(
     action: "saveSettings",
     debugLog,
     autoCheckForUpdates,
+    pauseInRemoteSession,
     trayTarget,
     trayPresets: trayPresets.join(","),
     scheduleEnabled: schedule.enabled,

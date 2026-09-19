@@ -58,6 +58,7 @@ typedef struct { int hidden, failures, lastHwSent, hardwareState;
     DWORD ddcMax, ddcMin, ddcCurrent; wchar_t error[200]; } Monitor;
 Monitor monitor;
 int retries;
+BOOL g_remoteSession;
 Monitor* FindMonitorByUid(int uid) { (void)uid; return &monitor; }
 void PushMonitorsToDialog(void) {}
 void ScheduleDdcRetry(void) { retries++; }
@@ -243,6 +244,7 @@ NOTIFYICONDATAW g_nid = { (HWND)1 };
 Monitor g_monitors[4];
 struct { struct { BOOL enabled; } schedule; } g_config;
 int g_monitorCount, modifies, paused;
+BOOL g_remoteSession;
 SchedulePhase currentPhase;
 int MonitorMode(const Monitor* m) { return m->mode; }
 BOOL SchedulePhaseNow(SchedulePhase* phase) { *phase = currentPhase; return g_config.schedule.enabled; }
@@ -297,6 +299,16 @@ int main(void) {
     g_config.schedule.enabled = 0;
     UpdateTrayTooltip();
     assert(wcscmp(g_nid.szTip, L"Schedule: Disabled") == 0);
+    /* A Remote Desktop session is announced first. */
+    g_remoteSession = 1;
+    g_monitorCount = 1;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"Remote Desktop session: paused\nSchedule: Disabled\nLeft: 75%") == 0);
+    g_config.schedule.enabled = 1;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"Remote Desktop session: paused\nState: Night\nSchedule: Active\nLeft: 75%") == 0);
+    g_remoteSession = 0;
+    g_monitorCount = 0;
     /* Long lists are cut with an ellipsis and the schedule lines always fit. */
     g_config.schedule.enabled = 1;
     g_monitorCount = 4;
@@ -331,6 +343,7 @@ typedef struct { int scheduled, hidden, value, hasValue, dirty, mode; wchar_t na
 struct { Schedule schedule; } g_config;
 Monitor g_monitors[3];
 int g_monitorCount = 3, g_loggedSchedulePhase = -1, target = 30, saves, applied;
+BOOL g_remoteSession;
 ULONGLONG now = 1000, nextReset = 5000;
 ULONGLONG NowFileTime(void) { return now; }
 ULONGLONG NextCycleResetFileTime(void) { return nextReset; }
@@ -391,6 +404,14 @@ int main(void) {
     EvaluateSchedule();
     assert(!g_config.schedule.pausedUntil && saves == 4);
     assert(g_monitors[0].value == 55 && g_monitors[1].value == 55 && g_monitors[2].value == 50);
+    /* Nothing is applied through Remote Desktop. */
+    g_remoteSession = TRUE;
+    target = 70;
+    EvaluateSchedule();
+    assert(g_monitors[0].value == 55 && applied == 6);
+    g_remoteSession = FALSE;
+    EvaluateSchedule();
+    assert(g_monitors[0].value == 70 && applied == 8);
     /* A disabled schedule is never paused, whatever the stored deadline says. */
     g_config.schedule.pausedUntil = 99999;
     g_config.schedule.enabled = FALSE;
@@ -434,11 +455,13 @@ typedef struct { long x, y; } POINT;
 typedef struct { wchar_t name[128]; } Monitor;
 struct { wchar_t trayTarget[128]; int trayPresets[TRAY_MAX_PRESETS]; int trayPresetCount; } g_config;
 int paused, items, defaults;
-UINT ids[16];
+UINT ids[16], greyed[16];
+BOOL g_remoteSession;
 void GetCursorPos(POINT* pt) { pt->x = pt->y = 0; }
 HMENU CreatePopupMenu(void) { return (HMENU)1; }
 BOOL AppendMenuW(HMENU menu, UINT flags, UINT id, const wchar_t* text) {
     (void)menu;
+    greyed[items] = flags & MF_GRAYED;
     if (flags & MF_SEPARATOR) { ids[items++] = 0; return TRUE; }
     if (id == ID_TRAY_MENU_RESUME_SCHEDULE) assert(wcscmp(text, L"Resume schedule") == 0);
     if (id == ID_TRAY_MENU_CONFIGURE) assert(wcscmp(text, L"Configure") == 0);
@@ -474,6 +497,118 @@ int main(void) {
     ShowContextMenu((HWND)1);
     assert(items == 7 && ids[0] == ID_TRAY_MENU_BRIGHTER && ids[1] == ID_TRAY_MENU_DIMMER && ids[2] == 0);
     assert(ids[3] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[4] == ID_TRAY_MENU_CONFIGURE && ids[5] == 0 && ids[6] == ID_TRAY_MENU_EXIT);
+    assert(!greyed[0] && !greyed[1]);
+    /* Through Remote Desktop the brightness items stay but are greyed out. */
+    g_remoteSession = 1;
+    items = 0;
+    ShowContextMenu((HWND)1);
+    assert(items == 7 && greyed[0] && greyed[1] && !greyed[3] && !greyed[4]);
+}
+''')
+
+    def test_remote_session_pauses_refreshes_and_hides_overlays(self):
+        run_c(r'''
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#include <wchar.h>
+#define TRUE 1
+#define FALSE 0
+#define MAX_MONITORS 16
+#define MAX_PHYSICAL_PER_DISPLAY 8
+#define CCHDEVICENAME 32
+#define HW_UNKNOWN 0
+#define MONITORINFOF_PRIMARY 1
+#define SW_HIDE 0
+#define ID_TIMER_REFRESH_MONITORS 2
+#define ID_TIMER_DDC_RETRY 5
+#define DDC_RETRY_INITIAL_MS 3000
+#define REFRESH_MONITORS_RESUME_DELAY_MS 3000
+#define DebugPrint(...) ((void)0)
+#define ZeroMemory(p,n) memset(p,0,n)
+#define swprintf_s swprintf
+#define EnumMonitorProc NULL
+typedef int BOOL;
+typedef unsigned UINT;
+typedef unsigned long DWORD;
+typedef unsigned long long ULONGLONG;
+typedef void *HMONITOR, *HWND;
+typedef intptr_t LPARAM;
+typedef int HardwareState;
+typedef struct { long left, top, right, bottom; } RECT;
+typedef struct { RECT rcMonitor; DWORD dwFlags; wchar_t szDevice[32]; } MONITORINFOEXW;
+''' + structure("Monitor") + structure("DdcProbeEntry") + structure("EnumEntry") + structure("EnumContext") + r'''
+Monitor g_monitors[MAX_MONITORS], saved;
+int g_monitorCount, g_nextUid = 20, connected = 1, remote = 0, hidden = 0, probes = -1;
+int killed[8], scheduledRefreshes = 0, tooltipUpdates = 0, dialogPushes = 0;
+BOOL g_remoteSession, g_ddcRetryPending = TRUE;
+UINT g_ddcRetryDelayMs = 60000;
+HWND g_hwnd = (HWND)1;
+struct { BOOL pauseInRemoteSession; } g_config = { TRUE };
+BOOL IsRemoteSession(void) { return remote; }
+void SaveMonitorSettings(const Monitor* m) { saved = *m; }
+void LoadMonitorSettings(Monitor* m) { m->value = 25; m->hasValue = TRUE; }
+void LogDisplayDevices(void) {}
+void EnumDisplayMonitors(void* a,void* b,void* c,LPARAM data) {
+    (void)a; (void)b; (void)c;
+    EnumContext* ctx = (EnumContext*)data;
+    ctx->count = connected;
+    ctx->entries[0].hmon = (void*)1;
+    wcscpy(ctx->entries[0].info.szDevice, connected == 1 ? L"DISPLAY" : L"RDP");
+}
+BOOL GetNumberOfPhysicalMonitorsFromHMONITOR(HMONITOR h,DWORD* count) { (void)h; *count=1; return TRUE; }
+void wcscpy_s(wchar_t* out,size_t count,const wchar_t* in) { (void)count; wcscpy(out,in); }
+void ResolveMonitorIdentity(const wchar_t* device,int index,Monitor* m) { (void)index; wcscpy(m->key,device); }
+void SanitizeKeyChars(wchar_t* key) { (void)key; }
+void DestroyWindow(HWND hwnd) { (void)hwnd; }
+HWND CreateOverlayWindow(const RECT* rect) { (void)rect; return (void*)2; }
+void PositionOverlay(Monitor* m) { (void)m; }
+void SetOverlayDim(Monitor* m,int dim) { (void)m; (void)dim; }
+void ReleaseMonitorOverlay(Monitor* m) { m->overlay=NULL; }
+Monitor* FindMonitorByUid(int uid) {
+    for (int i=0;i<g_monitorCount;i++) if(g_monitors[i].uid==uid)return &g_monitors[i];
+    return NULL;
+}
+void DdcRequestProbe(const DdcProbeEntry* entries,int count) { (void)entries; probes = count; }
+void PushMonitorsToDialog(void) {}
+void PushRemoteSessionToDialog(void) { dialogPushes++; }
+void ScheduleTooltipUpdate(void) { tooltipUpdates++; }
+void ScheduleMonitorRefresh(UINT delayMs) { (void)delayMs; scheduledRefreshes++; }
+BOOL KillTimer(HWND hwnd, UINT id) { (void)hwnd; killed[id]++; return TRUE; }
+BOOL IsWindowVisible(HWND hwnd) { return hwnd != NULL; }
+BOOL ShowWindow(HWND hwnd, int cmd) { (void)hwnd; if (cmd == SW_HIDE) hidden++; return TRUE; }
+''' + function("PersistDirtyMonitors") + function("UpdateRemoteSessionState") + function("RefreshMonitors") + r'''
+int main(void) {
+    RefreshMonitors();
+    assert(g_monitorCount == 1 && wcscmp(g_monitors[0].key, L"DISPLAY") == 0 && probes == 1);
+    g_monitors[0].overlayDim = 40;
+    g_monitors[0].value = 60;
+    g_monitors[0].dirty = TRUE;
+    /* Remote Desktop takes over: the list is kept, the overlay hidden, the
+     * worker released, pending state saved, and retries stopped. */
+    remote = 1;
+    connected = 2;
+    RefreshMonitors();
+    assert(g_remoteSession && g_monitorCount == 1 && wcscmp(g_monitors[0].key, L"DISPLAY") == 0);
+    assert(probes == 0 && hidden == 1 && g_monitors[0].overlayDim == 40 && g_monitors[0].overlay);
+    assert(saved.value == 60 && !g_ddcRetryPending && killed[ID_TIMER_REFRESH_MONITORS] == 1 && killed[ID_TIMER_DDC_RETRY] == 1);
+    assert(dialogPushes == 1 && tooltipUpdates == 1);
+    /* Further refreshes and state checks stay quiet while remote. */
+    UpdateRemoteSessionState();
+    RefreshMonitors();
+    assert(probes == 0 && hidden == 1 && dialogPushes == 1 && scheduledRefreshes == 0);
+    /* Back at the console: a refresh is scheduled and retries start afresh. */
+    remote = 0;
+    connected = 1;
+    UpdateRemoteSessionState();
+    assert(!g_remoteSession && scheduledRefreshes == 1 && g_ddcRetryDelayMs == DDC_RETRY_INITIAL_MS && dialogPushes == 2);
+    RefreshMonitors();
+    assert(probes == 1 && g_monitorCount == 1 && g_monitors[0].value == 60 && g_monitors[0].overlayDim == 40);
+    /* With the option off, a remote session changes nothing. */
+    g_config.pauseInRemoteSession = FALSE;
+    remote = 1;
+    UpdateRemoteSessionState();
+    assert(!g_remoteSession && hidden == 1);
 }
 ''')
 
@@ -595,6 +730,8 @@ Monitor* FindMonitorByUid(int uid) {
 }
 void DdcRequestProbe(const DdcProbeEntry* entries,int count) { (void)entries; (void)count; }
 void PushMonitorsToDialog(void) {}
+void UpdateRemoteSessionState(void) {}
+BOOL g_remoteSession;
 ''' + function("PersistDirtyMonitors") + function("RefreshMonitors") + r'''
 int main(void) {
     g_monitorCount = 1;

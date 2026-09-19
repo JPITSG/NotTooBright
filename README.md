@@ -126,6 +126,30 @@ scheduled. The night level can only go below 0% when **Allow dimming below
 the hardware minimum** is enabled, and each monitor clamps the scheduled
 value to its own range.
 
+## Remote Desktop
+
+When the session is viewed through Remote Desktop, Windows replaces the
+real displays with a virtual one, and neither DDC/CI nor a dimming overlay
+belongs there. Not Too Bright detects this (the `SM_REMOTESESSION` metric
+plus the console-session check Microsoft documents for the sessions that
+metric misses, re-evaluated on every session and display change) and
+pauses: the monitors keep whatever brightness they have, nothing is probed,
+written, scheduled, or dimmed, and the overlays leave the remote desktop.
+The tray tooltip starts with **Remote Desktop session: paused**, the tray
+menu's brightness items are greyed out, and the dialog shows the monitors
+exactly as they were at the computer, with a notice and their controls
+disabled; the settings can still be changed and saved. A session that was
+disconnected without signing out counts as remote too. Once the session is
+back at the console the monitors are re-detected and the stored values are
+applied again.
+
+Other remote-control tools (VNC, TeamViewer, AnyDesk, Parsec and the like)
+mirror the console session and are not affected. The behaviour can be
+turned off with **Pause while connected through Remote Desktop** for the
+rare setup where a Windows session is only ever used remotely, for example
+a virtual machine with an enhanced session, where software dimming of the
+remote picture is what is wanted.
+
 ## Updates
 
 When **Automatically check for updates** is enabled (the default), Not Too
@@ -178,6 +202,7 @@ brightness section applies immediately; the settings below it are saved with
 | Cycle reset time | Time of day at which monitors that were adjusted by hand return to automatic control. 04:00 by default. |
 | Tray menu brightness control | Chooses what the tray menu's **Increase brightness** and **Decrease brightness** items act on: **None** (the items are not shown; the default), **All monitors**, or one specific monitor. Each click moves the target by 10% from its current value; that counts as a manual change for scheduled monitors. Saved with **Save**. |
 | Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed, with a bullet on the level the target is currently at. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
+| Pause while connected through Remote Desktop | Leaves the monitors alone while the session is viewed remotely; see [Remote Desktop](#remote-desktop). Saved with **Save**. Enabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Update (button) | Checks the repository for a newer build right now and shows the result; see [Updates](#updates). |
 | Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
@@ -191,7 +216,7 @@ next to the executable, so it can run from any folder.
 
 | Location | Contents |
 |----------|----------|
-| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, update checking and the ignored update version, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, the Remote Desktop pause, update checking and the ignored update version, debug logging |
 | `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, original brightness |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |
@@ -212,6 +237,8 @@ its factory state.
   not forward it.
 - Laptop built-in panels are controlled by Windows itself; this application
   is for external monitors.
+- Started inside a Remote Desktop session, the application knows no
+  monitors until the session is back at the console; the dialog says so.
 
 ## Building from Source
 

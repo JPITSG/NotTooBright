@@ -44,6 +44,7 @@
 #include <winhttp.h>
 #include <winver.h>
 #include <userenv.h>
+#include <wtsapi32.h>
 #include <physicalmonitorenumerationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
@@ -106,6 +107,7 @@
 #define UPDATE_HELPER_READY_MS 10000
 #define UPDATE_HELPER_WAIT_MS 120000
 #define REG_VALUE_AUTO_UPDATE L"AutoCheckForUpdates"
+#define REG_VALUE_PAUSE_REMOTE L"PauseInRemoteSession"
 #define REG_VALUE_IGNORED_UPDATE_VERSION L"IgnoredUpdateVersion"
 #define ID_TIMER_AUTO_UPDATE 8
 #define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
@@ -431,6 +433,7 @@ typedef struct {
     BOOL allowBelowMinimum;   /* let hardware monitors dim further in software */
     BOOL debugLogEnabled;
     BOOL autoCheckForUpdates;
+    BOOL pauseInRemoteSession; /* leave the monitors alone while viewed through Remote Desktop */
     wchar_t trayTarget[128];  /* "", "*", or a monitor key */
     int trayPresets[TRAY_MAX_PRESETS];  /* -SOFT_MAX_DIM..100, menu order */
     int trayPresetCount;
@@ -579,6 +582,7 @@ static LONG g_lastDisplayState = -1;
 static UINT g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
 static BOOL g_ddcRetryPending = FALSE;
 static int g_loggedSchedulePhase = -1;      /* last SchedulePhase written to the log */
+static BOOL g_remoteSession = FALSE;        /* paused: the session is viewed through Remote Desktop */
 
 /* DDC/CI worker thread and its shared request state (guarded by g_ddcLock). */
 static CRITICAL_SECTION g_ddcLock;
@@ -637,6 +641,7 @@ static void ApplyMonitor(Monitor* m);
 static void SetMonitorValue(Monitor* m, int value);
 static void RefreshMonitors(void);
 static void ScheduleMonitorRefresh(UINT delayMs);
+static void UpdateRemoteSessionState(void);
 static void ScheduleDdcRetry(void);
 static void SchedulePersist(void);
 static void PersistDirtyMonitors(void);
@@ -882,6 +887,7 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     ZeroMemory(config, sizeof(*config));
     SetScheduleDefaults(&config->schedule);
     config->autoCheckForUpdates = TRUE;   /* default enabled */
+    config->pauseInRemoteSession = TRUE;
 
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -890,6 +896,7 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     ReadRegistryBool(hKey, REG_VALUE_DEBUGLOG, &config->debugLogEnabled);
     ReadRegistryBool(hKey, REG_VALUE_ALLOW_BELOW_MIN, &config->allowBelowMinimum);
     ReadRegistryBool(hKey, REG_VALUE_AUTO_UPDATE, &config->autoCheckForUpdates);
+    ReadRegistryBool(hKey, REG_VALUE_PAUSE_REMOTE, &config->pauseInRemoteSession);
 
     DWORD dataType = 0;
     DWORD dataSize = sizeof(config->trayTarget) - sizeof(wchar_t);
@@ -954,6 +961,7 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     if (!WriteRegistryDword(hKey, REG_VALUE_DEBUGLOG, config->debugLogEnabled ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_ALLOW_BELOW_MIN, config->allowBelowMinimum ? 1 : 0)) success = FALSE;
     if (!WriteRegistryDword(hKey, REG_VALUE_AUTO_UPDATE, config->autoCheckForUpdates ? 1 : 0)) success = FALSE;
+    if (!WriteRegistryDword(hKey, REG_VALUE_PAUSE_REMOTE, config->pauseInRemoteSession ? 1 : 0)) success = FALSE;
     RegSetValueExW(hKey, REG_VALUE_TRAY_TARGET, 0, REG_SZ, (const BYTE*)config->trayTarget,
                    (DWORD)((wcslen(config->trayTarget) + 1) * sizeof(wchar_t)));
     wchar_t presetText[128];
@@ -2008,10 +2016,93 @@ static int ClampMonitorValue(const Monitor* m, int value) {
  * monitors: 0..100 is the backlight, negative values keep the backlight at
  * its minimum and add software dimming. Software monitors: the overlay
  * alone provides the whole range. */
+/* ── Remote Desktop sessions ─────────────────────────────────────────────── */
+
+/* Microsoft's documented test: SM_REMOTESESSION, and for the sessions that
+ * metric misses (RemoteFX and similar) whether this session owns the
+ * physical console ("glass"). A session that was disconnected without
+ * logging off also counts as remote: its displays belong to whoever is at
+ * the console now. The details are returned for the log. */
+static BOOL QueryRemoteSession(BOOL* metric, DWORD* sessionId, DWORD* glassId, BOOL* glassKnown) {
+    *metric = GetSystemMetrics(SM_REMOTESESSION) != 0;
+    *sessionId = 0;
+    *glassId = 0;
+    *glassKnown = FALSE;
+    ProcessIdToSessionId(GetCurrentProcessId(), sessionId);
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD type = 0, size = sizeof(*glassId);
+        if (RegQueryValueExW(hKey, L"GlassSessionId", NULL, &type, (LPBYTE)glassId, &size) == ERROR_SUCCESS &&
+            type == REG_DWORD) {
+            *glassKnown = TRUE;
+        }
+        RegCloseKey(hKey);
+    }
+    if (*metric) return TRUE;
+    return *glassKnown && *sessionId != *glassId;
+}
+
+static BOOL IsRemoteSession(void) {
+    BOOL metric, glassKnown;
+    DWORD sessionId, glassId;
+    return QueryRemoteSession(&metric, &sessionId, &glassId, &glassKnown);
+}
+
+static void PushRemoteSessionToDialog(void) {
+    if (!g_cfgWebView) return;
+    webview_cfg_execute_script(g_remoteSession
+        ? L"window.onRemoteSession && window.onRemoteSession(true)"
+        : L"window.onRemoteSession && window.onRemoteSession(false)");
+}
+
+/* Enters or leaves the paused state. Called after anything that can change
+ * how the session is viewed (session notifications, display changes, every
+ * refresh) so a missed notification cannot leave the state stale. While
+ * paused nothing is enumerated, probed, written, or dimmed: the monitor
+ * list stays as it was at the console and the displays keep their state. */
+static void UpdateRemoteSessionState(void) {
+    BOOL remote = g_config.pauseInRemoteSession && IsRemoteSession();
+    if (remote == g_remoteSession) return;
+    g_remoteSession = remote;
+    if (remote) {
+        DebugPrint(L"[INFO] Remote Desktop session: pausing; %d monitor(s) keep their state\n", g_monitorCount);
+        if (g_hwnd) {
+            KillTimer(g_hwnd, ID_TIMER_REFRESH_MONITORS);
+            KillTimer(g_hwnd, ID_TIMER_DDC_RETRY);
+        }
+        g_ddcRetryPending = FALSE;
+        PersistDirtyMonitors();
+        /* The overlays would cover the remote desktop; hide them without
+         * forgetting their dimming. The physical monitor handles belong to
+         * the console's displays, so the worker lets go of them. */
+        for (int i = 0; i < g_monitorCount; i++) {
+            Monitor* m = &g_monitors[i];
+            if (m->overlay && IsWindowVisible(m->overlay)) {
+                ShowWindow(m->overlay, SW_HIDE);
+                DebugPrint(L"[OVERLAY] %s: hidden for the remote session (dim %d%% kept)\n", m->name, m->overlayDim);
+            }
+        }
+        DdcProbeEntry none[1];
+        DdcRequestProbe(none, 0);
+    } else {
+        DebugPrint(L"[INFO] Back at the console: resuming, monitors will be re-detected and re-applied\n");
+        g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
+        ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
+    }
+    PushRemoteSessionToDialog();
+    ScheduleTooltipUpdate();
+}
+
+/* ── Applying values ─────────────────────────────────────────────────────── */
+
 static void ApplyMonitor(Monitor* m) {
     /* Hidden monitors are not controlled at all: no overlay, no DDC/CI
      * writes. Whatever state the display is in stays that way. */
     if (m->hidden) return;
+    /* Paused for a remote session: the value is kept and applied once the
+     * console is back and the monitor has been re-probed. */
+    if (g_remoteSession) return;
     BrightnessMode mode = MonitorMode(m);
     if (mode == MODE_PROBING) return;   /* applied when the probe answers */
     if (mode == MODE_WAITING) return;   /* nothing is touched until it answers */
@@ -2141,6 +2232,13 @@ static void LogDisplayDevices(void) {
 }
 
 static void RefreshMonitors(void) {
+    /* Through Remote Desktop the enumeration would only show the remote
+     * display; keep the list from the console instead. */
+    UpdateRemoteSessionState();
+    if (g_remoteSession) {
+        DebugPrint(L"[INFO] Refresh skipped: paused for the Remote Desktop session\n");
+        return;
+    }
     /* A removed monitor will no longer be in the array when the debounced
      * save runs. Flush its pending brightness/pause before replacing it. */
     PersistDirtyMonitors();
@@ -2352,6 +2450,13 @@ static void ApplyScheduleAfterProbe(Monitor* m) {
 }
 
 static void HandleDdcProbed(DdcProbeResult* r) {
+    if (g_remoteSession) {
+        /* From a job started before the pause; the state from the console
+         * must not be overwritten with failures against remote displays. */
+        DebugPrint(L"[INFO] Probe result for uid %d ignored during the remote session\n", r->uid);
+        free(r);
+        return;
+    }
     Monitor* m = FindMonitorByUid(r->uid);
     DebugPrint(L"[INFO] Probe result for uid %d (%s): supported=%d highLevel=%d min=%lu current=%lu max=%lu error=%lu elapsed=%lu ms\n",
                r->uid, m ? m->name : L"unknown monitor", r->supported, r->highLevel,
@@ -2445,7 +2550,7 @@ static void HandleDdcProbed(DdcProbeResult* r) {
 
 static void HandleDdcSetResult(int uid, BOOL success) {
     Monitor* m = FindMonitorByUid(uid);
-    if (!m) return;
+    if (!m || g_remoteSession) return;
     if (m->hidden) {
         /* Only the restore-before-hide write reaches a hidden monitor. */
         DebugPrint(L"[%s] %s (%s): original brightness %s before hiding\n",
@@ -2808,6 +2913,9 @@ static void EvaluateSchedule(void) {
         changed = TRUE;
         DebugPrint(L"[INFO] Schedule resumed at the cycle reset time\n");
     }
+    /* Nothing is applied through Remote Desktop; the re-probe after the
+     * console is back brings every scheduled monitor to the current value. */
+    if (g_remoteSession) return;
     for (int i = 0; i < g_monitorCount; i++) {
         Monitor* m = &g_monitors[i];
         if (!m->scheduled || m->hidden) continue;
@@ -4417,7 +4525,8 @@ static void webview_push_init_config(void) {
     if (script) {
         int written = swprintf_s(script, cap,
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
-            L"\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
+            L"\"autoCheckForUpdates\":%s,\"pauseInRemoteSession\":%s,\"remoteSession\":%s,"
+            L"\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
             L"\"trayTarget\":\"%s\",\"trayPresets\":\"%s\","
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
             L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
@@ -4427,6 +4536,8 @@ static void webview_push_init_config(void) {
             g_config.allowBelowMinimum ? L"true" : L"false",
             g_config.debugLogEnabled ? L"true" : L"false",
             g_config.autoCheckForUpdates ? L"true" : L"false",
+            g_config.pauseInRemoteSession ? L"true" : L"false",
+            g_remoteSession ? L"true" : L"false",
             updateCheckPending ? L"true" : L"false",
             g_updateNoticeTask ? L"true" : L"false",
             eTrayTarget, presetText,
@@ -4870,6 +4981,10 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         EvaluateSchedule();
         for (int i = 0; i < g_monitorCount; i++) ApplyMonitor(&g_monitors[i]);
         PushMonitorsToDialog();
+    } else if (strcmp(action, "hideMonitor") == 0 && g_remoteSession) {
+        DebugPrint(L"[INFO] Hide ignored during the remote session\n");
+    } else if (strcmp(action, "refreshMonitors") == 0 && g_remoteSession) {
+        DebugPrint(L"[INFO] Rescan ignored during the remote session\n");
     } else if (strcmp(action, "hideMonitor") == 0) {
         int uid = -1;
         Monitor* m = json_get_int(msg, "uid", &uid) ? FindMonitorByUid(uid) : NULL;
@@ -4919,6 +5034,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
         g_config.autoCheckForUpdates = json_get_bool(msg, "autoCheckForUpdates", TRUE);
+        g_config.pauseInRemoteSession = json_get_bool(msg, "pauseInRemoteSession", TRUE);
         char trayTarget[256] = {0};
         json_get_string(msg, "trayTarget", trayTarget, sizeof(trayTarget));
         if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, trayTarget, -1, g_config.trayTarget,
@@ -4940,8 +5056,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
         FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 256);
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
-                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.trayTarget, presetText);
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, pauseInRemoteSession=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
+                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.pauseInRemoteSession,
+                   g_config.trayTarget, presetText);
+        /* Turning the pause off from inside a remote session resumes at once. */
+        UpdateRemoteSessionState();
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
@@ -5192,9 +5311,12 @@ static void UpdateTrayTooltip(void) {
     if (!g_nid.hWnd) return;
     const size_t cap = sizeof(g_nid.szTip) / sizeof(wchar_t);
     wchar_t tip[128] = L"";
+    if (g_remoteSession) wcscpy_s(tip, cap, L"Remote Desktop session: paused\n");
     SchedulePhase phase;
     if (SchedulePhaseNow(&phase)) {
-        swprintf_s(tip, cap, L"State: %s\n", SchedulePhaseName(phase));
+        wcscat_s(tip, cap, L"State: ");
+        wcscat_s(tip, cap, SchedulePhaseName(phase));
+        wcscat_s(tip, cap, L"\n");
     }
     const wchar_t* scheduleState = !g_config.schedule.enabled ? L"Disabled"
                                  : IsSchedulePaused(NowFileTime()) ? L"Paused" : L"Active";
@@ -5247,6 +5369,7 @@ static Monitor* TrayTargetMonitor(BOOL* allVisible) {
  * own current value, a preset sets them all to that level. Either is a
  * manual change, so scheduled monitors pause. */
 static void ApplyTrayMenuValue(int value, BOOL relative) {
+    if (g_remoteSession) return;
     BOOL allVisible = FALSE;
     Monitor* target = TrayTargetMonitor(&allVisible);
     int changed = 0;
@@ -5314,7 +5437,7 @@ static void ShowContextMenu(HWND hwnd) {
     if (g_config.trayTarget[0]) {
         BOOL allVisible = FALSE;
         Monitor* target = TrayTargetMonitor(&allVisible);
-        BOOL usable = allVisible ? VisibleMonitorCount() > 0 : target != NULL;
+        BOOL usable = (allVisible ? VisibleMonitorCount() > 0 : target != NULL) && !g_remoteSession;
         UINT state = usable ? MF_ENABLED : MF_GRAYED;
         wchar_t brighter[96], dimmer[96];
         if (allVisible) {
@@ -5472,7 +5595,18 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
         case WM_DISPLAYCHANGE:
             DebugPrint(L"[INFO] Display change (%ux%u)\n",
                        (unsigned)LOWORD(lParam), (unsigned)HIWORD(lParam));
+            /* Remote Desktop swaps the displays; catch it here as well so
+             * the overlays leave the remote desktop without waiting. */
+            UpdateRemoteSessionState();
             ScheduleMonitorRefresh(REFRESH_MONITORS_DEBOUNCE_MS);
+            return 0;
+
+        /* The session moved between the console and Remote Desktop (or was
+         * disconnected); the state is re-evaluated rather than trusted. */
+        case WM_WTSSESSION_CHANGE:
+            DebugPrint(L"[INFO] Session change %u (1 console connect, 2 console disconnect, "
+                       L"3 remote connect, 4 remote disconnect, 7 lock, 8 unlock)\n", (unsigned)wParam);
+            UpdateRemoteSessionState();
             return 0;
 
         case WM_DEVICECHANGE:
@@ -5548,6 +5682,12 @@ static void LogEnvironment(void) {
                (unsigned long)os.dwBuildNumber, GetSystemMetrics(SM_CMONITORS), exePath);
     DebugPrint(L"[ENV] time zone \"%s\" bias %ld min (state %lu)\n", tz.StandardName,
                (long)tz.Bias, (unsigned long)tzState);
+    BOOL metric, glassKnown;
+    DWORD sessionId, glassId;
+    BOOL remote = QueryRemoteSession(&metric, &sessionId, &glassId, &glassKnown);
+    DebugPrint(L"[ENV] session %lu, SM_REMOTESESSION=%d, console session %lu%s -> %s; pauseInRemoteSession=%d\n",
+               (unsigned long)sessionId, metric, (unsigned long)glassId, glassKnown ? L"" : L" (unknown)",
+               remote ? L"remote" : L"local", g_config.pauseInRemoteSession);
     const Schedule* sc = &g_config.schedule;
     DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
                g_config.allowBelowMinimum, g_config.debugLogEnabled, sc->enabled, sc->hasLocation,
@@ -5662,6 +5802,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     g_displayStateNotify = RegisterPowerSettingNotification(
         g_hwnd, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!WTSRegisterSessionNotification(g_hwnd, NOTIFY_FOR_THIS_SESSION)) {
+        DebugPrint(L"[WARNING] Session notifications unavailable (error %lu); Remote Desktop is "
+                   L"detected on display changes only\n", (unsigned long)GetLastError());
+    }
     RefreshMonitors();
     SetTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST, OVERLAY_TOPMOST_INTERVAL_MS, NULL);
     UpdateScheduleTimer();
@@ -5700,6 +5844,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     DestroyAllOverlays();
     StopDdcWorker();
     if (g_displayStateNotify) UnregisterPowerSettingNotification(g_displayStateNotify);
+    WTSUnRegisterSessionNotification(g_hwnd);
     RemoveTrayIcon();
     CoUninitialize();
     if (g_hwnd) DestroyWindow(g_hwnd);
