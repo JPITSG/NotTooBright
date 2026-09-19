@@ -2585,8 +2585,13 @@ static double SmoothStep(double x) {
 
 /* Brightness at a local time (minutes, fractional) on the given day. */
 static int ScheduleValueAt(const Schedule* sc, const SolarDay* day, double minutes) {
-    if (day->polar > 0) return sc->dayLevel;
-    if (day->polar < 0) return sc->nightLevel;
+    /* Clamp endpoints before interpolation, just like the dialog preview.
+     * Keeping the stored levels lets the extended range be enabled again. */
+    int minimum = g_config.allowBelowMinimum ? -SOFT_MAX_DIM : 0;
+    double night = sc->nightLevel < minimum ? minimum : sc->nightLevel;
+    double dayLevel = sc->dayLevel < minimum ? minimum : sc->dayLevel;
+    if (day->polar > 0) return (int)dayLevel;
+    if (day->polar < 0) return (int)night;
     int a[4];
     ScheduleAnchors(sc, day, a);
     /* A dusk that ends after midnight (or a dawn that starts before it)
@@ -2599,7 +2604,7 @@ static int ScheduleValueAt(const Schedule* sc, const SolarDay* day, double minut
             break;
         }
     }
-    double night = sc->nightLevel, dayLevel = sc->dayLevel, v;
+    double v;
     if (t <= a[0] || t >= a[3]) {
         v = night;
     } else if (t < a[1]) {
@@ -4741,7 +4746,9 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         SaveConfigToRegistry(&g_config);
         DebugPrint(L"[INFO] Dimming below the hardware minimum %s\n",
                    g_config.allowBelowMinimum ? L"enabled" : L"disabled");
-        /* Re-clamp: disabling pulls any monitor parked below 0 back up. */
+        /* Recompute the curve with the new endpoint range immediately;
+         * paused/manual monitors still only need their value re-clamped. */
+        EvaluateSchedule();
         for (int i = 0; i < g_monitorCount; i++) ApplyMonitor(&g_monitors[i]);
         PushMonitorsToDialog();
     } else if (strcmp(action, "hideMonitor") == 0) {

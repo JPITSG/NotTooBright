@@ -124,5 +124,34 @@ int main(void) {
 ''')
 
 
+    def test_extended_range_clamps_endpoints_before_interpolation(self):
+        run_c(r'''
+#include <assert.h>
+#include <math.h>
+#define SOFT_MAX_DIM 90
+#define SCHEDULE_MIN_GAP 5
+typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
+    duskStartOffset, duskEndOffset; } Schedule;
+typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
+struct { int allowBelowMinimum; } g_config;
+''' + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleValueAt") + r'''
+int main(void) {
+    Schedule sc = {100, -90, -30, 30, -30, 30};
+    SolarDay day = {360, 1080, 720, 0};
+    assert(ScheduleValueAt(&sc, &day, 360) == 50);
+    assert(ScheduleValueAt(&sc, &day, 1080) == 50);
+    assert(ScheduleValueAt(&sc, &day, 0) == 0);
+    assert(sc.nightLevel == -90);
+    g_config.allowBelowMinimum = 1;
+    assert(ScheduleValueAt(&sc, &day, 360) == 5);
+    assert(ScheduleValueAt(&sc, &day, 0) == -90);
+    day.polar = -1;
+    assert(ScheduleValueAt(&sc, &day, 0) == -90);
+    g_config.allowBelowMinimum = 0;
+    assert(ScheduleValueAt(&sc, &day, 0) == 0);
+}
+''')
+
+
 if __name__ == "__main__":
     unittest.main()
