@@ -173,7 +173,7 @@
 #define REFRESH_MONITORS_DEBOUNCE_MS 1500
 #define REFRESH_MONITORS_RESUME_DELAY_MS 3000
 /* Other topmost windows can end up above a dimming overlay; this timer
- * periodically checks and re-raises the overlays. */
+ * checks and re-raises them only while software dimming is visible. */
 #define ID_TIMER_OVERLAY_TOPMOST 3
 #define OVERLAY_TOPMOST_INTERVAL_MS 1500
 /* Brightness changes stream in while a slider is dragged; registry writes
@@ -493,6 +493,18 @@ typedef struct {
     int noon;
 } SolarDay;
 
+/* Only the solar anchors are cached; brightness and pause state always
+ * use the current clock. Accessed on the main thread. */
+typedef struct {
+    BOOL valid;
+    SYSTEMTIME date;
+    double latitude;
+    double longitude;
+    DWORD zoneId;
+    DYNAMIC_TIME_ZONE_INFORMATION zone;
+    SolarDay days[SCHEDULE_DAY_COUNT];
+} SolarCache;
+
 /* Where the schedule's curve is: on a plateau or in one of the transitions. */
 typedef enum {
     SCHEDULE_PHASE_NIGHT = 0,
@@ -598,6 +610,8 @@ static HPOWERNOTIFY g_displayStateNotify = NULL;
 static LONG g_lastDisplayState = -1;
 static UINT g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
 static BOOL g_ddcRetryPending = FALSE;
+static BOOL g_overlayTimerRunning = FALSE;
+static SolarCache g_solarCache;
 static int g_loggedSchedulePhase = -1;      /* last SchedulePhase written to the log */
 static BOOL g_remoteSession = FALSE;        /* paused: the session is viewed through Remote Desktop */
 
@@ -1462,18 +1476,46 @@ static void PositionOverlay(Monitor* m) {
                  SWP_NOACTIVATE);
 }
 
+/* Hardware-only brightness needs no z-order polling. Keep the original
+ * cadence whenever an overlay is visible, including across lock/unlock;
+ * an overlay on the user's desktop still needs protecting after unlock. */
+static void UpdateOverlayTimer(void) {
+    if (!g_hwnd) return;
+    BOOL needed = FALSE;
+    if (!g_remoteSession) {
+        for (int i = 0; i < g_monitorCount; i++) {
+            const Monitor* m = &g_monitors[i];
+            if (!m->hidden && m->overlay && m->overlayDim > 0 && IsWindowVisible(m->overlay)) {
+                needed = TRUE;
+                break;
+            }
+        }
+    }
+    if (needed && !g_overlayTimerRunning) {
+        g_overlayTimerRunning = SetTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST,
+                                          OVERLAY_TOPMOST_INTERVAL_MS, NULL) != 0;
+    } else if (!needed && g_overlayTimerRunning) {
+        KillTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST);
+        g_overlayTimerRunning = FALSE;
+    }
+}
+
 /* dim is the percentage of darkening, 0..SOFT_MAX_DIM. */
 static void SetOverlayDim(Monitor* m, int dim) {
     if (dim < 0) dim = 0;
     if (dim > SOFT_MAX_DIM) dim = SOFT_MAX_DIM;
     int previous = m->overlayDim;
     m->overlayDim = dim;
-    if (!m->overlay) return;
+    if (!m->overlay) {
+        UpdateOverlayTimer();
+        return;
+    }
     if (dim == 0) {
         if (IsWindowVisible(m->overlay)) {
             ShowWindow(m->overlay, SW_HIDE);
             DebugPrint(L"[OVERLAY] %s: hidden (was %d%%)\n", m->name, previous);
         }
+        UpdateOverlayTimer();
         return;
     }
     BYTE alpha = (BYTE)((dim * 255 + 50) / 100);
@@ -1483,6 +1525,7 @@ static void SetOverlayDim(Monitor* m, int dim) {
         PositionOverlay(m);
     }
     if (previous != dim) DebugPrint(L"[OVERLAY] %s: dim %d%% (alpha %u)\n", m->name, dim, (unsigned)alpha);
+    UpdateOverlayTimer();
 }
 
 static BOOL IsOverlayWindow(HWND hwnd) {
@@ -1530,6 +1573,7 @@ static void ReleaseMonitorOverlay(Monitor* m) {
         m->overlay = NULL;
     }
     m->overlayDim = 0;
+    UpdateOverlayTimer();
 }
 
 static void DestroyAllOverlays(void) {
@@ -1540,6 +1584,7 @@ static void DestroyAllOverlays(void) {
         }
         g_monitors[i].overlayDim = 0;
     }
+    UpdateOverlayTimer();
 }
 
 /* ── DDC/CI worker ───────────────────────────────────────────────────────── */
@@ -2352,6 +2397,7 @@ static void UpdateRemoteSessionState(void) {
         g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
         ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
     }
+    UpdateOverlayTimer();
     PushRemoteSessionToDialog();
     ScheduleTooltipUpdate();
 }
@@ -2652,6 +2698,7 @@ static void RefreshMonitors(void) {
     DebugPrint(L"[INFO] %d monitor(s) enumerated, %d hidden; probing DDC/CI\n",
                g_monitorCount, g_monitorCount - probeCount);
     DdcRequestProbe(probe, probeCount);
+    UpdateOverlayTimer();
     PushMonitorsToDialog();
 }
 
@@ -3122,7 +3169,27 @@ static BOOL ScheduleNow(SolarDay days[SCHEDULE_DAY_COUNT], double* minutes) {
     if (!sc->enabled || !sc->hasLocation) return FALSE;
     SYSTEMTIME now;
     GetLocalTime(&now);
-    if (!ComputeSolarDays(sc->latitude, sc->longitude, &now, days)) return FALSE;
+    DYNAMIC_TIME_ZONE_INFORMATION zone;
+    ZeroMemory(&zone, sizeof(zone));
+    DWORD zoneId = GetDynamicTimeZoneInformation(&zone);
+    /* Check the inputs even without a Windows notification: midnight,
+     * DST, a time-zone/location change, or waking on another date must
+     * never reuse stale anchors. A failed zone query disables caching. */
+    if (!g_solarCache.valid || zoneId == TIME_ZONE_ID_INVALID ||
+        now.wYear != g_solarCache.date.wYear || now.wMonth != g_solarCache.date.wMonth ||
+        now.wDay != g_solarCache.date.wDay ||
+        sc->latitude != g_solarCache.latitude || sc->longitude != g_solarCache.longitude ||
+        zoneId != g_solarCache.zoneId || memcmp(&zone, &g_solarCache.zone, sizeof(zone)) != 0) {
+        g_solarCache.valid = FALSE;
+        if (!ComputeSolarDays(sc->latitude, sc->longitude, &now, g_solarCache.days)) return FALSE;
+        g_solarCache.date = now;
+        g_solarCache.latitude = sc->latitude;
+        g_solarCache.longitude = sc->longitude;
+        g_solarCache.zoneId = zoneId;
+        g_solarCache.zone = zone;
+        g_solarCache.valid = zoneId != TIME_ZONE_ID_INVALID;
+    }
+    memcpy(days, g_solarCache.days, sizeof(g_solarCache.days));
     *minutes = now.wHour * 60 + now.wMinute + now.wSecond / 60.0;
     return TRUE;
 }
@@ -3150,13 +3217,12 @@ static BOOL SchedulePhaseNow(SchedulePhase* phase) {
  * schedule is paused. Runs on the schedule timer and after anything that
  * changes the inputs. */
 static void EvaluateSchedule(void) {
-    /* The tooltip's schedule lines follow the clock, not just the values. */
-    ScheduleTooltipUpdate();
     Schedule* sc = &g_config.schedule;
     SolarDay days[SCHEDULE_DAY_COUNT];
     double minutes;
     if (!ScheduleNow(days, &minutes)) {
         g_loggedSchedulePhase = -1;
+        ScheduleTooltipUpdate();
         return;
     }
     int target = ScheduleValueAt(sc, days, minutes);
@@ -3165,6 +3231,9 @@ static void EvaluateSchedule(void) {
     if ((int)phase != g_loggedSchedulePhase) {
         DebugPrint(L"[INFO] Schedule state: %s, target %d%%\n", SchedulePhaseName(phase), target);
         g_loggedSchedulePhase = (int)phase;
+        /* The phase can change before the rounded brightness does, or
+         * while paused. Unchanged ticks need no separate tooltip timer. */
+        ScheduleTooltipUpdate();
     }
     ULONGLONG now = NowFileTime();
     BOOL changed = FALSE;
@@ -3172,6 +3241,7 @@ static void EvaluateSchedule(void) {
         if (sc->pausedUntil > now) return;
         sc->pausedUntil = 0;
         SaveConfigToRegistry(&g_config);
+        ScheduleTooltipUpdate();
         changed = TRUE;
         DebugPrint(L"[INFO] Schedule resumed at the cycle reset time\n");
     }
@@ -5814,7 +5884,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     RefreshMonitors();
                     return 0;
                 case ID_TIMER_OVERLAY_TOPMOST:
-                    KeepOverlaysOnTop();
+                    /* KillTimer can leave an already queued WM_TIMER. */
+                    if (g_overlayTimerRunning) KeepOverlaysOnTop();
                     return 0;
                 case ID_TIMER_PERSIST:
                     KillTimer(hwnd, ID_TIMER_PERSIST);
@@ -5842,6 +5913,14 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     return 0;
             }
             break;
+
+        case WM_TIMECHANGE:
+        case WM_SETTINGCHANGE:
+            /* Time-zone rules can also change without a new date or bias.
+             * Reload on broadcasts as well as checking the cache key. */
+            g_solarCache.valid = FALSE;
+            EvaluateSchedule();
+            return 0;
 
         /* Monitors come and go, change resolution, or wake up: re-enumerate
          * after the burst of notifications settles. */
@@ -5871,6 +5950,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
         case WM_POWERBROADCAST:
             if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+                g_solarCache.valid = FALSE;
                 DebugPrint(L"[INFO] Resumed from sleep; monitors will be re-applied\n");
                 ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
                 ScheduleBrightnessKeyReaderRestart();
@@ -6062,7 +6142,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                    L"detected on display changes only\n", (unsigned long)GetLastError());
     }
     RefreshMonitors();
-    SetTimer(g_hwnd, ID_TIMER_OVERLAY_TOPMOST, OVERLAY_TOPMOST_INTERVAL_MS, NULL);
     UpdateScheduleTimer();
     UpdateBrightnessKeyReaders();
 

@@ -546,7 +546,7 @@ typedef struct { RECT rcMonitor; DWORD dwFlags; wchar_t szDevice[32]; } MONITORI
 ''' + structure("Monitor") + structure("DdcProbeEntry") + structure("EnumEntry") + structure("EnumContext") + r'''
 Monitor g_monitors[MAX_MONITORS], saved;
 int g_monitorCount, g_nextUid = 20, connected = 1, remote = 0, hidden = 0, probes = -1;
-int killed[8], scheduledRefreshes = 0, tooltipUpdates = 0, dialogPushes = 0;
+int killed[8], scheduledRefreshes = 0, tooltipUpdates = 0, dialogPushes = 0, overlayUpdates = 0;
 BOOL g_remoteSession, g_ddcRetryPending = TRUE;
 UINT g_ddcRetryDelayMs = 60000;
 HWND g_hwnd = (HWND)1;
@@ -571,6 +571,7 @@ HWND CreateOverlayWindow(const RECT* rect) { (void)rect; return (void*)2; }
 void PositionOverlay(Monitor* m) { (void)m; }
 void SetOverlayDim(Monitor* m,int dim) { (void)m; (void)dim; }
 void ReleaseMonitorOverlay(Monitor* m) { m->overlay=NULL; }
+void UpdateOverlayTimer(void) { overlayUpdates++; }
 Monitor* FindMonitorByUid(int uid) {
     for (int i=0;i<g_monitorCount;i++) if(g_monitors[i].uid==uid)return &g_monitors[i];
     return NULL;
@@ -587,6 +588,7 @@ BOOL ShowWindow(HWND hwnd, int cmd) { (void)hwnd; if (cmd == SW_HIDE) hidden++; 
 int main(void) {
     RefreshMonitors();
     assert(g_monitorCount == 1 && wcscmp(g_monitors[0].key, L"DISPLAY") == 0 && probes == 1);
+    assert(overlayUpdates == 1);
     g_monitors[0].overlayDim = 40;
     g_monitors[0].value = 60;
     g_monitors[0].dirty = TRUE;
@@ -598,11 +600,11 @@ int main(void) {
     assert(g_remoteSession && g_monitorCount == 1 && wcscmp(g_monitors[0].key, L"DISPLAY") == 0);
     assert(probes == 0 && hidden == 1 && g_monitors[0].overlayDim == 40 && g_monitors[0].overlay);
     assert(saved.value == 60 && !g_ddcRetryPending && killed[ID_TIMER_REFRESH_MONITORS] == 1 && killed[ID_TIMER_DDC_RETRY] == 1);
-    assert(dialogPushes == 1 && tooltipUpdates == 1);
+    assert(dialogPushes == 1 && tooltipUpdates == 1 && overlayUpdates == 2);
     /* Further refreshes and state checks stay quiet while remote. */
     UpdateRemoteSessionState();
     RefreshMonitors();
-    assert(probes == 0 && hidden == 1 && dialogPushes == 1 && scheduledRefreshes == 0);
+    assert(probes == 0 && hidden == 1 && dialogPushes == 1 && scheduledRefreshes == 0 && overlayUpdates == 2);
     /* Back at the console: a refresh is scheduled and retries start afresh. */
     remote = 0;
     connected = 1;
@@ -610,6 +612,7 @@ int main(void) {
     assert(!g_remoteSession && scheduledRefreshes == 1 && g_ddcRetryDelayMs == DDC_RETRY_INITIAL_MS && dialogPushes == 2);
     RefreshMonitors();
     assert(probes == 1 && g_monitorCount == 1 && g_monitors[0].value == 60 && g_monitors[0].overlayDim == 40);
+    assert(overlayUpdates == 4);
     /* With the option off, a remote session changes nothing. */
     g_config.pauseInRemoteSession = FALSE;
     remote = 1;
@@ -794,6 +797,7 @@ HWND CreateOverlayWindow(const RECT* rect) { (void)rect; return (void*)2; }
 void PositionOverlay(Monitor* m) { (void)m; }
 void SetOverlayDim(Monitor* m,int dim) { (void)m; (void)dim; }
 void ReleaseMonitorOverlay(Monitor* m) { m->overlay=NULL; }
+void UpdateOverlayTimer(void) {}
 Monitor* FindMonitorByUid(int uid) {
     for (int i=0;i<g_monitorCount;i++) if(g_monitors[i].uid==uid)return &g_monitors[i];
     return NULL;

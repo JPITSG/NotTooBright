@@ -109,7 +109,13 @@ side of sunrise and sunset). Where the sun does not rise or set on a given
 day, the night or daytime level simply applies all day.
 
 The schedule is evaluated every 30 seconds and writes to a monitor only when
-the rounded percentage changes. The tray icon's tooltip shows where the
+the rounded percentage changes. Solar times are cached for the current date,
+location, and Windows time-zone settings; clock/settings changes and resume
+invalidate the cache. Locking the workstation does not stop the schedule.
+The overlay's 1.5-second check runs only while a dimming overlay is visible,
+and unchanged schedule ticks do not queue tooltip updates.
+
+The tray icon's tooltip shows where the
 schedule currently is: **State: Daytime** or **State: Night** on the two
 plateaus, **State: Daytime → Night** while dusk is dimming the monitors and
 **State: Night → Daytime** while dawn is brightening them, and a **Schedule**
