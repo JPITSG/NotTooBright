@@ -312,13 +312,27 @@ enum { PBT_APMRESUMEAUTOMATIC=200, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE,
     DBT_DEVNODES_CHANGED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK };
 ''' + defines("ID_TIMER_REFRESH_MONITORS", "ID_TIMER_OVERLAY_TOPMOST", "ID_TIMER_PERSIST",
               "ID_TIMER_SCHEDULE", "ID_TIMER_DDC_RETRY", "ID_TIMER_AUTO_UPDATE",
-              "ID_TIMER_TOOLTIP", "ID_TIMER_KEY_DEVICES", "SCHEDULE_INTERVAL_MS",
-              "REFRESH_MONITORS_DEBOUNCE_MS", "REFRESH_MONITORS_RESUME_DELAY_MS") + r'''
+              "ID_TIMER_TOOLTIP", "ID_TIMER_KEY_DEVICES", "ID_TIMER_PANEL", "SCHEDULE_INTERVAL_MS",
+              "REFRESH_MONITORS_DEBOUNCE_MS", "REFRESH_MONITORS_RESUME_DELAY_MS",
+              "PANEL_SETTLE_MS", "PANEL_QUIET_MS") + r'''
 struct { BOOL autoCheckForUpdates; struct { BOOL enabled, hasLocation; } schedule; } g_config;
 struct { BOOL valid; } g_solarCache;
 typedef struct { int PowerSetting; DWORD DataLength; DWORD Data[1]; } POWERBROADCAST_SETTING;
-const int kGuidConsoleDisplayState = 1;
-LONG g_lastDisplayState = -1;
+const int kGuidConsoleDisplayState = 1, kGuidAcDcPowerSource = 2, kGuidPowerSavingStatus = 3,
+    kGuidEnergySaverStatus = 4;
+LONG g_lastDisplayState = -1, g_lastPowerSource = -1, g_lastBatterySaver = -1, g_lastEnergySaver = -1;
+int quietTransitions, holdTransitions, panelServices, powerConditions;
+UINT lastTransitionMs;
+LONG* lastCondition;
+LONG lastConditionValue;
+void NotePanelTransition(BOOL quiet, DWORD ms) {
+    if (quiet) quietTransitions++; else holdTransitions++;
+    lastTransitionMs = ms;
+}
+void NotePowerCondition(LONG* last, LONG value, const wchar_t* what) {
+    (void)what; powerConditions++; lastCondition = last; lastConditionValue = value;
+}
+void ServicePanels(void) { panelServices++; }
 BOOL g_overlayTimerRunning, g_ddcRetryPending;
 HWND g_hwnd = (HWND)1;
 int evaluations, refreshes, keyRestarts, sessionChecks, scheduleTimer, raised;
@@ -368,12 +382,41 @@ int main(void) {
     g_solarCache.valid = TRUE;
     Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
     assert(!g_solarCache.valid && scheduleTimer && refreshes == 2 && keyRestarts == 2);
+    /* After a resume Windows applies its own level to a built-in display. */
+    assert(quietTransitions == 2 && lastTransitionMs == PANEL_QUIET_MS);
     POWERBROADCAST_SETTING power = {1, sizeof(DWORD), {0}};
     Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&power);
     assert(scheduleTimer && refreshes == 2);
+    /* The first display state only tells the current one. */
+    assert(quietTransitions == 2 && holdTransitions == 0);
     power.Data[0] = 1;
     Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&power);
     assert(scheduleTimer && refreshes == 3);
+    /* Switched back on: a level of Windows' own. */
+    assert(quietTransitions == 3 && lastTransitionMs == PANEL_QUIET_MS);
+    /* Dimmed and undimmed: Windows restores the previous level, and a key
+     * pressed to wake the display is the user's, so no quiet period. */
+    power.Data[0] = 2;
+    Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&power);
+    assert(quietTransitions == 3 && holdTransitions == 1 && refreshes == 3);
+    power.Data[0] = 1;
+    Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&power);
+    assert(quietTransitions == 3 && holdTransitions == 2 && lastTransitionMs == PANEL_SETTLE_MS);
+    assert(refreshes == 3 && g_lastDisplayState == 1);
+    /* Power source and saver modes go to their own trackers. */
+    POWERBROADCAST_SETTING source = {2, sizeof(DWORD), {1}};
+    Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&source);
+    assert(powerConditions == 1 && lastCondition == &g_lastPowerSource && lastConditionValue == 1);
+    source.PowerSetting = 3;
+    Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&source);
+    assert(powerConditions == 2 && lastCondition == &g_lastBatterySaver);
+    source.PowerSetting = 4;
+    Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, (LPARAM)&source);
+    assert(powerConditions == 3 && lastCondition == &g_lastEnergySaver && g_lastDisplayState == 1);
+    Dispatch(g_hwnd, WM_DISPLAYCHANGE, 0, 0);
+    assert(quietTransitions == 4 && refreshes == 4);
+    Dispatch(g_hwnd, WM_TIMER, ID_TIMER_PANEL, 0);
+    assert(panelServices == 1);
     Dispatch(g_hwnd, WM_TIMER, ID_TIMER_SCHEDULE, 0);
     assert(evaluations == 123);
     /* A queued overlay timer cannot do work after it was disabled. */

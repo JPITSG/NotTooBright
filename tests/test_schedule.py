@@ -52,13 +52,16 @@ class ScheduleTests(unittest.TestCase):
 #define DDC_MAX_CONSECUTIVE_FAILURES 3
 #define HW_AVAILABLE 1
 #define HW_UNAVAILABLE 2
+#define PANEL_ECHO_MS 1500
 typedef int BOOL;
 typedef unsigned long DWORD;
-typedef struct { int hidden, failures, lastHwSent, hardwareState;
-    DWORD ddcMax, ddcMin, ddcCurrent; wchar_t error[200]; } Monitor;
+typedef unsigned long long ULONGLONG;
+typedef struct { int hidden, failures, lastHwSent, hardwareState, builtin;
+    DWORD ddcMax, ddcMin, ddcCurrent; ULONGLONG panelEchoUntil; wchar_t error[200]; } Monitor;
 Monitor monitor;
 int retries;
 BOOL g_remoteSession;
+ULONGLONG GetTickCount64(void) { return 7000; }
 Monitor* FindMonitorByUid(int uid) { (void)uid; return &monitor; }
 void PushMonitorsToDialog(void) {}
 void ScheduleDdcRetry(void) { retries++; }
@@ -77,9 +80,16 @@ int main(void) {
     assert(retries == 3 && monitor.hardwareState == HW_UNAVAILABLE);
     HandleDdcSetResult(1, 1);
     assert(retries == 3 && monitor.failures == 0);
+    assert(monitor.panelEchoUntil == 0);   /* DDC/CI writes have no echo */
+    /* Windows reports the level a write to a built-in display set; that
+     * report must count as the write's echo, even after a failure. */
+    monitor.builtin = 1;
+    HandleDdcSetResult(1, 1);
+    assert(monitor.panelEchoUntil == 7000 + PANEL_ECHO_MS);
     monitor.hidden = 1;
+    monitor.panelEchoUntil = 0;
     HandleDdcSetResult(1, 0);
-    assert(retries == 3);
+    assert(retries == 3 && monitor.panelEchoUntil == 7000 + PANEL_ECHO_MS);
 }
 ''')
 
@@ -541,6 +551,8 @@ typedef unsigned long long ULONGLONG;
 typedef void *HMONITOR, *HWND;
 typedef intptr_t LPARAM;
 typedef int HardwareState;
+typedef unsigned char BYTE;
+#define PANEL_MAX_LEVELS 101
 typedef struct { long left, top, right, bottom; } RECT;
 typedef struct { RECT rcMonitor; DWORD dwFlags; wchar_t szDevice[32]; } MONITORINFOEXW;
 ''' + structure("Monitor") + structure("DdcProbeEntry") + structure("EnumEntry") + structure("EnumContext") + r'''
@@ -634,11 +646,11 @@ int main(void) {
 #define DebugPrint(...) ((void)0)
 typedef int BOOL;
 typedef unsigned long long ULONGLONG;
-typedef struct { int hidden, value, mode; } Monitor;
+typedef struct { int hidden, value, mode, builtin; } Monitor;
 struct { BOOL brightnessKeys; } g_config = { TRUE };
 BOOL g_remoteSession;
-Monitor g_monitors[3];
-int g_monitorCount = 3, manual, pushes;
+Monitor g_monitors[4];
+int g_monitorCount = 4, manual, pushes;
 int MonitorMode(const Monitor* m) { return m->mode; }
 void SetMonitorValue(Monitor* m, int value) { m->value = value < 0 ? 0 : value > 100 ? 100 : value; }
 void NoteManualChange(Monitor* m) { (void)m; manual++; }
@@ -662,9 +674,11 @@ int main(void) {
     g_monitors[0] = (Monitor){0, 50, MODE_HARDWARE};
     g_monitors[1] = (Monitor){0, 95, MODE_HARDWARE};
     g_monitors[2] = (Monitor){1, 50, MODE_HARDWARE};   /* hidden */
+    /* A built-in display: Windows moves it for the same key press. */
+    g_monitors[3] = (Monitor){0, 40, MODE_HARDWARE, 1};
     ApplyBrightnessKey(+1);
     assert(g_monitors[0].value == 60 && g_monitors[1].value == 100 && g_monitors[2].value == 50);
-    assert(manual == 2 && pushes == 1);
+    assert(g_monitors[3].value == 40 && manual == 2 && pushes == 1);
     /* Clamped at the top: nothing changes, nothing pushed, still a manual change. */
     g_monitors[0].value = 100;
     ApplyBrightnessKey(+1);
@@ -681,7 +695,7 @@ int main(void) {
     g_remoteSession = FALSE;
     g_config.brightnessKeys = FALSE;
     ApplyBrightnessKey(-1);
-    assert(g_monitors[0].value == 80 && pushes == 3);
+    assert(g_monitors[0].value == 80 && pushes == 3 && g_monitors[3].value == 40);
 }
 ''')
 
@@ -766,6 +780,8 @@ typedef unsigned long long ULONGLONG;
 typedef void *HMONITOR, *HWND;
 typedef intptr_t LPARAM;
 typedef int HardwareState;
+typedef unsigned char BYTE;
+#define PANEL_MAX_LEVELS 101
 typedef struct { long left, top, right, bottom; } RECT;
 typedef struct { RECT rcMonitor; DWORD dwFlags; wchar_t szDevice[32]; } MONITORINFOEXW;
 ''' + structure("Monitor") + structure("DdcProbeEntry") + structure("EnumEntry") + structure("EnumContext") + r'''
@@ -788,8 +804,11 @@ BOOL GetNumberOfPhysicalMonitorsFromHMONITOR(HMONITOR h,DWORD* count) {
     (void)h; *count=1; return TRUE;
 }
 void wcscpy_s(wchar_t* out,size_t count,const wchar_t* in) { (void)count; wcscpy(out,in); }
+wchar_t instance[160] = L"DISPLAY\\ABC1234\\4&1&0&UID1";
+DdcProbeEntry lastProbe[MAX_MONITORS];
+int lastProbeCount;
 void ResolveMonitorIdentity(const wchar_t* device,int index,Monitor* m) {
-    (void)device; (void)index; wcscpy(m->key,L"monitor");
+    (void)device; (void)index; wcscpy(m->key,L"monitor"); wcscpy(m->instancePath, instance);
 }
 void SanitizeKeyChars(wchar_t* key) { (void)key; }
 void DestroyWindow(HWND hwnd) { (void)hwnd; }
@@ -802,7 +821,9 @@ Monitor* FindMonitorByUid(int uid) {
     for (int i=0;i<g_monitorCount;i++) if(g_monitors[i].uid==uid)return &g_monitors[i];
     return NULL;
 }
-void DdcRequestProbe(const DdcProbeEntry* entries,int count) { (void)entries; (void)count; }
+void DdcRequestProbe(const DdcProbeEntry* entries,int count) {
+    memcpy(lastProbe, entries, sizeof(DdcProbeEntry) * (size_t)count); lastProbeCount = count;
+}
 void PushMonitorsToDialog(void) {}
 void UpdateRemoteSessionState(void) {}
 BOOL g_remoteSession;
@@ -822,6 +843,21 @@ int main(void) {
     RefreshMonitors(); /* Existing whole-record merge must still survive. */
     assert(saves==2 && g_monitors[0].uid==uid);
     assert(g_monitors[0].value==40 && g_monitors[0].scheduled);
+    /* Windows is asked about a display until it has answered for it... */
+    assert(lastProbeCount==1 && lastProbe[0].checkPanel && !lastProbe[0].builtin);
+    assert(wcscmp(lastProbe[0].instancePath, instance)==0);
+    g_monitors[0].panelChecked=TRUE;
+    RefreshMonitors();
+    assert(!lastProbe[0].checkPanel && g_monitors[0].panelChecked);
+    /* ...and every time for a built-in display, whose probe state and
+     * levels survive while its device path follows the enumeration. */
+    g_monitors[0].builtin=TRUE;
+    g_monitors[0].panelLevelCount=11;
+    wcscpy(instance, L"DISPLAY\\ABC1234\\4&1&0&UID2");
+    RefreshMonitors();
+    assert(lastProbe[0].checkPanel && lastProbe[0].builtin && g_monitors[0].builtin);
+    assert(g_monitors[0].panelLevelCount==11 && wcscmp(g_monitors[0].instancePath, instance)==0);
+    assert(wcscmp(lastProbe[0].instancePath, instance)==0);
 }
 ''')
 

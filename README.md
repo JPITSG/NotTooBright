@@ -1,11 +1,12 @@
 # Not Too Bright
 
-**Dim your desktop monitors from the system tray — no more hunting for buttons on the back of the screen.**
+**Dim every screen from the system tray — no more hunting for buttons on the back of the monitor.**
 
 Laptops get brightness keys. Desktop monitors get a five-button menu and a
 Windows that pretends the backlight does not exist. Not Too Bright is a tiny,
 single-file Windows tray app that fixes that: real backlight control over
-DDC/CI where the monitor allows it, a software dimming fallback everywhere
+DDC/CI where the monitor allows it, a laptop's built-in display through
+Windows' own brightness control, a software dimming fallback everywhere
 else, and an optional schedule that follows the sun for your location.
 
 ![Not Too Bright configuration dialog](assets/screenshot.png)
@@ -13,6 +14,7 @@ else, and an optional schedule that follows the sun for your location.
 ## Highlights
 
 - **Real backlight control** - Talks DDC/CI to the monitor, the same channel its own menu uses, so dimming keeps full contrast and saves power
+- **Laptop screens too** - A built-in display is driven through Windows' own brightness control, the one its brightness keys use; changes made with the keys or in Windows show up in the app
 - **Works on anything** - Monitors without DDC/CI (docks, KVMs, virtual displays, remote sessions) get a click-through software overlay instead
 - **One slider per monitor** - Plus *All monitors*; changes apply live while you drag and are remembered per monitor
 - **Follows the sun** - Optional day/night levels with smooth dawn and dusk transitions computed for your latitude and longitude, shown on an editable graph
@@ -20,7 +22,7 @@ else, and an optional schedule that follows the sun for your location.
 - **Below the minimum** - Optionally continue below 0% on hardware monitors by adding software dimming on top of the lowest backlight setting
 - **Hide what you do not want touched** - Remove a monitor from the app entirely until the next rescan; its original brightness is restored first
 - **Never black, never in screenshots** - Software dimming stops at 10% and its overlay is excluded from screen capture and screen sharing
-- **Zero install** - One 560 KB executable, no runtime to install, settings in your user registry, nothing written next to the exe
+- **Zero install** - One 620 KB executable, no runtime to install, settings in your user registry, nothing written next to the exe
 - **Self update** - Checks this repository for a newer build, shows both version numbers, and replaces itself in place after a standard UAC prompt; automatic checks can be turned off
 - **Survives everything** - Settings follow the monitor (by EDID) and are re-applied after sleep, after displays are switched back on, and after display changes
 
@@ -52,6 +54,11 @@ dimmer, with no loss of contrast. All DDC/CI traffic runs on a background
 thread with retries, because a single command can take a while and some
 monitors are slow or flaky. If a driver refuses the raw VCP request but
 accepts the high-level Monitor Configuration API, that route is used instead.
+
+A laptop's built-in display has no DDC/CI. Windows controls its backlight
+itself, and Not Too Bright uses that same control (WMI, see
+[Built-in Displays](#built-in-displays)); such a display is recognised and
+set up before any DDC/CI traffic starts.
 
 When a monitor does not answer (DDC/CI disabled in its on-screen menu, some
 docks, KVMs, USB-C hubs, DisplayLink adapters, virtual machines, remote
@@ -85,6 +92,36 @@ time a monitor is seen its current hardware brightness is adopted as is, so
 nothing changes until you move the slider, and that original value is
 recorded for good: hiding the monitor later restores it before the
 application lets go of the monitor.
+
+## Built-in Displays
+
+A laptop's own screen, or any display whose brightness Windows controls
+itself, shows up with a **Hardware (built-in)** badge. Not Too Bright sets
+its brightness through Windows' brightness control (WMI:
+`WmiMonitorBrightness` and `WmiSetBrightness`), the same control the
+brightness keys, the quick settings slider and Settings use, so the
+backlight really changes, in the steps the panel supports. Everything else
+works as for any other monitor: the slider, **All monitors**, the schedule,
+the tray menu, **Hide** (which puts back the level the display had when it
+was first seen), and dimming below the minimum.
+
+Windows keeps its own ways of changing that brightness, and Not Too Bright
+follows them as they happen:
+
+- A change you make in Windows - the laptop's brightness keys, the quick
+  settings slider, Settings - shows up on the display's card and in the
+  tray tooltip, is remembered, and counts as a manual change, so it pauses
+  the schedule like moving the slider would.
+- When Windows dims the display after a period of inactivity, or switches
+  it off, nothing is written to it; a level the schedule reaches meanwhile
+  is applied once the display is on again.
+- Windows applies a level of its own after sleep, when the display comes
+  back on, when you plug in or unplug the charger, and when battery saver
+  turns on or off. The level set in Not Too Bright replaces it a few
+  seconds later.
+
+With debug logging on, everything about built-in displays is logged under
+`[PANEL]`: what Windows reports, each change, and how it was taken.
 
 ## Automatic Brightness
 
@@ -137,10 +174,12 @@ value to its own range.
 Many keyboards have Brightness Up and Brightness Down keys. Windows reacts
 to them by showing its brightness flyout, but only a laptop's built-in
 panel actually changes; external monitors are ignored. With **Use the
-keyboard's brightness keys** enabled, each press moves every listed monitor
-by 10% from its own value, whatever window is focused, and counts as a
-manual change for the schedule. Holding a key repeats on keyboards that
-send repeated reports. Windows keeps showing its flyout.
+keyboard's brightness keys** enabled, each press moves every listed external
+monitor by 10% from its own value, whatever window is focused, and counts as
+a manual change for the schedule. Holding a key repeats on keyboards that
+send repeated reports. Windows keeps showing its flyout and keeps moving a
+built-in display itself; Not Too Bright picks that change up (see
+[Built-in Displays](#built-in-displays)).
 
 The keys are not ordinary key codes but usages on the keyboard's HID
 consumer-control collection, so Not Too Bright opens that collection
@@ -214,8 +253,8 @@ brightness section applies immediately; the settings below it are saved with
 | Control | Description |
 |---------|-------------|
 | All monitors | Sets every monitor to the same value (shown only with more than one monitor). |
-| Per-monitor slider | The brightness of that monitor. The badge shows how it is controlled: **Hardware (DDC/CI)**, **Software (no DDC/CI)**, **Software (chosen)**, or **DDC/CI not answering**. |
-| Software dimming only | Shown for monitors that have answered DDC/CI. Uses the overlay instead of DDC/CI and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values, or that have stopped answering. |
+| Per-monitor slider | The brightness of that monitor. The badge shows how it is controlled: **Hardware (DDC/CI)**, **Hardware (built-in)** (Windows' own brightness control of a laptop display), **Software (no DDC/CI)**, **Software (chosen)**, **DDC/CI not answering**, or **Built-in not answering**. |
+| Software dimming only | Shown for monitors that have answered DDC/CI or Windows' brightness control. Uses the overlay instead and leaves the monitor's own brightness setting untouched. Useful for monitors that answer DDC/CI but ignore or mangle the values, or that have stopped answering. |
 | Hide | Puts the monitor back to the brightness it had when Not Too Bright first saw it, then removes it from the list and stops controlling it entirely, as if it were not connected: its dimming overlay is removed, it is no longer probed, and no further brightness changes are sent. The last monitor in the list cannot be hidden. Hidden monitors stay hidden across restarts and display changes until you choose **Rescan**. |
 | Rescan | Re-detects monitors, probes DDC/CI again (for example after enabling DDC/CI in a monitor's menu), and shows every hidden monitor again. |
 | Allow dimming below the hardware minimum | Extends hardware-controlled sliders below 0% into software dimming (down to -90%). Applies immediately. Disabled by default. |
@@ -227,11 +266,11 @@ brightness section applies immediately; the settings below it are saved with
 | Cycle reset time | Time of day at which a schedule paused by a manual change takes over again. 04:00 by default. |
 | Tray menu brightness control | Chooses what the tray menu's **Increase brightness** and **Decrease brightness** items act on: **None** (the items are not shown; the default), **All monitors**, or one specific monitor. Each click moves the target by 10% from its current value; that counts as a manual change for scheduled monitors. Saved with **Save**. |
 | Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
-| Use the keyboard's brightness keys | The keyboard's Brightness Up/Down keys step every monitor by 10%; see [Keyboard Brightness Keys](#keyboard-brightness-keys). Saved with **Save**. Disabled by default. |
+| Use the keyboard's brightness keys | The keyboard's Brightness Up/Down keys step every external monitor by 10%; see [Keyboard Brightness Keys](#keyboard-brightness-keys). Saved with **Save**. Disabled by default. |
 | Pause while connected through Remote Desktop | Leaves the monitors alone while the session is viewed remotely; see [Remote Desktop](#remote-desktop). Saved with **Save**. Enabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Update (button) | Checks the repository for a newer build right now and shows the result; see [Updates](#updates). |
-| Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
+| Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), each call to Windows' brightness control for a built-in display and every level Windows reports for it, mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
 
 The footer displays the application version.
 
@@ -261,8 +300,10 @@ its factory state.
 - DDC/CI must be enabled in the monitor's menu and pass through whatever
   sits between the computer and the monitor; many docks and KVM switches do
   not forward it.
-- Laptop built-in panels are controlled by Windows itself; this application
-  is for external monitors.
+- On a built-in display, Windows' adaptive brightness (*Change brightness
+  automatically when lighting changes*) keeps adjusting the level, and each
+  of its adjustments counts as a manual change that pauses the schedule.
+  Turn it off if the schedule should control that display.
 - Started inside a Remote Desktop session, the application knows no
   monitors until the session is back at the console; the dialog says so.
 

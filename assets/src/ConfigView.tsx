@@ -99,10 +99,10 @@ function ModeBadge({ monitor }: { monitor: MonitorData }) {
   let text = "Detecting…";
   let className = "border-neutral-200 bg-neutral-50 text-neutral-500";
   if (monitor.mode === "hardware") {
-    text = "Hardware (DDC/CI)";
+    text = monitor.builtin ? "Hardware (built-in)" : "Hardware (DDC/CI)";
     className = "border-emerald-200 bg-emerald-50 text-emerald-700";
   } else if (monitor.mode === "waiting") {
-    text = "DDC/CI not answering";
+    text = monitor.builtin ? "Built-in not answering" : "DDC/CI not answering";
     className = "border-amber-200 bg-amber-50 text-amber-700";
   } else if (monitor.mode === "software") {
     text = monitor.forceSoftware
@@ -244,10 +244,12 @@ function MonitorCard({
       )}
       {monitor.mode === "waiting" && (
         <p className="text-[11px] leading-snug text-neutral-500">
-          This monitor answered DDC/CI before but is not responding now. Its
-          backlight is left exactly as it is and it is retried automatically;
-          the slider applies once it answers. To dim it in software in the
-          meantime, tick Software dimming only.
+          {monitor.builtin
+            ? "Windows' brightness control for this built-in display is not responding now."
+            : "This monitor answered DDC/CI before but is not responding now."}{" "}
+          Its backlight is left exactly as it is and it is retried
+          automatically; the slider applies once it answers. To dim it in
+          software in the meantime, tick Software dimming only.
         </p>
       )}
       {scheduleEnabled && monitor.scheduled && monitor.pausedUntil && (
@@ -724,10 +726,10 @@ export default function ConfigView({
             Use the keyboard's brightness keys
           </Label>
           <p className="text-neutral-500 text-[11px] leading-snug">
-            The Brightness Up and Brightness Down keys change every monitor by
-            10% per press, whatever window is focused, and count as a manual
-            change for the schedule. Windows keeps showing its own brightness
-            indicator, which only affects a built-in display.
+            The Brightness Up and Brightness Down keys change every external
+            monitor by 10% per press, whatever window is focused, and count as
+            a manual change for the schedule. Windows keeps showing its own
+            brightness indicator and moves a built-in display itself.
           </p>
         </div>
       </div>
@@ -781,7 +783,7 @@ export default function ConfigView({
             Enable debug logging
           </Label>
           <p className="text-neutral-500 text-[11px] leading-snug">
-            Writes monitor detection and DDC/CI results to{" "}
+            Writes monitor detection, DDC/CI and built-in display results to{" "}
             %LOCALAPPDATA%\NotTooBright\debug.log. Useful when reporting
             issues; leave off for normal use.
           </p>

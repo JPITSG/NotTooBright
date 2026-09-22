@@ -1,7 +1,7 @@
 export type HardwareState = "probing" | "available" | "unavailable";
-// "waiting": a monitor that has answered DDC/CI before is not responding;
-// it is left alone (no software dimming on top of its backlight) and
-// retried automatically.
+// "waiting": a monitor that has answered DDC/CI (or Windows' brightness
+// control) before is not responding; it is left alone (no software dimming
+// on top of its backlight) and retried automatically.
 export type BrightnessMode = "probing" | "hardware" | "software" | "waiting";
 
 export interface MonitorData {
@@ -13,8 +13,12 @@ export interface MonitorData {
   height: number;
   primary: boolean;
   hardware: HardwareState;
+  // A built-in display (a laptop's own panel): its hardware control is
+  // Windows' own brightness control rather than DDC/CI.
+  builtin: boolean;
   mode: BrightnessMode;
-  // Has answered DDC/CI at some point (remembered across restarts).
+  // Has answered DDC/CI or Windows' brightness control at some point
+  // (remembered across restarts).
   knownHardware: boolean;
   forceSoftware: boolean;
   // Removed from the dialog and left alone until the next rescan.
@@ -54,7 +58,8 @@ export interface ConfigData {
   // Desktop (the default); remoteSession says whether that is the case now.
   pauseInRemoteSession: boolean;
   remoteSession: boolean;
-  // The keyboard's Brightness Up/Down keys step every monitor by 10%.
+  // The keyboard's Brightness Up/Down keys step every monitor by 10%
+  // (built-in displays are left to Windows, which moves them itself).
   brightnessKeys: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;

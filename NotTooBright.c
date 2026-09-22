@@ -1,14 +1,18 @@
 /*
  * NotTooBright - NotTooBright.c
  *
- * System tray utility for lowering the brightness of desktop monitors from
- * software, for displays that offer no native Windows brightness control.
+ * System tray utility for controlling the brightness of every display from
+ * one place: desktop monitors that offer no native Windows brightness
+ * control, and a laptop's built-in panel.
  *
  * How brightness is controlled:
+ *   - Built-in displays (a laptop's own panel): Windows' own brightness
+ *     control through WMI, the same one the brightness keys and the Settings
+ *     slider use. Changes made in Windows are picked up as they happen.
  *   - Hardware first: DDC/CI through the Windows Monitor Configuration API
  *     (dxva2), which drives the monitor's own backlight exactly like its
- *     on-screen menu. All DDC/CI traffic runs on a worker thread because a
- *     single command can block for hundreds of milliseconds.
+ *     on-screen menu. All DDC/CI and WMI traffic runs on a worker thread
+ *     because a single command can block for hundreds of milliseconds.
  *   - Software fallback: a click-through, per-monitor black overlay window
  *     with adjustable alpha, used for monitors that do not answer DDC/CI,
  *     when the user asks for it, or to dim below the backlight's minimum.
@@ -35,6 +39,8 @@
 
 #include <windows.h>
 #include <objbase.h>
+#include <oleauto.h>
+#include <wbemidl.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -80,10 +86,11 @@
 #define REG_VALUE_MON_BRIGHTNESS L"Brightness"
 #define REG_VALUE_MON_SOFTWARE_ONLY L"SoftwareOnly"
 #define REG_VALUE_MON_HIDDEN L"Hidden"
-/* Set once a monitor has answered DDC/CI; such a monitor is never dimmed in
- * software behind the user's back (its backlight may sit below 100%). */
+/* Set once a monitor has answered DDC/CI (or, for a built-in display,
+ * Windows' brightness control); such a monitor is never dimmed in software
+ * behind the user's back (its backlight may sit below 100%). */
 #define REG_VALUE_MON_HARDWARE L"HardwareControl"
-/* The DDC/CI value the monitor reported the very first time it was seen,
+/* The hardware value the monitor reported the very first time it was seen,
  * before anything was written to it; restored when the monitor is hidden. */
 #define REG_VALUE_MON_ORIGINAL L"OriginalBrightness"
 #define REG_VALUE_MON_ORIGINAL_MAX L"OriginalBrightnessMax"
@@ -126,6 +133,7 @@
 #define WM_APP_UPDATE_RESULT (WM_APP + 4)
 #define WM_APP_UPDATE_PROGRESS (WM_APP + 5)
 #define WM_APP_BRIGHTNESS_KEY (WM_APP + 6)   /* wParam: +1 up / -1 down, from a reader thread */
+#define WM_APP_PANEL_BRIGHTNESS (WM_APP + 7) /* lParam: PanelBrightnessEvent* (receiver frees) */
 #define ID_TRAY_MENU_CONFIGURE 1
 #define ID_TRAY_MENU_EXIT 2
 #define ID_TRAY_MENU_BRIGHTER 3
@@ -205,6 +213,28 @@
  * failure (a flaky first probe must not lock it into software mode); one
  * that has answered before is retried for as long as it takes. */
 #define DDC_UNKNOWN_MONITOR_RETRIES 3
+
+/* Built-in displays (see "Built-in displays" below). A level Windows
+ * reports for one is looked at PANEL_SETTLE_MS after it arrives, so that
+ * the result of our own write, or the power notification behind the
+ * change, has come in first; the timer only runs while something waits. */
+#define ID_TIMER_PANEL 10
+#define PANEL_SETTLE_MS 1500
+/* A level reported this soon after our own write is that write's echo. */
+#define PANEL_ECHO_MS 1500
+/* Windows applies a level of its own to a built-in display after a resume,
+ * a display switched back on, a display change, or a power source or
+ * battery saver change; what it reports this soon after one of those is
+ * not the user's doing. */
+#define PANEL_QUIET_MS 5000
+/* How long one WMI call may take before it counts as failed. */
+#define PANEL_WMI_TIMEOUT_MS 5000
+/* Delay before listening again after WMI dropped the change notifications. */
+#define PANEL_EVENTS_RETRY_MIN_MS 5000
+#define PANEL_EVENTS_RETRY_MAX_MS (5 * 60 * 1000)
+#define PANEL_MAX_LEVELS 101
+#define PANEL_NAME_CHARS 200
+#define PANEL_PATH_CHARS 256
 
 /* The schedule is evaluated on this timer while enabled; values only
  * change by whole percents, so this is plenty for a slow transition. */
@@ -515,15 +545,15 @@ typedef enum {
 
 typedef enum {
     HW_UNKNOWN = 0,   /* probe in flight */
-    HW_AVAILABLE,     /* monitor answers VCP 0x10 */
-    HW_UNAVAILABLE    /* no DDC/CI brightness: software dimming only */
+    HW_AVAILABLE,     /* monitor answers VCP 0x10, or Windows controls its brightness */
+    HW_UNAVAILABLE    /* no hardware brightness: software dimming only */
 } HardwareState;
 
 typedef enum {
     MODE_PROBING = 0,
     MODE_HARDWARE,
     MODE_SOFTWARE,
-    MODE_WAITING      /* known DDC/CI monitor not answering: left alone, retried */
+    MODE_WAITING      /* known hardware monitor not answering: left alone, retried */
 } BrightnessMode;
 
 /* One entry per physical monitor. A display (HMONITOR) normally has exactly
@@ -538,22 +568,32 @@ typedef struct {
     RECT rect;
     BOOL primary;
     HardwareState hardwareState;
-    BOOL knownHardware;           /* has answered DDC/CI at some point (persisted) */
+    BOOL knownHardware;           /* has answered DDC/CI or WMI at some point (persisted) */
     int probeFailures;            /* consecutive failed probes in this outage */
-    DWORD ddcMax;
+    DWORD ddcMax;                 /* 100 for a built-in display (percent) */
     DWORD ddcMin;                 /* non-zero only on the high-level route */
     DWORD ddcCurrent;
     BOOL ddcHighLevel;            /* GetMonitorBrightness/SetMonitorBrightness route */
+    BOOL builtin;                 /* built-in display: brightness through Windows (WMI), not DDC/CI */
+    BOOL panelChecked;            /* Windows answered that it does not control this display */
+    wchar_t instancePath[160];    /* DISPLAY\<PnP id>\<instance>, how WMI names the display */
+    BYTE panelLevels[PANEL_MAX_LEVELS]; /* levels a built-in display supports, in percent */
+    int panelLevelCount;
+    ULONGLONG panelEchoUntil;     /* levels reported before this tick echo our own writes */
+    BOOL panelReportPending;      /* a level reported by Windows waits for PANEL_SETTLE_MS */
+    int panelReport;
+    ULONGLONG panelReportTick;
+    BOOL panelReapply;            /* not at our level through no action of the user: put it back */
     BOOL forceSoftware;           /* user asked for software dimming only */
     BOOL hidden;                  /* removed from the dialog and left alone until a rescan */
-    BOOL hasOriginal;             /* original DDC/CI value recorded */
+    BOOL hasOriginal;             /* original hardware value recorded */
     DWORD originalRaw;            /* raw VCP value at first sighting */
     DWORD originalMax;            /* its maximum, for display as a percent */
     BOOL scheduled;               /* follows the automatic brightness schedule */
     int value;                    /* desired brightness, -SOFT_MAX_DIM..100 */
     BOOL hasValue;
     int lastHwSent;               /* last percent handed to the worker, -1 = none */
-    int failures;                 /* consecutive failed DDC/CI writes */
+    int failures;                 /* consecutive failed hardware writes */
     HWND overlay;                 /* software dimming window, first entry only */
     int overlayDim;               /* current overlay dim 0..SOFT_MAX_DIM */
     BOOL dirty;                   /* needs persisting */
@@ -562,12 +602,17 @@ typedef struct {
 
 /* Main-to-worker probe request: which physical monitors to open and query.
  * patient: the monitor has answered before, so it is worth the long retry
- * sequence including a handle reopen. */
+ * sequence including a handle reopen. checkPanel: ask Windows (WMI) whether
+ * it controls this display's brightness; builtin: it did last time, so
+ * DDC/CI is not tried if WMI does not answer now. */
 typedef struct {
     int uid;
     HMONITOR hmon;
     int physicalIndex;
     BOOL patient;
+    BOOL checkPanel;
+    BOOL builtin;
+    wchar_t instancePath[160];
 } DdcProbeEntry;
 
 /* Main-to-worker brightness request; one slot per monitor so a burst of
@@ -580,17 +625,30 @@ typedef struct {
 } DdcSetSlot;
 
 /* Worker-to-main probe result. highLevel: the raw VCP read failed but the
- * high-level GetMonitorBrightness/SetMonitorBrightness route works. */
+ * high-level GetMonitorBrightness/SetMonitorBrightness route works.
+ * builtin: a built-in display, controlled through Windows (WMI), with the
+ * levels it supports; current and max are then percent. panelChecked:
+ * Windows answered and does not control this display. */
 typedef struct {
     int uid;
     BOOL supported;
     BOOL highLevel;
+    BOOL builtin;
+    BOOL panelChecked;
     DWORD min;
     DWORD current;
     DWORD max;
     DWORD error;
     DWORD elapsedMs;
+    BYTE levels[PANEL_MAX_LEVELS];
+    int levelCount;
 } DdcProbeResult;
+
+/* Change-notification-to-main: Windows reports a built-in display's level. */
+typedef struct {
+    wchar_t instanceName[PANEL_NAME_CHARS];
+    int brightness;
+} PanelBrightnessEvent;
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 
@@ -614,6 +672,20 @@ static BOOL g_overlayTimerRunning = FALSE;
 static SolarCache g_solarCache;
 static int g_loggedSchedulePhase = -1;      /* last SchedulePhase written to the log */
 static BOOL g_remoteSession = FALSE;        /* paused: the session is viewed through Remote Desktop */
+
+/* Built-in displays: the change listener and the power notifications that
+ * explain Windows' own adjustments, started with the first such display. */
+static BOOL g_panelWatchStarted = FALSE;
+static HANDLE g_panelEventThread = NULL;
+static HANDLE g_panelEventStop = NULL;      /* manual-reset: the listener should exit */
+static HPOWERNOTIFY g_powerSourceNotify = NULL;
+static HPOWERNOTIFY g_batterySaverNotify = NULL;
+static HPOWERNOTIFY g_energySaverNotify = NULL;
+static LONG g_lastPowerSource = -1;
+static LONG g_lastBatterySaver = -1;
+static LONG g_lastEnergySaver = -1;
+static ULONGLONG g_panelQuietUntil = 0;     /* tick: reports before it are Windows' own adjustments */
+static ULONGLONG g_panelHoldUntil = 0;      /* tick: our level is not put back before it */
 
 /* One open consumer-control collection with its reader thread. */
 typedef struct {
@@ -667,6 +739,20 @@ static WCHAR g_extractedDllPath[MAX_PATH] = {0};
 /* GUID_CONSOLE_DISPLAY_STATE, declared locally so no GUID library is needed. */
 static const GUID kGuidConsoleDisplayState =
     { 0x6fe69556, 0x704a, 0x47a0, { 0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47 } };
+/* GUID_ACDC_POWER_SOURCE, GUID_POWER_SAVING_STATUS (battery saver) and
+ * GUID_ENERGY_SAVER_STATUS (Windows 11): Windows applies its own level to a
+ * built-in display when these change. */
+static const GUID kGuidAcDcPowerSource =
+    { 0x5d3e9a59, 0xe9d5, 0x4b00, { 0xa6, 0xbd, 0xff, 0x34, 0xff, 0x51, 0x65, 0x48 } };
+static const GUID kGuidPowerSavingStatus =
+    { 0xe00958c0, 0xc213, 0x4ace, { 0xac, 0x77, 0xfe, 0xcc, 0xed, 0x2e, 0xee, 0xa5 } };
+static const GUID kGuidEnergySaverStatus =
+    { 0x550e8400, 0xe29b, 0x41d4, { 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00 } };
+/* CLSID_WbemLocator and IID_IWbemLocator, for the same reason. */
+static const CLSID kClsidWbemLocator =
+    { 0x4590f811, 0x1d3a, 0x11d0, { 0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 } };
+static const IID kIidWbemLocator =
+    { 0xdc12a687, 0x737f, 0x11cf, { 0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24 } };
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 
@@ -694,6 +780,8 @@ static int VisibleMonitorCount(void);
 static void UnhideAllMonitors(void);
 static void DdcRequestSet(int uid, int percent);
 static void DdcRequestProbe(const DdcProbeEntry* entries, int count);
+static void StartPanelWatch(void);
+static void SchedulePanelService(void);
 static BOOL load_webview2_loader(void);
 static void ShowConfigDialog(void);
 static void webview_cfg_execute_script(const wchar_t* script);
@@ -1362,6 +1450,13 @@ static void ResolveMonitorIdentity(const wchar_t* adapterDevice, int physicalInd
             CopyRange(instance, sizeof(instance) / sizeof(wchar_t), h2 + 1, n);
         }
     }
+    /* The monitor's device instance, which is how WMI names a display whose
+     * brightness Windows controls. */
+    m->instancePath[0] = L'\0';
+    if (pnpId[0] && instance[0]) {
+        swprintf_s(m->instancePath, sizeof(m->instancePath) / sizeof(wchar_t),
+                   L"DISPLAY\\%s\\%s", pnpId, instance);
+    }
 
     BYTE edid[512];
     wchar_t edidName[64] = L"", edidSerial[64] = L"";
@@ -1587,12 +1682,382 @@ static void DestroyAllOverlays(void) {
     UpdateOverlayTimer();
 }
 
+/* ── Built-in displays (Windows brightness control over WMI) ─────────────── */
+
+/* A laptop's own panel has no DDC/CI: Windows drives its backlight itself
+ * (the brightness keys, the Settings slider) and offers the same control to
+ * programs through WMI in root\WMI - WmiMonitorBrightness for the level and
+ * the steps the panel supports, WmiMonitorBrightnessMethods.WmiSetBrightness
+ * to set it, and WmiMonitorBrightnessEvent whenever it changes. A display
+ * WMI lists there is driven this way instead of over DDC/CI. Reads and
+ * writes run on the worker thread like all other hardware access; waiting
+ * for change notifications blocks, so that has a thread of its own. The
+ * process never calls CoInitializeSecurity (WebView2 shares it), so every
+ * WMI proxy gets its security set directly. Logged under [PANEL]. */
+
+/* One display as WMI lists it. */
+typedef struct {
+    wchar_t instanceName[PANEL_NAME_CHARS];   /* DISPLAY\<PnP id>\<instance>_0 */
+    wchar_t methodPath[PANEL_PATH_CHARS];     /* its WmiMonitorBrightnessMethods object */
+    int current;                              /* percent */
+    BOOL active;
+    BYTE levels[PANEL_MAX_LEVELS];
+    int levelCount;
+} PanelInfo;
+
+/* The worker's WMI connection: made on first use, dropped after a failure. */
+typedef struct {
+    IWbemServices* services;
+    IWbemClassObject* setParams;              /* WmiSetBrightness input parameters */
+} PanelWmi;
+
+/* WMI names a display after its device instance with a "_0" suffix, for
+ * example DISPLAY\SDC4161\4&2e4de1c1&0&UID265988_0. */
+static BOOL PanelInstanceMatches(const wchar_t* instanceName, const wchar_t* instancePath) {
+    size_t n = wcslen(instancePath);
+    return n > 0 && _wcsnicmp(instanceName, instancePath, n) == 0 && instanceName[n] == L'_';
+}
+
+/* The nearest level the display supports (the value itself while that list
+ * is unknown); a tie goes to the level listed first. */
+static int SnapPanelLevel(const BYTE* levels, int count, int percent) {
+    int best = percent, bestDistance = INT_MAX;
+    for (int i = 0; i < count; i++) {
+        int distance = abs((int)levels[i] - percent);
+        if (distance < bestDistance) {
+            best = levels[i];
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+static void SetWmiProxySecurity(IUnknown* proxy) {
+    CoSetProxyBlanket(proxy, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL,
+                      RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+}
+
+/* root\WMI on this computer, or NULL. */
+static IWbemServices* ConnectWmi(void) {
+    IWbemLocator* locator = NULL;
+    IWbemServices* services = NULL;
+    HRESULT hr = CoCreateInstance(&kClsidWbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                                  &kIidWbemLocator, (void**)&locator);
+    if (SUCCEEDED(hr)) {
+        BSTR ns = SysAllocString(L"ROOT\\WMI");
+        hr = ns ? IWbemLocator_ConnectServer(locator, ns, NULL, NULL, NULL,
+                                             WBEM_FLAG_CONNECT_USE_MAX_WAIT, NULL, NULL, &services)
+                : E_OUTOFMEMORY;
+        SysFreeString(ns);
+        IWbemLocator_Release(locator);
+    }
+    if (FAILED(hr) || !services) {
+        DebugPrint(L"[PANEL] Could not connect to WMI (0x%08lX)\n", (unsigned long)hr);
+        return NULL;
+    }
+    SetWmiProxySecurity((IUnknown*)services);
+    return services;
+}
+
+static void DropPanelWmi(PanelWmi* w) {
+    if (w->setParams) IWbemClassObject_Release(w->setParams);
+    if (w->services) IWbemServices_Release(w->services);
+    w->setParams = NULL;
+    w->services = NULL;
+}
+
+/* A forward-only, semisynchronous WQL query; its results are read with a
+ * timeout (NextWmiObject), so a stuck WMI cannot hold the worker forever. */
+static HRESULT ExecWmiQuery(IWbemServices* services, const wchar_t* text, IEnumWbemClassObject** out) {
+    *out = NULL;
+    BSTR language = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(text);
+    HRESULT hr = (language && query)
+        ? IWbemServices_ExecQuery(services, language, query,
+                                  WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, out)
+        : E_OUTOFMEMORY;
+    SysFreeString(language);
+    SysFreeString(query);
+    if (SUCCEEDED(hr) && !*out) hr = E_POINTER;
+    if (SUCCEEDED(hr)) SetWmiProxySecurity((IUnknown*)*out);
+    return hr;
+}
+
+/* S_OK with the next object, S_FALSE at the end, or a failure (including a
+ * reply that took longer than PANEL_WMI_TIMEOUT_MS). */
+static HRESULT NextWmiObject(IEnumWbemClassObject* e, IWbemClassObject** obj) {
+    ULONG got = 0;
+    *obj = NULL;
+    HRESULT hr = IEnumWbemClassObject_Next(e, PANEL_WMI_TIMEOUT_MS, 1, obj, &got);
+    if (hr == (HRESULT)WBEM_S_TIMEDOUT) hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if (FAILED(hr)) {
+        if (*obj) IWbemClassObject_Release(*obj);
+        *obj = NULL;
+        return hr;
+    }
+    return (got && *obj) ? S_OK : S_FALSE;
+}
+
+/* uint8 properties arrive as VT_UI1, uint32 as VT_I4, booleans as VT_BOOL. */
+static BOOL WmiGetInt(IWbemClassObject* obj, const wchar_t* name, int* out) {
+    VARIANT v;
+    VariantInit(&v);
+    BOOL ok = SUCCEEDED(IWbemClassObject_Get(obj, name, 0, &v, NULL, NULL)) &&
+              v.vt != VT_NULL && v.vt != VT_EMPTY &&
+              SUCCEEDED(VariantChangeType(&v, &v, 0, VT_I4));
+    if (ok) *out = (int)v.lVal;
+    VariantClear(&v);
+    return ok;
+}
+
+static BOOL WmiGetString(IWbemClassObject* obj, const wchar_t* name, wchar_t* out, size_t count) {
+    VARIANT v;
+    VariantInit(&v);
+    BOOL ok = SUCCEEDED(IWbemClassObject_Get(obj, name, 0, &v, NULL, NULL)) &&
+              v.vt == VT_BSTR && v.bstrVal;
+    if (ok) wcsncpy_s(out, count, v.bstrVal, _TRUNCATE);
+    VariantClear(&v);
+    return ok;
+}
+
+/* Level: the steps the panel supports, in percent (uint8[]). */
+static int WmiGetLevels(IWbemClassObject* obj, BYTE* out, int max) {
+    VARIANT v;
+    VariantInit(&v);
+    int count = 0;
+    if (SUCCEEDED(IWbemClassObject_Get(obj, L"Level", 0, &v, NULL, NULL)) &&
+        v.vt == (VT_ARRAY | VT_UI1) && v.parray) {
+        LONG lower = 0, upper = -1;
+        BYTE* data = NULL;
+        if (SUCCEEDED(SafeArrayGetLBound(v.parray, 1, &lower)) &&
+            SUCCEEDED(SafeArrayGetUBound(v.parray, 1, &upper)) &&
+            SUCCEEDED(SafeArrayAccessData(v.parray, (void**)&data))) {
+            for (LONG i = 0; i <= upper - lower && count < max; i++) {
+                if (data[i] <= 100) out[count++] = data[i];
+            }
+            SafeArrayUnaccessData(v.parray);
+        }
+    }
+    VariantClear(&v);
+    return count;
+}
+
+/* How WMI says that Windows controls no display's brightness here (a
+ * desktop answers "not supported"): a definite none, not a failure. */
+static BOOL IsNoPanelAnswer(HRESULT hr) {
+    return hr == (HRESULT)WBEM_E_NOT_SUPPORTED || hr == (HRESULT)WBEM_E_INVALID_CLASS ||
+           hr == (HRESULT)WBEM_E_NOT_FOUND;
+}
+
+/* Lists the displays whose brightness Windows controls, normally a laptop's
+ * built-in panel. Returns how many, 0 for none, or -1 when WMI could not
+ * answer (the connection is dropped and made again next time; the caller
+ * treats those displays as it did before). */
+static int QueryPanels(PanelWmi* w, PanelInfo* out, int max) {
+    ULONGLONG start = GetTickCount64();
+    if (!w->services) w->services = ConnectWmi();
+    if (!w->services) return -1;
+    IEnumWbemClassObject* e = NULL;
+    IWbemClassObject* obj = NULL;
+    int count = 0;
+    HRESULT hr = ExecWmiQuery(w->services, L"SELECT * FROM WmiMonitorBrightness", &e);
+    while (SUCCEEDED(hr) && (hr = NextWmiObject(e, &obj)) == S_OK) {
+        int current = -1, active = 1;
+        if (count < max) {
+            PanelInfo* p = &out[count];
+            ZeroMemory(p, sizeof(*p));
+            if (WmiGetString(obj, L"InstanceName", p->instanceName, PANEL_NAME_CHARS) &&
+                WmiGetInt(obj, L"CurrentBrightness", &current) && current >= 0 && current <= 100) {
+                WmiGetInt(obj, L"Active", &active);
+                p->current = current;
+                p->active = active != 0;
+                p->levelCount = WmiGetLevels(obj, p->levels, PANEL_MAX_LEVELS);
+                count++;
+            }
+        }
+        IWbemClassObject_Release(obj);
+    }
+    if (e) IEnumWbemClassObject_Release(e);
+    e = NULL;
+    if (FAILED(hr)) {
+        if (IsNoPanelAnswer(hr)) {
+            DebugPrint(L"[PANEL] Windows controls no display's brightness here (0x%08lX, %lu ms)\n",
+                       (unsigned long)hr, (unsigned long)(GetTickCount64() - start));
+            return 0;
+        }
+        DebugPrint(L"[PANEL] WmiMonitorBrightness query FAILED (0x%08lX, %lu ms)\n",
+                   (unsigned long)hr, (unsigned long)(GetTickCount64() - start));
+        DropPanelWmi(w);
+        return -1;
+    }
+    /* The object that carries WmiSetBrightness for each of them. */
+    if (count > 0) {
+        hr = ExecWmiQuery(w->services, L"SELECT * FROM WmiMonitorBrightnessMethods", &e);
+        while (SUCCEEDED(hr) && (hr = NextWmiObject(e, &obj)) == S_OK) {
+            wchar_t name[PANEL_NAME_CHARS];
+            if (WmiGetString(obj, L"InstanceName", name, PANEL_NAME_CHARS)) {
+                for (int i = 0; i < count; i++) {
+                    if (_wcsicmp(out[i].instanceName, name) == 0) {
+                        WmiGetString(obj, L"__RELPATH", out[i].methodPath, PANEL_PATH_CHARS);
+                    }
+                }
+            }
+            IWbemClassObject_Release(obj);
+        }
+        if (e) IEnumWbemClassObject_Release(e);
+        if (FAILED(hr)) {
+            DebugPrint(L"[PANEL] WmiMonitorBrightnessMethods query FAILED (0x%08lX, %lu ms)\n",
+                       (unsigned long)hr, (unsigned long)(GetTickCount64() - start));
+            DropPanelWmi(w);
+            return -1;
+        }
+    }
+    /* A display without that object cannot be set; it stays with DDC/CI. */
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        const PanelInfo* p = &out[i];
+        int low = 100, high = 0;
+        for (int l = 0; l < p->levelCount; l++) {
+            if (p->levels[l] < low) low = p->levels[l];
+            if (p->levels[l] > high) high = p->levels[l];
+        }
+        DebugPrint(L"[PANEL] %s: current %d%%, %d level(s) %d..%d, active %d, method %s\n",
+                   p->instanceName, p->current, p->levelCount, p->levelCount ? low : 0,
+                   p->levelCount ? high : 100, p->active, p->methodPath[0] ? p->methodPath : L"MISSING");
+        if (p->methodPath[0]) out[kept++] = *p;
+    }
+    DebugPrint(L"[PANEL] Windows controls the brightness of %d display(s) (%lu ms)\n", kept,
+               (unsigned long)(GetTickCount64() - start));
+    return kept;
+}
+
+/* WmiSetBrightness(Timeout, Brightness) on the display's method object,
+ * waiting at most PANEL_WMI_TIMEOUT_MS for it. Timeout 0, as Windows tools
+ * use it: the level stays until something changes it. */
+static HRESULT SetPanelBrightness(PanelWmi* w, const wchar_t* methodPath, int percent) {
+    if (!w->services) w->services = ConnectWmi();
+    if (!w->services) return E_FAIL;
+    HRESULT hr = S_OK;
+    if (!w->setParams) {
+        IWbemClassObject* cls = NULL;
+        BSTR name = SysAllocString(L"WmiMonitorBrightnessMethods");
+        hr = name ? IWbemServices_GetObject(w->services, name, 0, NULL, &cls, NULL) : E_OUTOFMEMORY;
+        SysFreeString(name);
+        if (SUCCEEDED(hr) && cls) {
+            hr = IWbemClassObject_GetMethod(cls, L"WmiSetBrightness", 0, &w->setParams, NULL);
+        }
+        if (cls) IWbemClassObject_Release(cls);
+        if (SUCCEEDED(hr) && !w->setParams) hr = E_POINTER;
+    }
+    IWbemClassObject* in = NULL;
+    if (SUCCEEDED(hr)) hr = IWbemClassObject_SpawnInstance(w->setParams, 0, &in);
+    VARIANT v;
+    VariantInit(&v);
+    if (SUCCEEDED(hr)) {
+        v.vt = VT_I4;   /* a uint32 travels as VT_I4 */
+        v.lVal = 0;
+        hr = IWbemClassObject_Put(in, L"Timeout", 0, &v, 0);
+    }
+    if (SUCCEEDED(hr)) {
+        v.vt = VT_UI1;
+        v.bVal = (BYTE)percent;
+        hr = IWbemClassObject_Put(in, L"Brightness", 0, &v, 0);
+    }
+    IWbemCallResult* call = NULL;
+    if (SUCCEEDED(hr)) {
+        BSTR path = SysAllocString(methodPath);
+        BSTR method = SysAllocString(L"WmiSetBrightness");
+        hr = (path && method)
+            ? IWbemServices_ExecMethod(w->services, path, method, WBEM_FLAG_RETURN_IMMEDIATELY,
+                                       NULL, in, NULL, &call)
+            : E_OUTOFMEMORY;
+        SysFreeString(path);
+        SysFreeString(method);
+    }
+    if (SUCCEEDED(hr) && call) {
+        SetWmiProxySecurity((IUnknown*)call);
+        LONG status = 0;
+        HRESULT wait = IWbemCallResult_GetCallStatus(call, PANEL_WMI_TIMEOUT_MS, &status);
+        hr = wait == (HRESULT)WBEM_S_TIMEDOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+           : FAILED(wait) ? wait : (HRESULT)status;
+    }
+    if (call) IWbemCallResult_Release(call);
+    if (in) IWbemClassObject_Release(in);
+    return hr;
+}
+
+/* Waits for WmiMonitorBrightnessEvent - Windows reporting a new level for a
+ * built-in display, whoever changed it - and posts each one to the main
+ * window, which works out whether it was the user. The wait has no timeout
+ * (no wake-ups while nothing changes); if WMI drops the subscription it is
+ * made again after a growing delay. Started with the first built-in display
+ * and left running until exit. */
+static DWORD WINAPI PanelEventThread(LPVOID param) {
+    (void)param;
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) {
+        DebugPrint(L"[PANEL] Brightness change notifications unavailable: COM could not start\n");
+        return 0;
+    }
+    DWORD retryMs = PANEL_EVENTS_RETRY_MIN_MS;
+    while (WaitForSingleObject(g_panelEventStop, 0) != WAIT_OBJECT_0) {
+        IWbemServices* services = ConnectWmi();
+        IEnumWbemClassObject* events = NULL;
+        HRESULT hr = E_FAIL;
+        if (services) {
+            BSTR language = SysAllocString(L"WQL");
+            BSTR query = SysAllocString(L"SELECT * FROM WmiMonitorBrightnessEvent");
+            hr = (language && query)
+                ? IWbemServices_ExecNotificationQuery(services, language, query,
+                      WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY, NULL, &events)
+                : E_OUTOFMEMORY;
+            SysFreeString(language);
+            SysFreeString(query);
+        }
+        if (SUCCEEDED(hr) && events) {
+            SetWmiProxySecurity((IUnknown*)events);
+            DebugPrint(L"[PANEL] Listening for brightness changes made in Windows\n");
+            retryMs = PANEL_EVENTS_RETRY_MIN_MS;
+            for (;;) {
+                IWbemClassObject* obj = NULL;
+                ULONG got = 0;
+                hr = IEnumWbemClassObject_Next(events, (LONG)WBEM_INFINITE, 1, &obj, &got);
+                BOOL stop = WaitForSingleObject(g_panelEventStop, 0) == WAIT_OBJECT_0;
+                if (FAILED(hr) || !got || !obj || stop) {
+                    if (obj) IWbemClassObject_Release(obj);
+                    if (SUCCEEDED(hr)) hr = S_FALSE;   /* ended without an error */
+                    break;
+                }
+                PanelBrightnessEvent* report = (PanelBrightnessEvent*)calloc(1, sizeof(*report));
+                int brightness = -1;
+                if (report && WmiGetString(obj, L"InstanceName", report->instanceName, PANEL_NAME_CHARS) &&
+                    WmiGetInt(obj, L"Brightness", &brightness) && brightness >= 0 && brightness <= 100) {
+                    report->brightness = brightness;
+                    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_PANEL_BRIGHTNESS, 0, (LPARAM)report)) free(report);
+                } else {
+                    free(report);
+                }
+                IWbemClassObject_Release(obj);
+            }
+        }
+        if (events) IEnumWbemClassObject_Release(events);
+        if (services) IWbemServices_Release(services);
+        if (WaitForSingleObject(g_panelEventStop, 0) == WAIT_OBJECT_0) break;
+        DebugPrint(L"[PANEL] Brightness change notifications %s (0x%08lX); trying again in %lu s\n",
+                   events ? L"stopped" : L"unavailable", (unsigned long)hr, (unsigned long)(retryMs / 1000));
+        if (WaitForSingleObject(g_panelEventStop, retryMs) == WAIT_OBJECT_0) break;
+        retryMs = retryMs * 2 > PANEL_EVENTS_RETRY_MAX_MS ? PANEL_EVENTS_RETRY_MAX_MS : retryMs * 2;
+    }
+    CoUninitialize();
+    return 0;
+}
+
 /* ── DDC/CI worker ───────────────────────────────────────────────────────── */
 
 /* Everything that talks to a monitor over DDC/CI happens on this thread: a
  * single VCP read or write can take hundreds of milliseconds, and a
  * misbehaving monitor can stall for seconds, so the UI thread only ever
- * queues requests and receives posted results. */
+ * queues requests and receives posted results. Built-in displays are read
+ * and set here as well, through WMI. */
 
 typedef struct {
     HMONITOR hmon;
@@ -1608,8 +2073,11 @@ typedef struct {
     BOOL patient;
     BOOL supported;
     BOOL highLevel;
+    BOOL builtin;                 /* set through WMI (methodPath), not DDC/CI */
+    BOOL panelChecked;            /* WMI answered and does not list it */
     DWORD min;
     DWORD max;
+    wchar_t methodPath[PANEL_PATH_CHARS];
 } WorkerMonitor;
 
 static void DdcRequestWrite(int uid, int target, BOOL raw) {
@@ -1829,6 +2297,7 @@ static void ProbeWorkerMonitor(WorkerSource* sources, int* sourceCount, WorkerMo
     DdcProbeResult* r = (DdcProbeResult*)calloc(1, sizeof(*r));
     if (!r) return;
     r->uid = wm->uid;
+    r->panelChecked = wm->panelChecked;
     ULONGLONG start = GetTickCount64();
     DWORD min = 0, current = 0, max = 0;
     BOOL ok = FALSE, highLevel = FALSE;
@@ -1920,10 +2389,89 @@ static BOOL WriteWorkerBrightness(HANDLE handle, WorkerMonitor* wm, int target, 
     return ok;
 }
 
+/* One level to a built-in display (raw values are percent too); a failed
+ * call is tried once more on a fresh WMI connection. */
+static BOOL WritePanelBrightness(PanelWmi* wmi, const WorkerMonitor* wm, int target) {
+    int percent = target < 0 ? 0 : (target > 100 ? 100 : target);
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 2 && FAILED(hr); attempt++) {
+        if (attempt) DropPanelWmi(wmi);
+        ULONGLONG start = GetTickCount64();
+        hr = SetPanelBrightness(wmi, wm->methodPath, percent);
+        DebugPrint(L"[PANEL] monitor %d WmiSetBrightness(%d%%) attempt %d -> %s (0x%08lX), %lu ms\n",
+                   wm->uid, percent, attempt + 1, SUCCEEDED(hr) ? L"ok" : L"FAILED",
+                   (unsigned long)hr, (unsigned long)(GetTickCount64() - start));
+    }
+    return SUCCEEDED(hr);
+}
+
+/* Built-in displays go first: WMI answers for them in milliseconds, while a
+ * DDC/CI probe can take seconds. Each display Windows controls gets its
+ * result posted right away; the others are returned in ddcJob (with
+ * panelChecked: WMI answered and does not list it) for DDC/CI. A display
+ * that was built-in last time is never handed to DDC/CI, which a laptop
+ * panel does not speak: if WMI does not list it now it is reported as not
+ * answering and retried like any known monitor. */
+static int ProbePanels(PanelWmi* wmi, const DdcProbeEntry* job, int jobCount,
+                       WorkerMonitor* monitors, int* monitorCount,
+                       DdcProbeEntry* ddcJob, BOOL* panelChecked) {
+    static PanelInfo panels[MAX_MONITORS];   /* worker thread only */
+    BOOL wanted = FALSE;
+    for (int i = 0; i < jobCount; i++) wanted = wanted || job[i].checkPanel;
+    ULONGLONG start = GetTickCount64();
+    int panelCount = (wanted && wmi) ? QueryPanels(wmi, panels, MAX_MONITORS) : -1;
+    DWORD elapsed = (DWORD)(GetTickCount64() - start);
+    int ddcCount = 0;
+    for (int i = 0; i < jobCount; i++) {
+        const DdcProbeEntry* entry = &job[i];
+        const PanelInfo* panel = NULL;
+        for (int p = 0; entry->checkPanel && p < panelCount && !panel; p++) {
+            if (PanelInstanceMatches(panels[p].instanceName, entry->instancePath)) panel = &panels[p];
+        }
+        if (!panel && !entry->builtin) {
+            panelChecked[ddcCount] = entry->checkPanel && panelCount >= 0;
+            ddcJob[ddcCount++] = *entry;
+            continue;
+        }
+        if (*monitorCount >= MAX_MONITORS) continue;
+        WorkerMonitor* wm = &monitors[(*monitorCount)++];
+        ZeroMemory(wm, sizeof(*wm));
+        wm->uid = entry->uid;
+        wm->hmon = entry->hmon;
+        wm->physicalIndex = entry->physicalIndex;
+        wm->patient = entry->patient;
+        wm->builtin = TRUE;
+        wm->max = 100;
+        DdcProbeResult* r = (DdcProbeResult*)calloc(1, sizeof(*r));
+        if (!r) continue;
+        r->uid = entry->uid;
+        r->builtin = TRUE;
+        r->max = 100;
+        r->elapsedMs = elapsed;
+        if (panel) {
+            wm->supported = TRUE;
+            wcscpy_s(wm->methodPath, PANEL_PATH_CHARS, panel->methodPath);
+            r->supported = TRUE;
+            r->current = (DWORD)panel->current;
+            memcpy(r->levels, panel->levels, sizeof(r->levels));
+            r->levelCount = panel->levelCount;
+            DebugPrint(L"[PANEL] monitor %d (%s): Windows controls its brightness, current %d%%\n",
+                       entry->uid, entry->instancePath, panel->current);
+        } else {
+            r->error = panelCount < 0 ? ERROR_GEN_FAILURE : ERROR_NOT_FOUND;
+            DebugPrint(L"[PANEL] monitor %d (%s): built-in display %s; not trying DDC/CI\n",
+                       entry->uid, entry->instancePath,
+                       panelCount < 0 ? L"but WMI did not answer" : L"no longer listed by WMI");
+        }
+        if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_DDC_PROBED, 0, (LPARAM)r)) free(r);
+    }
+    return ddcCount;
+}
+
 /* Performs queued brightness writes. During a probe job only monitors
  * already probed in that job are written (the others stay queued), so a
  * slider does not have to wait for a slow display at the end of the job. */
-static void DrainPendingWrites(WorkerSource* sources, int sourceCount,
+static void DrainPendingWrites(PanelWmi* wmi, WorkerSource* sources, int sourceCount,
                                WorkerMonitor* monitors, int monitorCount, BOOL onlyProbed) {
     for (;;) {
         if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
@@ -1952,7 +2500,9 @@ static void DrainPendingWrites(WorkerSource* sources, int sourceCount,
         if (uid < 0) break;
 
         BOOL ok = FALSE;
-        if (wm && wm->supported) {
+        if (wm && wm->supported && wm->builtin) {
+            ok = WritePanelBrightness(wmi, wm, target);
+        } else if (wm && wm->supported) {
             HANDLE handle = NULL;
             if (WorkerMonitorHandle(sources, sourceCount, wm, &handle)) ok = WriteWorkerBrightness(handle, wm, target, raw);
             else DebugPrint(L"[DDC] monitor %d: no handle for the write\n", uid);
@@ -1971,7 +2521,12 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
     WorkerMonitor monitors[MAX_MONITORS];
     int monitorCount = 0;
     ZeroMemory(sources, sizeof(sources));
-    DebugPrint(L"[DDC] worker thread started (id %lu)\n", (unsigned long)GetCurrentThreadId());
+    PanelWmi wmi;
+    ZeroMemory(&wmi, sizeof(wmi));
+    /* Built-in displays are reached through WMI, which needs COM here. */
+    HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    DebugPrint(L"[DDC] worker thread started (id %lu), COM 0x%08lX\n", (unsigned long)GetCurrentThreadId(),
+               (unsigned long)com);
 
     for (;;) {
         WaitForSingleObject(g_ddcEvent, INFINITE);
@@ -1992,34 +2547,43 @@ static DWORD WINAPI DdcWorkerThread(LPVOID param) {
         if (probe) {
             DebugPrint(L"[DDC] probe job: %d monitor(s)\n", jobCount);
             for (int i = 0; i < jobCount; i++) {
-                DebugPrint(L"[DDC]   entry %d: uid %d hmon=%p physicalIndex %d patient %d\n", i,
-                           job[i].uid, (void*)job[i].hmon, job[i].physicalIndex, job[i].patient);
+                DebugPrint(L"[DDC]   entry %d: uid %d hmon=%p physicalIndex %d patient %d checkPanel %d builtin %d instance %s\n",
+                           i, job[i].uid, (void*)job[i].hmon, job[i].physicalIndex, job[i].patient,
+                           job[i].checkPanel, job[i].builtin, job[i].instancePath);
             }
-            OpenJobSources(sources, &sourceCount, job, jobCount);
             monitorCount = 0;
-            for (int i = 0; i < jobCount && monitorCount < MAX_MONITORS; i++) {
+            DdcProbeEntry ddcJob[MAX_MONITORS];
+            BOOL panelChecked[MAX_MONITORS];
+            int ddcCount = ProbePanels(SUCCEEDED(com) ? &wmi : NULL, job, jobCount, monitors,
+                                       &monitorCount, ddcJob, panelChecked);
+            /* Built-in displays take their writes while DDC/CI probes. */
+            DrainPendingWrites(&wmi, sources, sourceCount, monitors, monitorCount, TRUE);
+            OpenJobSources(sources, &sourceCount, ddcJob, ddcCount);
+            for (int i = 0; i < ddcCount && monitorCount < MAX_MONITORS; i++) {
                 WorkerMonitor* wm = &monitors[monitorCount++];
-                wm->uid = job[i].uid;
-                wm->hmon = job[i].hmon;
-                wm->physicalIndex = job[i].physicalIndex;
-                wm->patient = job[i].patient;
-                wm->supported = FALSE;
-                wm->highLevel = FALSE;
+                ZeroMemory(wm, sizeof(*wm));
+                wm->uid = ddcJob[i].uid;
+                wm->hmon = ddcJob[i].hmon;
+                wm->physicalIndex = ddcJob[i].physicalIndex;
+                wm->patient = ddcJob[i].patient;
+                wm->panelChecked = panelChecked[i];
                 wm->min = 0;
                 wm->max = 100;
                 ProbeWorkerMonitor(sources, &sourceCount, wm);
                 if (InterlockedCompareExchange(&g_ddcStop, 0, 0)) break;
                 /* Keep sliders responsive while the remaining displays probe. */
-                DrainPendingWrites(sources, sourceCount, monitors, monitorCount, TRUE);
+                DrainPendingWrites(&wmi, sources, sourceCount, monitors, monitorCount, TRUE);
             }
             CloseUnusedSources(sources, &sourceCount);
             DebugPrint(L"[DDC] probe job done; %d source(s) kept open\n", sourceCount);
         }
 
-        DrainPendingWrites(sources, sourceCount, monitors, monitorCount, FALSE);
+        DrainPendingWrites(&wmi, sources, sourceCount, monitors, monitorCount, FALSE);
     }
 
     ReleaseWorkerSources(sources, &sourceCount);
+    DropPanelWmi(&wmi);
+    if (SUCCEEDED(com)) CoUninitialize();
     return 0;
 }
 
@@ -2088,6 +2652,19 @@ static int ClampMonitorValue(const Monitor* m, int value) {
     if (value < min) value = min;
     if (value > 100) value = 100;
     return value;
+}
+
+/* The backlight level the value asks for: 0 while software dimming goes
+ * below the minimum, and on a built-in display the nearest level it has. */
+static int MonitorHardwareTarget(const Monitor* m) {
+    int hw = m->value < 0 ? 0 : (m->value > 100 ? 100 : m->value);
+    return m->builtin ? SnapPanelLevel(m->panelLevels, m->panelLevelCount, hw) : hw;
+}
+
+/* GUID_CONSOLE_DISPLAY_STATE: 0 off, 1 on, 2 dimmed by Windows for
+ * inactivity; -1 until the first notification. */
+static BOOL DisplayIsOn(void) {
+    return g_lastDisplayState != 0 && g_lastDisplayState != 2;
 }
 
 /* Turns the desired value into hardware and overlay settings. Hardware
@@ -2303,7 +2880,9 @@ static void ScheduleBrightnessKeyReaderRestart(void) {
 
 /* One press: every listed monitor moves by the tray step from its own
  * value, as a manual change (so scheduled monitors pause), like the tray
- * menu's Increase/Decrease. */
+ * menu's Increase/Decrease. A built-in display is left out: Windows moves
+ * it for the same key press itself, and that change is picked up like any
+ * other made in Windows. */
 static void ApplyBrightnessKey(int direction) {
     if (!g_config.brightnessKeys) return;   /* posted just before the option went off */
     if (g_remoteSession) {
@@ -2313,7 +2892,7 @@ static void ApplyBrightnessKey(int direction) {
     int changed = 0;
     for (int i = 0; i < g_monitorCount; i++) {
         Monitor* m = &g_monitors[i];
-        if (m->hidden || MonitorMode(m) == MODE_PROBING) continue;
+        if (m->hidden || m->builtin || MonitorMode(m) == MODE_PROBING) continue;
         int before = m->value;
         SetMonitorValue(m, m->value + direction * TRAY_STEP_PERCENT);
         NoteManualChange(m);
@@ -2405,7 +2984,7 @@ static void UpdateRemoteSessionState(void) {
 /* ── Applying values ─────────────────────────────────────────────────────── */
 
 static void ApplyMonitor(Monitor* m) {
-    /* Hidden monitors are not controlled at all: no overlay, no DDC/CI
+    /* Hidden monitors are not controlled at all: no overlay, no hardware
      * writes. Whatever state the display is in stays that way. */
     if (m->hidden) return;
     /* Paused for a remote session: the value is kept and applied once the
@@ -2423,22 +3002,34 @@ static void ApplyMonitor(Monitor* m) {
     }
 
     int dim = 0;
-    BOOL wrote = FALSE;
+    BOOL wrote = FALSE, deferred = FALSE;
+    int hw = MonitorHardwareTarget(m);
     if (mode == MODE_HARDWARE) {
-        int hw = value < 0 ? 0 : value;
         if (value < 0) dim = -value;
         if (hw != m->lastHwSent) {
-            m->lastHwSent = hw;
-            DdcRequestSet(m->uid, hw);
-            wrote = TRUE;
+            if (m->builtin && !DisplayIsOn()) {
+                /* Windows has dimmed or switched off the display for
+                 * inactivity; a write now would light it up behind its
+                 * back. The level goes out once the display is on. */
+                m->panelReapply = TRUE;
+                deferred = TRUE;
+            } else {
+                m->lastHwSent = hw;
+                DdcRequestSet(m->uid, hw);
+                if (m->builtin) {
+                    m->panelEchoUntil = GetTickCount64() + PANEL_ECHO_MS;
+                    m->panelReapply = FALSE;
+                }
+                wrote = TRUE;
+            }
         }
     } else {
         dim = 100 - value;
     }
     DebugPrint(L"[APPLY] %s (%s): mode %s value %d -> hardware %s%d%%, overlay dim %d%%\n",
                m->name, m->device, ModeName(mode), value,
-               mode == MODE_HARDWARE ? (wrote ? L"write " : L"unchanged ") : L"n/a ",
-               mode == MODE_HARDWARE ? (value < 0 ? 0 : value) : 0, dim);
+               mode == MODE_HARDWARE ? (wrote ? L"write " : deferred ? L"deferred " : L"unchanged ") : L"n/a ",
+               mode == MODE_HARDWARE ? hw : 0, dim);
     SetOverlayDim(m, dim);
     ScheduleTooltipUpdate();
 }
@@ -2632,6 +3223,7 @@ static void RefreshMonitors(void) {
             dst->primary = seen.primary;
             wcscpy_s(dst->device, CCHDEVICENAME, seen.device);
             wcscpy_s(dst->name, sizeof(dst->name) / sizeof(wchar_t), seen.name);
+            wcscpy_s(dst->instancePath, sizeof(dst->instancePath) / sizeof(wchar_t), seen.instancePath);
             dst->lastHwSent = -1;   /* the re-probe decides whether to write */
             dst->failures = 0;
             dst->error[0] = L'\0';
@@ -2680,22 +3272,29 @@ static void RefreshMonitors(void) {
             probe[at].hmon = m->hmon;
             probe[at].physicalIndex = m->physicalIndex;
             probe[at].patient = m->knownHardware;
+            /* Windows is asked about every display once; after it said it
+             * does not control one, only a rescan asks again. */
+            probe[at].checkPanel = m->builtin || !m->panelChecked;
+            probe[at].builtin = m->builtin;
+            wcscpy_s(probe[at].instancePath, sizeof(probe[at].instancePath) / sizeof(wchar_t),
+                     m->instancePath);
             probeCount++;
         }
-        DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s state=%s knownHardware=%d%s%s%s original=%s%lu/%lu\n",
+        DebugPrint(L"[INFO] Monitor %d: %s (%s, %ldx%ld%s) key=%s value=%d%s state=%s knownHardware=%d%s%s%s%s original=%s%lu/%lu\n",
                    m->uid, m->name, m->device,
                    (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
                    m->primary ? L", primary" : L"", m->key,
                    m->hasValue ? m->value : -1000,
                    m->hasValue ? L"" : L" (none saved)",
                    HardwareStateName(m->hardwareState), m->knownHardware,
+                   m->builtin ? L", built-in" : L"",
                    m->forceSoftware ? L", software only" : L"",
                    m->hidden ? L", hidden" : L"",
                    m->scheduled ? L", scheduled" : L"",
                    m->hasOriginal ? L"" : L"none ",
                    (unsigned long)m->originalRaw, (unsigned long)m->originalMax);
     }
-    DebugPrint(L"[INFO] %d monitor(s) enumerated, %d hidden; probing DDC/CI\n",
+    DebugPrint(L"[INFO] %d monitor(s) enumerated, %d hidden; probing\n",
                g_monitorCount, g_monitorCount - probeCount);
     DdcRequestProbe(probe, probeCount);
     UpdateOverlayTimer();
@@ -2767,12 +3366,21 @@ static void HandleDdcProbed(DdcProbeResult* r) {
         return;
     }
     Monitor* m = FindMonitorByUid(r->uid);
-    DebugPrint(L"[INFO] Probe result for uid %d (%s): supported=%d highLevel=%d min=%lu current=%lu max=%lu error=%lu elapsed=%lu ms\n",
-               r->uid, m ? m->name : L"unknown monitor", r->supported, r->highLevel,
+    DebugPrint(L"[INFO] Probe result for uid %d (%s): supported=%d builtin=%d highLevel=%d min=%lu current=%lu max=%lu error=%lu elapsed=%lu ms\n",
+               r->uid, m ? m->name : L"unknown monitor", r->supported, r->builtin, r->highLevel,
                (unsigned long)r->min, (unsigned long)r->current, (unsigned long)r->max,
                (unsigned long)r->error, (unsigned long)r->elapsedMs);
     if (m) {
         BrightnessMode before = MonitorMode(m);
+        const wchar_t* control = r->builtin ? L"Windows brightness control" : L"DDC/CI";
+        m->builtin = r->builtin;
+        if (r->panelChecked) m->panelChecked = TRUE;
+        if (r->builtin && r->supported) {
+            int count = r->levelCount < 0 ? 0 : (r->levelCount > PANEL_MAX_LEVELS ? PANEL_MAX_LEVELS : r->levelCount);
+            memcpy(m->panelLevels, r->levels, (size_t)count);
+            m->panelLevelCount = count;
+            StartPanelWatch();
+        }
         if (r->supported) {
             m->hardwareState = HW_AVAILABLE;
             m->ddcMax = r->max;
@@ -2782,8 +3390,8 @@ static void HandleDdcProbed(DdcProbeResult* r) {
             m->failures = 0;
             m->error[0] = L'\0';
             if (m->probeFailures > 0) {
-                DebugPrint(L"[INFO] %s (%s): DDC/CI answering again after %d failed probe(s)\n",
-                           m->name, m->device, m->probeFailures);
+                DebugPrint(L"[INFO] %s (%s): %s answering again after %d failed probe(s)\n",
+                           m->name, m->device, control, m->probeFailures);
                 m->probeFailures = 0;
                 g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
             }
@@ -2817,9 +3425,16 @@ static void HandleDdcProbed(DdcProbeResult* r) {
             }
             ApplyScheduleAfterProbe(m);
             /* Already at the wanted level: no write needed. */
-            m->lastHwSent = (m->value == percent) ? percent : -1;
-            DebugPrint(L"[INFO] %s (%s): DDC/CI brightness available, current %lu/%lu (%lu ms)\n",
-                       m->name, m->device, (unsigned long)r->current,
+            m->lastHwSent = (MonitorHardwareTarget(m) == percent) ? percent : -1;
+            if (m->builtin && m->panelReportPending && m->lastHwSent < 0) {
+                /* A level Windows reported is still waiting to be looked at
+                 * and may be the user's: it decides first, and ours goes
+                 * back afterwards unless it was. */
+                m->lastHwSent = MonitorHardwareTarget(m);
+                m->panelReapply = TRUE;
+            }
+            DebugPrint(L"[INFO] %s (%s): %s brightness available, current %lu/%lu (%lu ms)\n",
+                       m->name, m->device, control, (unsigned long)r->current,
                        (unsigned long)r->max, (unsigned long)r->elapsedMs);
         } else {
             m->hardwareState = HW_UNAVAILABLE;
@@ -2834,14 +3449,14 @@ static void HandleDdcProbed(DdcProbeResult* r) {
             if (m->knownHardware && !m->forceSoftware) {
                 /* The dialog explains the waiting state itself. */
                 m->error[0] = L'\0';
-                DebugPrint(L"[WARNING] %s (%s): DDC/CI not answering (error %lu, %lu ms, failure %d); "
+                DebugPrint(L"[WARNING] %s (%s): %s not answering (error %lu, %lu ms, failure %d); "
                            L"leaving the monitor alone and retrying\n",
-                           m->name, m->device, (unsigned long)r->error,
+                           m->name, m->device, control, (unsigned long)r->error,
                            (unsigned long)r->elapsedMs, m->probeFailures);
                 ScheduleDdcRetry();
             } else {
-                DebugPrint(L"[INFO] %s (%s): no DDC/CI brightness (error %lu, %lu ms); using software dimming\n",
-                           m->name, m->device, (unsigned long)r->error,
+                DebugPrint(L"[INFO] %s (%s): no %s brightness (error %lu, %lu ms); using software dimming\n",
+                           m->name, m->device, control, (unsigned long)r->error,
                            (unsigned long)r->elapsedMs);
                 if (!m->forceSoftware && m->probeFailures <= DDC_UNKNOWN_MONITOR_RETRIES) ScheduleDdcRetry();
             }
@@ -2860,6 +3475,9 @@ static void HandleDdcProbed(DdcProbeResult* r) {
 static void HandleDdcSetResult(int uid, BOOL success) {
     Monitor* m = FindMonitorByUid(uid);
     if (!m || g_remoteSession) return;
+    /* Windows reports the level a write to a built-in display set (even a
+     * write that failed half-way may have); that report is an echo. */
+    if (m->builtin) m->panelEchoUntil = GetTickCount64() + PANEL_ECHO_MS;
     if (m->hidden) {
         /* Only the restore-before-hide write reaches a hidden monitor. */
         DebugPrint(L"[%s] %s (%s): original brightness %s before hiding\n",
@@ -2886,8 +3504,8 @@ static void HandleDdcSetResult(int uid, BOOL success) {
     if (m->failures >= DDC_MAX_CONSECUTIVE_FAILURES && m->hardwareState == HW_AVAILABLE) {
         m->hardwareState = HW_UNAVAILABLE;
         m->error[0] = L'\0';
-        DebugPrint(L"[WARNING] %s (%s): %d consecutive DDC/CI failures; leaving the monitor alone and retrying\n",
-                   m->name, m->device, m->failures);
+        DebugPrint(L"[WARNING] %s (%s): %d consecutive %s failures; leaving the monitor alone and retrying\n",
+                   m->name, m->device, m->failures, m->builtin ? L"Windows brightness control" : L"DDC/CI");
     } else {
         wcscpy_s(m->error, sizeof(m->error) / sizeof(wchar_t),
                  L"The monitor did not accept the last brightness change.");
@@ -2896,6 +3514,176 @@ static void HandleDdcSetResult(int uid, BOOL success) {
      * even the first failed write, independently of future slider changes. */
     ScheduleDdcRetry();
     PushMonitorsToDialog();
+}
+
+/* ── Built-in displays: changes made in Windows ──────────────────────────── */
+
+/* Windows reports every new level of a built-in display, whoever set it.
+ * Only the latest report per display counts, looked at PANEL_SETTLE_MS
+ * after it arrived. It is one of:
+ *   - our level: nothing to do;
+ *   - not the user's doing: the level we wrote before (Windows restores it
+ *     when it undims the display, possibly after we changed ours), a
+ *     display dimmed or switched off for inactivity, or a level Windows
+ *     applied after a resume, a display change, or a power source or
+ *     battery saver change. Ours is put back once the display is on and
+ *     Windows is done (g_panelHoldUntil);
+ *   - the echo of one of our own earlier writes (a slider drag): ignored;
+ *   - otherwise the user changed it in Windows (the brightness keys, the
+ *     Settings or quick settings slider): adopted like a slider move, so it
+ *     shows in the dialog and the tooltip, is remembered, and pauses the
+ *     schedule like any manual change. */
+
+static BOOL PanelReapplyDue(const Monitor* m) {
+    return m->builtin && m->panelReapply && !m->hidden && !g_remoteSession && DisplayIsOn();
+}
+
+static void ProcessPanelReport(Monitor* m) {
+    if (g_remoteSession || m->hidden || MonitorMode(m) != MODE_HARDWARE) return;
+    int reported = m->panelReport;
+    int target = MonitorHardwareTarget(m);
+    if (reported == target) {
+        m->panelReapply = FALSE;   /* at our level, whatever put it there */
+        return;
+    }
+    if (reported == m->lastHwSent || !DisplayIsOn() || m->panelReportTick < g_panelQuietUntil) {
+        DebugPrint(L"[PANEL] %s (%s): Windows set %d%% itself; %d%% goes back once the display is on and settled\n",
+                   m->name, m->device, reported, target);
+        m->panelReapply = TRUE;
+        return;
+    }
+    if (m->panelReportTick < m->panelEchoUntil) return;   /* an earlier level of ours */
+    DebugPrint(L"[PANEL] %s (%s): changed in Windows from %d%% to %d%%; adopted as a manual change\n",
+               m->name, m->device, target, reported);
+    m->value = reported;
+    m->hasValue = TRUE;
+    m->dirty = TRUE;
+    SchedulePersist();
+    m->lastHwSent = reported;   /* already there: nothing to write */
+    m->panelReapply = FALSE;
+    ApplyMonitor(m);            /* drops software dimming below the minimum */
+    NoteManualChange(m);
+    PushMonitorsToDialog();
+}
+
+/* Arms ID_TIMER_PANEL for the earliest waiting work: a report to look at,
+ * or our level to put back. A display with a report still waiting is not
+ * written to before that report has been looked at: it may be the user's.
+ * Nothing waiting, no timer. */
+static void SchedulePanelService(void) {
+    if (!g_hwnd) return;
+    ULONGLONG now = GetTickCount64(), due = 0;
+    BOOL waiting = FALSE;
+    for (int i = 0; i < g_monitorCount; i++) {
+        const Monitor* m = &g_monitors[i];
+        ULONGLONG at;
+        if (m->builtin && m->panelReportPending) {
+            at = m->panelReportTick + PANEL_SETTLE_MS;
+        } else if (PanelReapplyDue(m)) {
+            at = g_panelHoldUntil > now ? g_panelHoldUntil : now;
+        } else {
+            continue;
+        }
+        if (!waiting || at < due) due = at;
+        waiting = TRUE;
+    }
+    if (!waiting) {
+        KillTimer(g_hwnd, ID_TIMER_PANEL);
+        return;
+    }
+    SetTimer(g_hwnd, ID_TIMER_PANEL, due > now ? (UINT)(due - now) : USER_TIMER_MINIMUM, NULL);
+}
+
+static void ServicePanels(void) {
+    ULONGLONG now = GetTickCount64();
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        if (m->builtin && m->panelReportPending && now >= m->panelReportTick + PANEL_SETTLE_MS) {
+            m->panelReportPending = FALSE;
+            ProcessPanelReport(m);
+        }
+    }
+    for (int i = 0; i < g_monitorCount; i++) {
+        Monitor* m = &g_monitors[i];
+        if (!PanelReapplyDue(m) || m->panelReportPending || now < g_panelHoldUntil) continue;
+        m->panelReapply = FALSE;
+        if (MonitorMode(m) != MODE_HARDWARE) continue;
+        DebugPrint(L"[PANEL] %s (%s): putting %d%% back\n", m->name, m->device, MonitorHardwareTarget(m));
+        m->lastHwSent = -1;
+        ApplyMonitor(m);
+    }
+    SchedulePanelService();
+}
+
+/* WM_APP_PANEL_BRIGHTNESS from PanelEventThread. */
+static void HandlePanelBrightness(PanelBrightnessEvent* report) {
+    Monitor* m = NULL;
+    for (int i = 0; i < g_monitorCount && !m; i++) {
+        if (g_monitors[i].builtin && PanelInstanceMatches(report->instanceName, g_monitors[i].instancePath)) {
+            m = &g_monitors[i];
+        }
+    }
+    DebugPrint(L"[PANEL] Windows reports %d%% for %s (%s)\n", report->brightness, report->instanceName,
+               m ? m->name : L"not a controlled display");
+    if (m && !m->hidden && !g_remoteSession) {
+        m->panelReport = report->brightness;
+        m->panelReportTick = GetTickCount64();
+        m->panelReportPending = TRUE;
+        SchedulePanelService();
+    }
+    free(report);
+}
+
+/* Windows is about to adjust built-in displays: with quiet, it applies a
+ * level of its own and what it reports meanwhile is not the user's; either
+ * way our level is not put back before it is done. */
+static void NotePanelTransition(BOOL quiet, DWORD ms) {
+    ULONGLONG until = GetTickCount64() + ms;
+    if (quiet && until > g_panelQuietUntil) g_panelQuietUntil = until;
+    if (until > g_panelHoldUntil) g_panelHoldUntil = until;
+    SchedulePanelService();
+}
+
+/* Power source, battery saver and energy saver notifications; the first one
+ * after registering only tells the current state. */
+static void NotePowerCondition(LONG* last, LONG value, const wchar_t* what) {
+    LONG previous = *last;
+    *last = value;
+    if (previous == -1 || previous == value) return;
+    DebugPrint(L"[PANEL] %s changed (%ld -> %ld)\n", what, (long)previous, (long)value);
+    NotePanelTransition(TRUE, PANEL_QUIET_MS);
+}
+
+/* Started with the first built-in display found: the listener for changes
+ * made in Windows, and the power notifications that explain Windows' own
+ * adjustments. A computer without such a display runs none of this. */
+static void StartPanelWatch(void) {
+    if (g_panelWatchStarted || !g_hwnd) return;
+    g_panelWatchStarted = TRUE;
+    g_powerSourceNotify = RegisterPowerSettingNotification(g_hwnd, &kGuidAcDcPowerSource,
+                                                           DEVICE_NOTIFY_WINDOW_HANDLE);
+    g_batterySaverNotify = RegisterPowerSettingNotification(g_hwnd, &kGuidPowerSavingStatus,
+                                                            DEVICE_NOTIFY_WINDOW_HANDLE);
+    g_energySaverNotify = RegisterPowerSettingNotification(g_hwnd, &kGuidEnergySaverStatus,
+                                                           DEVICE_NOTIFY_WINDOW_HANDLE);
+    g_panelEventStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_panelEventThread = g_panelEventStop ? CreateThread(NULL, 0, PanelEventThread, NULL, 0, NULL) : NULL;
+    DebugPrint(L"[PANEL] Watching built-in displays: change listener %s; power source %s, battery saver %s, energy saver %s notifications\n",
+               g_panelEventThread ? L"started" : L"FAILED",
+               g_powerSourceNotify ? L"on" : L"off", g_batterySaverNotify ? L"on" : L"off",
+               g_energySaverNotify ? L"on" : L"off");
+}
+
+/* At exit. The listener is blocked in WMI until the next report, so it is
+ * told to stop but not waited for; process exit ends it. */
+static void StopPanelWatch(void) {
+    if (g_panelEventStop) SetEvent(g_panelEventStop);
+    if (g_panelEventThread) CloseHandle(g_panelEventThread);
+    g_panelEventThread = NULL;
+    if (g_powerSourceNotify) UnregisterPowerSettingNotification(g_powerSourceNotify);
+    if (g_batterySaverNotify) UnregisterPowerSettingNotification(g_batterySaverNotify);
+    if (g_energySaverNotify) UnregisterPowerSettingNotification(g_energySaverNotify);
+    g_powerSourceNotify = g_batterySaverNotify = g_energySaverNotify = NULL;
 }
 
 /* ── Automatic brightness schedule ───────────────────────────────────────── */
@@ -4818,13 +5606,14 @@ static wchar_t* BuildMonitorsJson(void) {
         json_escape_wstring(m->error, eError, 320);
         int written = swprintf_s(buf + len, cap - len,
             L"%s{\"uid\":%d,\"key\":\"%s\",\"name\":\"%s\",\"device\":\"%s\","
-            L"\"width\":%ld,\"height\":%ld,\"primary\":%s,\"hardware\":\"%s\","
+            L"\"width\":%ld,\"height\":%ld,\"primary\":%s,\"hardware\":\"%s\",\"builtin\":%s,"
             L"\"mode\":\"%s\",\"knownHardware\":%s,\"forceSoftware\":%s,\"hidden\":%s,\"value\":%d,"
             L"\"min\":%d,\"max\":100,\"scheduled\":%s,\"pausedUntil\":\"%s\","
             L"\"error\":\"%s\"}",
             i == 0 ? L"" : L",", m->uid, eKey, eName, eDevice,
             (long)(m->rect.right - m->rect.left), (long)(m->rect.bottom - m->rect.top),
             m->primary ? L"true" : L"false", HardwareStateName(m->hardwareState),
+            m->builtin ? L"true" : L"false",
             ModeName(MonitorMode(m)), m->knownHardware ? L"true" : L"false",
             m->forceSoftware ? L"true" : L"false",
             m->hidden ? L"true" : L"false",
@@ -5361,6 +6150,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     } else if (strcmp(action, "refreshMonitors") == 0) {
         DebugPrint(L"[INFO] Rescan requested from the configuration dialog\n");
         g_ddcRetryDelayMs = DDC_RETRY_INITIAL_MS;
+        /* Windows is asked again which displays it controls. */
+        for (int i = 0; i < g_monitorCount; i++) g_monitors[i].panelChecked = FALSE;
         UnhideAllMonitors();
         RefreshMonitors();
     } else if (strcmp(action, "resumeSchedule") == 0) {
@@ -5877,6 +6668,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             ApplyBrightnessKey((int)(INT_PTR)wParam);
             return 0;
 
+        case WM_APP_PANEL_BRIGHTNESS:
+            HandlePanelBrightness((PanelBrightnessEvent*)lParam);
+            return 0;
+
         case WM_TIMER:
             switch (wParam) {
                 case ID_TIMER_REFRESH_MONITORS:
@@ -5911,6 +6706,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     KillTimer(hwnd, ID_TIMER_KEY_DEVICES);
                     UpdateBrightnessKeyReaders();
                     return 0;
+                case ID_TIMER_PANEL:
+                    KillTimer(hwnd, ID_TIMER_PANEL);
+                    ServicePanels();
+                    return 0;
             }
             break;
 
@@ -5930,6 +6729,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             /* Remote Desktop swaps the displays; catch it here as well so
              * the overlays leave the remote desktop without waiting. */
             UpdateRemoteSessionState();
+            NotePanelTransition(TRUE, PANEL_QUIET_MS);
             ScheduleMonitorRefresh(REFRESH_MONITORS_DEBOUNCE_MS);
             return 0;
 
@@ -5952,6 +6752,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
                 g_solarCache.valid = FALSE;
                 DebugPrint(L"[INFO] Resumed from sleep; monitors will be re-applied\n");
+                NotePanelTransition(TRUE, PANEL_QUIET_MS);
                 ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
                 ScheduleBrightnessKeyReaderRestart();
             } else if (wParam == PBT_POWERSETTINGCHANGE) {
@@ -5966,6 +6767,26 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     if (state == 1 && previous == 0) {
                         DebugPrint(L"[INFO] Displays switched on; monitors will be re-applied\n");
                         ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
+                    }
+                    /* A built-in display switched off or back on gets a level
+                     * from Windows; undimmed, it gets its previous one back
+                     * (and a brightness key pressed to wake it is the user's).
+                     * Either way, writes held back meanwhile wait for that. */
+                    if (previous != -1 && previous != state) {
+                        BOOL undimmed = state == 1 && previous == 2;
+                        NotePanelTransition(previous == 0 || state == 0,
+                                            undimmed ? PANEL_SETTLE_MS : PANEL_QUIET_MS);
+                    }
+                } else if (setting && setting->DataLength >= sizeof(DWORD)) {
+                    /* Windows applies its own level to a built-in display for
+                     * the new power source or saver mode. */
+                    LONG value = (LONG)*(const DWORD*)setting->Data;
+                    if (IsEqualGUID(&setting->PowerSetting, &kGuidAcDcPowerSource)) {
+                        NotePowerCondition(&g_lastPowerSource, value, L"Power source");
+                    } else if (IsEqualGUID(&setting->PowerSetting, &kGuidPowerSavingStatus)) {
+                        NotePowerCondition(&g_lastBatterySaver, value, L"Battery saver");
+                    } else if (IsEqualGUID(&setting->PowerSetting, &kGuidEnergySaverStatus)) {
+                        NotePowerCondition(&g_lastEnergySaver, value, L"Energy saver");
                     }
                 }
             }
@@ -6176,7 +6997,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_DDC_RETRY);
     KillTimer(g_hwnd, ID_TIMER_TOOLTIP);
     KillTimer(g_hwnd, ID_TIMER_KEY_DEVICES);
+    KillTimer(g_hwnd, ID_TIMER_PANEL);
     CloseBrightnessKeyReaders();
+    StopPanelWatch();
     PersistDirtyMonitors();
     DestroyAllOverlays();
     StopDdcWorker();
