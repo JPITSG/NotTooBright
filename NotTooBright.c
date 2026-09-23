@@ -5641,13 +5641,14 @@ static void cfg_sync_controller_bounds(void) {
 /* ── Fixed-size dialog frame ─────────────────────────────────────────────── */
 
 /* The dialog keeps the standard overlapped frame, so Windows draws the
- * normal caption height, but only the app sizes it (to fit the page's
- * content); the user cannot. Edge and corner hits become caption or border
- * hits, Size and Maximize leave the system menu and are refused as commands,
- * and the track size is pinned to the size the app last chose, which also
+ * normal caption height, but its title bar offers only Close, and only the
+ * app sizes it (to fit the page's content); the user cannot. Edge and corner
+ * hits become caption or border hits, Size, Minimize and Maximize leave the
+ * system menu (Size and Maximize are also refused as commands), and the
+ * track size is pinned to the size the app last chose, which also
  * keeps Aero Snap and the taskbar's window arrangements from stretching it.
  * Every size the app gives the window goes through FixedFrameSetPos. */
-#define FIXED_FRAME_STYLE (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX)
+#define FIXED_FRAME_STYLE (WS_OVERLAPPEDWINDOW & ~(WS_MINIMIZEBOX | WS_MAXIMIZEBOX))
 
 /* Runs first in the dialog's window procedure; returns TRUE with *result
  * set for a message it answered. */
@@ -5692,7 +5693,7 @@ static BOOL FixedFrameMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
 }
 
 /* Called once CreateWindowExW has returned: pins the size it gave the
- * window and takes Size and Maximize out of the system menu. */
+ * window and takes Size, Minimize and Maximize out of the system menu. */
 static void FixedFrameInit(HWND hwnd, SIZE *size) {
     RECT rect;
     if (GetWindowRect(hwnd, &rect)) {
@@ -5702,6 +5703,7 @@ static void FixedFrameInit(HWND hwnd, SIZE *size) {
     HMENU menu = GetSystemMenu(hwnd, FALSE);
     if (menu) {
         DeleteMenu(menu, SC_SIZE, MF_BYCOMMAND);
+        DeleteMenu(menu, SC_MINIMIZE, MF_BYCOMMAND);
         DeleteMenu(menu, SC_MAXIMIZE, MF_BYCOMMAND);
     }
 }

@@ -1,8 +1,9 @@
 """Run NotTooBright.c's fixed-size dialog frame against stubbed window calls.
 
-The dialogs keep the standard frame but only the app sizes them: edge hits,
-the Size and Maximize commands and the track size are covered here, then the
-source is checked for every place that sizes the dialog.
+The dialogs keep the standard frame with only a Close button, and only the
+app sizes them: the style, edge hits, the Size and Maximize commands, the
+system menu and the track size are covered here, then the source is checked
+for every place that sizes the dialog.
 Run: python3 -m unittest discover -s tests -v
 """
 from pathlib import Path
@@ -153,7 +154,7 @@ static LRESULT defaultHit;
 static int defaultCalls;
 static RECT windowRect;
 static BOOL windowRectOk = TRUE;
-static UINT deleted[4];
+static UINT deleted[8];
 static int deletedCount;
 static SIZE *pinned;
 static SIZE pinnedAtCall;
@@ -176,7 +177,7 @@ HMENU GetSystemMenu(HWND hwnd, BOOL revert) {
     return systemMenu;
 }
 BOOL DeleteMenu(HMENU menu, UINT item, UINT flags) {
-    assert(menu == systemMenu && flags == MF_BYCOMMAND && deletedCount < 4);
+    assert(menu == systemMenu && flags == MF_BYCOMMAND && deletedCount < 8);
     deleted[deletedCount++] = item;
     return TRUE;
 }
@@ -219,11 +220,11 @@ int main(void) {
     SIZE size = {0, 0};
     pinned = &size;
 
-    /* The standard frame (so the normal caption height) without Maximize. */
+    /* The standard frame (so the normal caption height) with only Close. */
     assert((FIXED_FRAME_STYLE & WS_CAPTION) == WS_CAPTION);
     assert(FIXED_FRAME_STYLE & WS_SYSMENU);
     assert(FIXED_FRAME_STYLE & WS_THICKFRAME);
-    assert(FIXED_FRAME_STYLE & WS_MINIMIZEBOX);
+    assert(!(FIXED_FRAME_STYLE & WS_MINIMIZEBOX));
     assert(!(FIXED_FRAME_STYLE & WS_MAXIMIZEBOX));
 
     /* Edges and corners cannot be dragged; the top edge moves the window. */
@@ -263,7 +264,8 @@ int main(void) {
     windowRect = (RECT){100, 50, 660, 570};
     FixedFrameInit(window, &size);
     assert(size.cx == 560 && size.cy == 520);
-    assert(deletedCount == 2 && deleted[0] == SC_SIZE && deleted[1] == SC_MAXIMIZE);
+    assert(deletedCount == 3 && deleted[0] == SC_SIZE && deleted[1] == SC_MINIMIZE &&
+           deleted[2] == SC_MAXIMIZE);
     info = track(&size, 136, 39, TRUE);
     assert(info.ptMinTrackSize.x == 560 && info.ptMinTrackSize.y == 520);
     assert(info.ptMaxTrackSize.x == 560 && info.ptMaxTrackSize.y == 520);

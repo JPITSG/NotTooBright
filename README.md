@@ -246,8 +246,8 @@ validate the download and enforce its safety limit.
 ## Configuration
 
 Double-click the tray icon (or choose **Configure** from its menu) to open
-the dialog. It sizes itself to its content and cannot be resized or
-maximized. The
+the dialog. It sizes itself to its content, cannot be resized, and has
+only a Close button. The
 brightness section applies immediately; the settings below it are saved with
 **Save**.
 
