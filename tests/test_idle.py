@@ -204,6 +204,7 @@ int main(void) {
 
     def test_idle_ticks_skip_work_but_transitions_and_pause_expiry_still_apply(self):
         run_c(r'''
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
 #include <assert.h>
 #include <math.h>
 #include <wchar.h>
@@ -242,7 +243,8 @@ BOOL ScheduleNow(SolarDay* days, double* minutes) {
     *minutes = clockMinutes; return TRUE;
 }
 ''' + function("ScheduleAnchors") + function("SmoothStep") +
-            function("ScheduleDaylightAt") + function("ScheduleValueAt") +
+            function("ScheduleDaylightAt") + function("ScheduleDeepSleepAt") +
+            function("ScheduleValueAt") + function("SchedulePhaseAt") +
             function("EvaluateSchedule") + r'''
 int main(void) {
     g_config.schedule = (Schedule){.enabled=TRUE, .hasLocation=TRUE,

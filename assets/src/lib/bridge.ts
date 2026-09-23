@@ -48,6 +48,11 @@ export interface ScheduleData {
   duskStartOffset: number;
   duskEndOffset: number;
   cycleResetMinutes: number;
+  // Optional: from deepSleepMinutes (after midnight) the level fades to
+  // deepSleepLevel and stays there until the next morning's transition.
+  deepSleepEnabled: boolean;
+  deepSleepLevel: number;
+  deepSleepMinutes: number;
 }
 
 export interface ConfigData {
@@ -119,6 +124,9 @@ export interface ScheduleSettings {
   duskStartOffset: number;
   duskEndOffset: number;
   cycleResetMinutes: number;
+  deepSleepEnabled: boolean;
+  deepSleepLevel: number;
+  deepSleepMinutes: number;
   scheduledKeys: string[];
 }
 
@@ -315,6 +323,9 @@ export function saveSettings(
     duskStartOffset: schedule.duskStartOffset,
     duskEndOffset: schedule.duskEndOffset,
     cycleResetMinutes: schedule.cycleResetMinutes,
+    deepSleepEnabled: schedule.deepSleepEnabled,
+    deepSleepLevel: schedule.deepSleepLevel,
+    deepSleepMinutes: schedule.deepSleepMinutes,
     scheduledKeys: monitors.filter((m) => !m.hidden && schedule.scheduledKeys.includes(m.key)).map((m) => m.key).join(","),
     scheduleMonitorKeys: monitors.filter((m) => !m.hidden).map((m) => m.key).join(","),
   });

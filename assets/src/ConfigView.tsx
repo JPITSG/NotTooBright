@@ -285,6 +285,9 @@ function initialSchedule(config: ConfigData, monitors: MonitorData[]): ScheduleS
     duskStartOffset: s?.duskStartOffset ?? -30,
     duskEndOffset: s?.duskEndOffset ?? 30,
     cycleResetMinutes: s?.cycleResetMinutes ?? 240,
+    deepSleepEnabled: s?.deepSleepEnabled ?? false,
+    deepSleepLevel: s?.deepSleepLevel ?? 10,
+    deepSleepMinutes: s?.deepSleepMinutes ?? 23 * 60 + 30,
     // Hidden monitors are not listed, so only visible ones count here;
     // a hidden one keeps its own flag until the next rescan.
     scheduledKeys: monitors.filter((m) => m.scheduled && !m.hidden).map((m) => m.key),

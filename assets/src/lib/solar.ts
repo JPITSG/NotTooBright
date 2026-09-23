@@ -15,11 +15,16 @@ export interface CurveShape {
   dawnEndOffset: number;
   duskStartOffset: number; // minutes relative to sunset
   duskEndOffset: number;
+  deepSleepEnabled: boolean;
+  deepSleepLevel: number;
+  deepSleepMinutes: number; // time of day deep sleep starts fading in
 }
 
 export const MAX_OFFSET = 6 * 60;
 export const MIN_GAP = 5;
 export const DAY_RADIUS = 2;
+// Minutes deep sleep takes to fade in.
+export const DEEP_SLEEP_RAMP = 5;
 
 const RAD = Math.PI / 180;
 
@@ -144,28 +149,79 @@ function smoothStep(x: number) {
   return x * x * (3 - 2 * x);
 }
 
+// The morning that ends a deep sleep, in minutes relative to today's
+// midnight: the end of the dawn transition (the dawn ramp rises from the
+// deep sleep level), the start of a day the sun never sets, or the solar
+// noon of one it never rises. `rise` is where the morning's ramp begins.
+function morningOf(shape: CurveShape, day: SolarDay, index: number) {
+  const base = (index - DAY_RADIUS) * 1440;
+  if (day.polar > 0) return { morning: base, rise: base };
+  if (day.polar < 0) return { morning: base + day.noon, rise: base + day.noon };
+  const a = scheduleAnchors(shape, day);
+  return { morning: base + a[1], rise: base + a[0] };
+}
+
+// How far deep sleep has taken over (0..1) at a local time, as on the host.
+export function deepSleepAt(shape: CurveShape, days: readonly SolarDay[], minutes: number) {
+  if (!shape.deepSleepEnabled) return 0;
+  let start = shape.deepSleepMinutes;
+  if (start > minutes) start -= 1440; // it began yesterday
+  for (let i = 0; i < days.length; i++) {
+    const { morning } = morningOf(shape, days[i], i);
+    if (morning > start && morning <= minutes) return 0; // that morning has come
+  }
+  return smoothStep((minutes - start) / DEEP_SLEEP_RAMP);
+}
+
+// Today's deep sleep stretches for the graph: from the start of each one
+// that touches today until its morning ramp begins, clipped to the day.
+export function deepSleepSpans(shape: CurveShape, days: readonly SolarDay[]) {
+  const spans: [number, number][] = [];
+  if (!shape.deepSleepEnabled) return spans;
+  for (const start of [shape.deepSleepMinutes - 1440, shape.deepSleepMinutes]) {
+    let end = Infinity;
+    for (let i = 0; i < days.length; i++) {
+      const { morning, rise } = morningOf(shape, days[i], i);
+      if (morning > start) {
+        end = rise;
+        break;
+      }
+    }
+    const from = Math.max(start, 0);
+    const to = Math.min(end, 1440);
+    if (to > from) spans.push([from, to]);
+  }
+  return spans;
+}
+
 export function scheduleValueAt(
   shape: CurveShape,
   days: readonly SolarDay[],
   minutes: number
 ) {
   const today = days[DAY_RADIUS];
-  if (today.polar > 0) return shape.dayLevel;
-  if (today.polar < 0) return shape.nightLevel;
   let daylight = 0;
-  for (let i = 0; i < days.length; i++) {
-    if (days[i].polar) continue;
-    const a = scheduleAnchors(shape, days[i]);
-    const t = minutes - (i - DAY_RADIUS) * 1440;
-    let weight = 0;
-    if (t > a[0] && t < a[3]) {
-      if (t < a[1]) weight = smoothStep((t - a[0]) / (a[1] - a[0]));
-      else if (t <= a[2]) weight = 1;
-      else weight = 1 - smoothStep((t - a[2]) / (a[3] - a[2]));
+  if (today.polar) {
+    daylight = today.polar > 0 ? 1 : 0;
+  } else {
+    for (let i = 0; i < days.length; i++) {
+      if (days[i].polar) continue;
+      const a = scheduleAnchors(shape, days[i]);
+      const t = minutes - (i - DAY_RADIUS) * 1440;
+      let weight = 0;
+      if (t > a[0] && t < a[3]) {
+        if (t < a[1]) weight = smoothStep((t - a[0]) / (a[1] - a[0]));
+        else if (t <= a[2]) weight = 1;
+        else weight = 1 - smoothStep((t - a[2]) / (a[3] - a[2]));
+      }
+      daylight = Math.max(daylight, weight);
     }
-    daylight = Math.max(daylight, weight);
   }
-  const value = shape.nightLevel + (shape.dayLevel - shape.nightLevel) * daylight;
+  // Deep sleep replaces the night level; the same order of operations as
+  // the host keeps the rounding identical.
+  const base = shape.nightLevel +
+    (shape.deepSleepLevel - shape.nightLevel) * deepSleepAt(shape, days, minutes);
+  const value = base + (shape.dayLevel - base) * daylight;
   // Match C lround for negative half-integers too.
   return Math.sign(value) * Math.floor(Math.abs(value) + 0.5);
 }

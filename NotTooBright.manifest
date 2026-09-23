@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.0.43.0" processorArchitecture="amd64" name="JPIT.NotTooBright" type="win32"/>
+  <assemblyIdentity version="0.0.44.0" processorArchitecture="amd64" name="JPIT.NotTooBright" type="win32"/>
   <description>Not Too Bright</description>
   <!-- Per-monitor DPI awareness: without this Windows renders the process at
        96 DPI and bitmap-stretches it on scaled displays, blurring all text.

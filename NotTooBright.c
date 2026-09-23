@@ -107,6 +107,9 @@
 #define REG_VALUE_SCHEDULE_DUSK_START L"ScheduleDuskStartOffset"
 #define REG_VALUE_SCHEDULE_DUSK_END L"ScheduleDuskEndOffset"
 #define REG_VALUE_CYCLE_RESET L"CycleResetMinutes"
+#define REG_VALUE_SCHEDULE_DEEP_SLEEP L"ScheduleDeepSleepEnabled"
+#define REG_VALUE_SCHEDULE_DEEP_LEVEL L"ScheduleDeepSleepLevel"
+#define REG_VALUE_SCHEDULE_DEEP_TIME L"ScheduleDeepSleepMinutes"   /* minutes after midnight */
 #define REG_VALUE_MON_NAME L"Name"
 
 /* Self update: the repository's release binary is downloaded, its embedded
@@ -247,6 +250,12 @@
 #define SCHEDULE_INTERVAL_MS 30000
 #define SCHEDULE_DEFAULT_DAY 100
 #define SCHEDULE_DEFAULT_NIGHT 30
+/* Optional deep sleep: from a time of day the level fades over
+ * SCHEDULE_DEEP_SLEEP_RAMP minutes to a level of its own and stays there
+ * until the next morning's transition. */
+#define SCHEDULE_DEFAULT_DEEP_LEVEL 10
+#define SCHEDULE_DEFAULT_DEEP_MINUTES (23 * 60 + 30)
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
 /* Transition anchors are minutes relative to sunrise (dawn) and sunset
  * (dusk); the defaults cover roughly civil twilight. */
 #define SCHEDULE_DEFAULT_DAWN_START (-30)
@@ -464,7 +473,8 @@ typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
 /* ── Configuration and monitor model ─────────────────────────────────────── */
 
 /* Sun-based automatic brightness: the day/night levels and four transition
- * anchors (minutes relative to sunrise and sunset) that shape the curve. */
+ * anchors (minutes relative to sunrise and sunset) that shape the curve,
+ * plus the optional deep sleep level late at night. */
 typedef struct {
     BOOL enabled;
     BOOL hasLocation;
@@ -477,6 +487,9 @@ typedef struct {
     int duskStartOffset;      /* day level until here (sunset + offset) */
     int duskEndOffset;        /* night level from here (sunset + offset) */
     int cycleResetMinutes;    /* time of day when manual overrides expire */
+    BOOL deepSleepEnabled;
+    int deepSleepLevel;       /* -SOFT_MAX_DIM..100, usually below the night level */
+    int deepSleepMinutes;     /* time of day deep sleep starts fading in */
     ULONGLONG pausedUntil;    /* UTC FILETIME; 0 unless paused by a manual change (persisted) */
 } Schedule;
 
@@ -545,7 +558,9 @@ typedef enum {
     SCHEDULE_PHASE_NIGHT = 0,
     SCHEDULE_PHASE_DAWN,      /* night -> daytime transition */
     SCHEDULE_PHASE_DAY,
-    SCHEDULE_PHASE_DUSK       /* daytime -> night transition */
+    SCHEDULE_PHASE_DUSK,      /* daytime -> night transition */
+    SCHEDULE_PHASE_SLEEP_FADE,/* night -> deep sleep, the short fade */
+    SCHEDULE_PHASE_DEEP_SLEEP
 } SchedulePhase;
 
 typedef enum {
@@ -978,6 +993,8 @@ static void SetScheduleDefaults(Schedule* schedule) {
     schedule->duskStartOffset = SCHEDULE_DEFAULT_DUSK_START;
     schedule->duskEndOffset = SCHEDULE_DEFAULT_DUSK_END;
     schedule->cycleResetMinutes = SCHEDULE_DEFAULT_RESET_MINUTES;
+    schedule->deepSleepLevel = SCHEDULE_DEFAULT_DEEP_LEVEL;
+    schedule->deepSleepMinutes = SCHEDULE_DEFAULT_DEEP_MINUTES;
 }
 
 static BOOL IsValidLatitude(double v) { return v >= -90.0 && v <= 90.0; }
@@ -1082,6 +1099,9 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DUSK_START, &sc->duskStartOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
     ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DUSK_END, &sc->duskEndOffset, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
     ReadRegistryInt(hKey, REG_VALUE_CYCLE_RESET, &sc->cycleResetMinutes, 0, 1439);
+    ReadRegistryBool(hKey, REG_VALUE_SCHEDULE_DEEP_SLEEP, &sc->deepSleepEnabled);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DEEP_LEVEL, &sc->deepSleepLevel, -SOFT_MAX_DIM, 100);
+    ReadRegistryInt(hKey, REG_VALUE_SCHEDULE_DEEP_TIME, &sc->deepSleepMinutes, 0, 1439);
     ReadRegistryQword(hKey, REG_VALUE_SCHEDULE_PAUSED_UNTIL, &sc->pausedUntil);
     if (!sc->hasLocation) sc->enabled = FALSE;
     RegCloseKey(hKey);
@@ -1126,6 +1146,9 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DUSK_START, (DWORD)(LONG)sc->duskStartOffset);
     WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DUSK_END, (DWORD)(LONG)sc->duskEndOffset);
     WriteRegistryDword(hKey, REG_VALUE_CYCLE_RESET, (DWORD)sc->cycleResetMinutes);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DEEP_SLEEP, sc->deepSleepEnabled ? 1 : 0);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DEEP_LEVEL, (DWORD)(LONG)sc->deepSleepLevel);
+    WriteRegistryDword(hKey, REG_VALUE_SCHEDULE_DEEP_TIME, (DWORD)sc->deepSleepMinutes);
     WriteRegistryQword(hKey, REG_VALUE_SCHEDULE_PAUSED_UNTIL, sc->pausedUntil);
     RegCloseKey(hKey);
     return success;
@@ -3939,16 +3962,59 @@ static double ScheduleDaylightAt(const Schedule* sc, const SolarDay days[SCHEDUL
     return daylight;
 }
 
-/* Brightness at a local time (minutes, fractional) on the given day. */
+/* How far deep sleep has taken over (0..1) at a local time (minutes,
+ * fractional). It starts at its time of day, fades in over
+ * SCHEDULE_DEEP_SLEEP_RAMP minutes, and lasts until the next morning: the
+ * end of the dawn transition, by when the daytime level has taken over
+ * anyway (so the dawn ramp rises from the deep sleep level); the start of a
+ * day the sun never sets; the solar noon of one it never rises. */
+static double ScheduleDeepSleepAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT],
+                                  double minutes) {
+    if (!sc->deepSleepEnabled) return 0;
+    double start = sc->deepSleepMinutes;
+    if (start > minutes) start -= 1440;   /* it began yesterday */
+    for (int i = 0; i < SCHEDULE_DAY_COUNT; i++) {
+        double morning = (i - SCHEDULE_DAY_RADIUS) * 1440;
+        if (days[i].polar < 0) {
+            morning += days[i].noon;
+        } else if (!days[i].polar) {
+            int a[4];
+            ScheduleAnchors(sc, &days[i], a);
+            morning += a[1];
+        }
+        if (morning > start && morning <= minutes) return 0;   /* that morning has come */
+    }
+    return SmoothStep((minutes - start) / SCHEDULE_DEEP_SLEEP_RAMP);
+}
+
+/* Brightness at a local time (minutes, fractional) on the given day. Deep
+ * sleep replaces the night level, so every ramp to or from the night uses
+ * the level in effect at that moment. */
 static int ScheduleValueAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes) {
     /* Clamp endpoints before interpolation, just like the dialog preview.
      * Keeping the stored levels lets the extended range be enabled again. */
     int minimum = g_config.allowBelowMinimum ? -SOFT_MAX_DIM : 0;
     double night = sc->nightLevel < minimum ? minimum : sc->nightLevel;
     double dayLevel = sc->dayLevel < minimum ? minimum : sc->dayLevel;
+    double deep = sc->deepSleepLevel < minimum ? minimum : sc->deepSleepLevel;
     SchedulePhase phase;
     double daylight = ScheduleDaylightAt(sc, days, minutes, &phase);
-    return (int)lround(night + (dayLevel - night) * daylight);
+    double base = night + (deep - night) * ScheduleDeepSleepAt(sc, days, minutes);
+    return (int)lround(base + (dayLevel - base) * daylight);
+}
+
+/* Where the curve is at a local time: the day/night part, with deep sleep
+ * taking over the night plateau (its fade, then the level itself). */
+static SchedulePhase SchedulePhaseAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT],
+                                     double minutes) {
+    SchedulePhase phase;
+    ScheduleDaylightAt(sc, days, minutes, &phase);
+    if (phase == SCHEDULE_PHASE_NIGHT) {
+        double deep = ScheduleDeepSleepAt(sc, days, minutes);
+        if (deep >= 1) phase = SCHEDULE_PHASE_DEEP_SLEEP;
+        else if (deep > 0) phase = SCHEDULE_PHASE_SLEEP_FADE;
+    }
+    return phase;
 }
 
 static const wchar_t* SchedulePhaseName(SchedulePhase phase) {
@@ -3956,6 +4022,8 @@ static const wchar_t* SchedulePhaseName(SchedulePhase phase) {
         case SCHEDULE_PHASE_DAY: return L"Daytime";
         case SCHEDULE_PHASE_DAWN: return L"Night \u2192 Daytime";
         case SCHEDULE_PHASE_DUSK: return L"Daytime \u2192 Night";
+        case SCHEDULE_PHASE_SLEEP_FADE: return L"Night \u2192 Deep sleep";
+        case SCHEDULE_PHASE_DEEP_SLEEP: return L"Deep sleep";
         default: return L"Night";
     }
 }
@@ -4068,7 +4136,7 @@ static BOOL SchedulePhaseNow(SchedulePhase* phase) {
     SolarDay days[SCHEDULE_DAY_COUNT];
     double minutes;
     if (!ScheduleNow(days, &minutes)) return FALSE;
-    ScheduleDaylightAt(&g_config.schedule, days, minutes, phase);
+    *phase = SchedulePhaseAt(&g_config.schedule, days, minutes);
     return TRUE;
 }
 
@@ -4085,8 +4153,7 @@ static void EvaluateSchedule(void) {
         return;
     }
     int target = ScheduleValueAt(sc, days, minutes);
-    SchedulePhase phase;
-    ScheduleDaylightAt(sc, days, minutes, &phase);
+    SchedulePhase phase = SchedulePhaseAt(sc, days, minutes);
     if ((int)phase != g_loggedSchedulePhase) {
         DebugPrint(L"[INFO] Schedule state: %s, target %d%%\n", SchedulePhaseName(phase), target);
         g_loggedSchedulePhase = (int)phase;
@@ -5793,7 +5860,7 @@ static void webview_push_init_config(void) {
     BOOL updateCheckPending =
         InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE ||
         InterlockedCompareExchangePointer((PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL;
-    const size_t cap = wcslen(monitors) + 1536;
+    const size_t cap = wcslen(monitors) + 2048;
     wchar_t* script = (wchar_t*)malloc(cap * sizeof(wchar_t));
     if (script) {
         int written = swprintf_s(script, cap,
@@ -5806,7 +5873,8 @@ static void webview_push_init_config(void) {
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
             L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
             L"\"dawnStartOffset\":%d,\"dawnEndOffset\":%d,\"duskStartOffset\":%d,"
-            L"\"duskEndOffset\":%d,\"cycleResetMinutes\":%d}},"
+            L"\"duskEndOffset\":%d,\"cycleResetMinutes\":%d,"
+            L"\"deepSleepEnabled\":%s,\"deepSleepLevel\":%d,\"deepSleepMinutes\":%d}},"
             L"\"monitors\":%s,\"updateCompletedVersion\":\"%s\"})",
             g_config.allowBelowMinimum ? L"true" : L"false",
             g_config.debugLogEnabled ? L"true" : L"false",
@@ -5822,6 +5890,7 @@ static void webview_push_init_config(void) {
             sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
             sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset,
             sc->duskEndOffset, sc->cycleResetMinutes,
+            sc->deepSleepEnabled ? L"true" : L"false", sc->deepSleepLevel, sc->deepSleepMinutes,
             monitors, eUpdateCompletedVersion);
         if (written > 0) webview_cfg_execute_script(script);
         free(script);
@@ -6128,6 +6197,9 @@ static void SaveScheduleFromMessage(const char* msg) {
     if (json_get_int(msg, "duskStartOffset", &v)) sc->duskStartOffset = ClampInt(v, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
     if (json_get_int(msg, "duskEndOffset", &v)) sc->duskEndOffset = ClampInt(v, -SCHEDULE_MAX_OFFSET, SCHEDULE_MAX_OFFSET);
     if (json_get_int(msg, "cycleResetMinutes", &v)) sc->cycleResetMinutes = ClampInt(v, 0, 1439);
+    if (json_get_int(msg, "deepSleepLevel", &v)) sc->deepSleepLevel = ClampInt(v, -SOFT_MAX_DIM, 100);
+    if (json_get_int(msg, "deepSleepMinutes", &v)) sc->deepSleepMinutes = ClampInt(v, 0, 1439);
+    sc->deepSleepEnabled = json_get_bool(msg, "deepSleepEnabled", FALSE);
     sc->enabled = json_get_bool(msg, "scheduleEnabled", FALSE) && sc->hasLocation;
 
     for (int i = 0; i < g_monitorCount; i++) {
@@ -6150,10 +6222,12 @@ static void SaveScheduleFromMessage(const char* msg) {
     for (int i = 0; i < g_monitorCount; i++) {
         if (g_monitors[i].scheduled && !g_monitors[i].hidden) scheduledCount++;
     }
-    DebugPrint(L"[INFO] Schedule %s: lat %.4f lon %.4f, day %d%% night %d%%, dawn %+d/%+d, dusk %+d/%+d, reset %02d:%02d, %d monitor(s) selected%s\n",
+    DebugPrint(L"[INFO] Schedule %s: lat %.4f lon %.4f, day %d%% night %d%%, dawn %+d/%+d, dusk %+d/%+d, deep sleep %s %d%% at %02d:%02d, reset %02d:%02d, %d monitor(s) selected%s\n",
                sc->enabled ? L"enabled" : L"disabled", sc->latitude, sc->longitude,
                sc->dayLevel, sc->nightLevel, sc->dawnStartOffset, sc->dawnEndOffset,
                sc->duskStartOffset, sc->duskEndOffset,
+               sc->deepSleepEnabled ? L"on" : L"off", sc->deepSleepLevel,
+               sc->deepSleepMinutes / 60, sc->deepSleepMinutes % 60,
                sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60, scheduledCount,
                (sc->enabled && scheduledCount == 0) ? L" - the schedule has nothing to control" : L"");
     UpdateScheduleTimer();
@@ -7019,11 +7093,12 @@ static void LogEnvironment(void) {
                (unsigned long)sessionId, metric, (unsigned long)glassId, glassKnown ? L"" : L" (unknown)",
                remote ? L"remote" : L"local", g_config.pauseInRemoteSession);
     const Schedule* sc = &g_config.schedule;
-    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d startWithWindows=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
+    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d startWithWindows=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d deepSleep=%d %d%% at %02d:%02d reset=%02d:%02d\n",
                g_config.allowBelowMinimum, g_config.debugLogEnabled, g_config.brightnessKeys,
                IsStartWithWindowsEnabled(), sc->enabled, sc->hasLocation,
                sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
                sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset, sc->duskEndOffset,
+               sc->deepSleepEnabled, sc->deepSleepLevel, sc->deepSleepMinutes / 60, sc->deepSleepMinutes % 60,
                sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60);
 }
 

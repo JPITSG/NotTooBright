@@ -39,7 +39,8 @@ test('Save sends stable keys and limits changes to monitors shown in the dialog'
 
 const solar = loadTs('assets/src/lib/solar.ts');
 const defaultShape = { dayLevel: 100, nightLevel: 10, dawnStartOffset: -30,
-  dawnEndOffset: 30, duskStartOffset: -30, duskEndOffset: 30 };
+  dawnEndOffset: 30, duskStartOffset: -30, duskEndOffset: 30,
+  deepSleepEnabled: false, deepSleepLevel: 5, deepSleepMinutes: 1410 };
 
 test('overlapping dusk and dawn remain continuous across calendar midnight', () => {
   process.env.TZ = 'Atlantic/Reykjavik';
@@ -60,6 +61,29 @@ test('ordinary dawn, daytime, dusk and night levels stay unchanged', () => {
   assert.equal(solar.scheduleValueAt(defaultShape, days, 720), 100);
   assert.equal(solar.scheduleValueAt(defaultShape, days, 1080), 55);
   assert.equal(solar.scheduleValueAt(defaultShape, days, 1440), 10);
+});
+
+test('deep sleep fades in, lasts through midnight into the dawn ramp, and is drawn as a band', () => {
+  const days = Array.from({ length: 5 }, () => ({ sunrise: 360, sunset: 1080, noon: 720, polar: 0 }));
+  const shape = { ...defaultShape, nightLevel: 30, deepSleepEnabled: true, deepSleepLevel: 10 };
+  assert.equal(solar.scheduleValueAt(shape, days, 1200), 30);
+  assert.equal(solar.scheduleValueAt(shape, days, 1410), 30);
+  assert.equal(solar.scheduleValueAt(shape, days, 1412.5), 20);
+  assert.equal(solar.scheduleValueAt(shape, days, 1415), 10);
+  assert.equal(solar.scheduleValueAt(shape, days, 1440), solar.scheduleValueAt(shape, days, 0));
+  assert.equal(solar.scheduleValueAt(shape, days, 360), 55);
+  assert.equal(solar.scheduleValueAt(shape, days, 390), 100);
+  // The band runs from the start to where the morning ramp begins. Arrays from
+  // the module's own context are copied for the comparison.
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(solar.deepSleepSpans(shape, days)), [[0, 330], [1410, 1440]]);
+  assert.deepEqual(plain(solar.deepSleepSpans({ ...shape, deepSleepMinutes: 90 }, days)), [[90, 330]]);
+  assert.deepEqual(plain(solar.deepSleepSpans({ ...shape, deepSleepMinutes: 360 }, days)), []);
+  assert.deepEqual(plain(solar.deepSleepSpans({ ...shape, deepSleepEnabled: false }, days)), []);
+  const polarNight = days.map((day) => ({ ...day, polar: -1, sunrise: 720, sunset: 720 }));
+  assert.deepEqual(plain(solar.deepSleepSpans(shape, polarNight)), [[0, 720], [1410, 1440]]);
+  assert.equal(solar.scheduleValueAt(shape, polarNight, 700), 10);
+  assert.equal(solar.scheduleValueAt(shape, polarNight, 800), 30);
 });
 
 test('solar event times use local clock minutes across both DST changes', () => {

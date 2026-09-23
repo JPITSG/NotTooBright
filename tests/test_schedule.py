@@ -155,11 +155,12 @@ int main(void) {
 #define SCHEDULE_MIN_GAP 5
 #define SCHEDULE_DAY_RADIUS 2
 #define SCHEDULE_DAY_COUNT 5
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
 typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
-    duskStartOffset, duskEndOffset; } Schedule;
+    duskStartOffset, duskEndOffset, deepSleepEnabled, deepSleepLevel, deepSleepMinutes; } Schedule;
 typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
 struct { int allowBelowMinimum; } g_config;
-''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleValueAt") + r'''
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleDeepSleepAt") + function("ScheduleValueAt") + r'''
 int main(void) {
     Schedule sc = {100, -90, -30, 30, -30, 30};
     SolarDay days[5];
@@ -175,9 +176,74 @@ int main(void) {
     assert(ScheduleValueAt(&sc, days, 0) == -90);
     g_config.allowBelowMinimum = 0;
     assert(ScheduleValueAt(&sc, days, 0) == 0);
+    /* The deep sleep level is clamped the same way. */
+    days[2].polar = 0;
+    sc.nightLevel = 30;
+    sc.deepSleepEnabled = 1; sc.deepSleepLevel = -50; sc.deepSleepMinutes = 1410;
+    assert(ScheduleValueAt(&sc, days, 0) == 0);
+    g_config.allowBelowMinimum = 1;
+    assert(ScheduleValueAt(&sc, days, 0) == -50);
 }
 ''')
 
+
+    def test_deep_sleep_fades_in_and_lasts_until_the_morning(self):
+        run_c(r'''
+#include <assert.h>
+#include <math.h>
+#define SOFT_MAX_DIM 90
+#define SCHEDULE_MIN_GAP 5
+#define SCHEDULE_DAY_RADIUS 2
+#define SCHEDULE_DAY_COUNT 5
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
+typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
+    duskStartOffset, duskEndOffset, deepSleepEnabled, deepSleepLevel, deepSleepMinutes; } Schedule;
+typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
+struct { int allowBelowMinimum; } g_config;
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") +
+              function("ScheduleDaylightAt") + function("ScheduleDeepSleepAt") + function("ScheduleValueAt") + r'''
+int main(void) {
+    /* Dawn 05:30-06:30, dusk 17:30-18:30; night 30%, deep sleep 10% at 23:30. */
+    Schedule sc = {100, 30, -30, 30, -30, 30, 1, 10, 1410};
+    SolarDay days[5];
+    for (int i = 0; i < 5; i++) days[i] = (SolarDay){360, 1080, 720, 0};
+    assert(ScheduleValueAt(&sc, days, 1200) == 30);     /* evening: the night level */
+    assert(ScheduleValueAt(&sc, days, 1410) == 30);     /* the fade starts here... */
+    assert(ScheduleValueAt(&sc, days, 1412.5) == 20);   /* ...halfway after 2.5 minutes... */
+    assert(ScheduleValueAt(&sc, days, 1415) == 10);     /* ...and is done after five */
+    assert(ScheduleValueAt(&sc, days, 1439) == 10);
+    assert(ScheduleValueAt(&sc, days, 0) == 10);        /* through midnight */
+    assert(ScheduleValueAt(&sc, days, 330) == 10);      /* until the dawn ramp starts */
+    assert(ScheduleValueAt(&sc, days, 360) == 55);      /* which rises from the deep level */
+    assert(ScheduleValueAt(&sc, days, 390) == 100);
+    assert(ScheduleValueAt(&sc, days, 1080) == 65);     /* dusk still falls to the night level */
+    /* Off: exactly the old curve. */
+    sc.deepSleepEnabled = 0;
+    assert(ScheduleValueAt(&sc, days, 0) == 30 && ScheduleValueAt(&sc, days, 360) == 65);
+    sc.deepSleepEnabled = 1;
+    /* After midnight, and above the night level. */
+    sc.deepSleepMinutes = 90; sc.deepSleepLevel = 60;
+    assert(ScheduleValueAt(&sc, days, 60) == 30 && ScheduleValueAt(&sc, days, 95) == 60);
+    assert(ScheduleValueAt(&sc, days, 1439) == 30);
+    /* In the daytime it only shows once dusk falls: to the deep level. */
+    sc.deepSleepMinutes = 840; sc.deepSleepLevel = 10;
+    assert(ScheduleValueAt(&sc, days, 900) == 100 && ScheduleValueAt(&sc, days, 1080) == 55);
+    assert(ScheduleValueAt(&sc, days, 1200) == 10 && ScheduleValueAt(&sc, days, 300) == 10);
+    /* Inside the dawn ramp: over by the time the day level is reached, and
+     * yesterday's has ended long before tonight. */
+    sc.deepSleepMinutes = 360;
+    assert(ScheduleValueAt(&sc, days, 370) == 77 && ScheduleValueAt(&sc, days, 390) == 100);
+    assert(ScheduleValueAt(&sc, days, 0) == 30 && ScheduleValueAt(&sc, days, 1200) == 30);
+    /* Polar night: from its time until solar noon. */
+    sc.deepSleepMinutes = 1410;
+    for (int i = 0; i < 5; i++) days[i] = (SolarDay){720, 720, 720, -1};
+    assert(ScheduleValueAt(&sc, days, 0) == 10 && ScheduleValueAt(&sc, days, 700) == 10);
+    assert(ScheduleValueAt(&sc, days, 800) == 30 && ScheduleValueAt(&sc, days, 1420) == 10);
+    /* Polar day: the day level all day. */
+    for (int i = 0; i < 5; i++) days[i].polar = 1;
+    assert(ScheduleValueAt(&sc, days, 0) == 100 && ScheduleValueAt(&sc, days, 1420) == 100);
+}
+''')
 
     def test_schedule_phase_follows_the_curve(self):
         run_c(r'''
@@ -186,10 +252,11 @@ int main(void) {
 #define SCHEDULE_MIN_GAP 5
 #define SCHEDULE_DAY_RADIUS 2
 #define SCHEDULE_DAY_COUNT 5
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
 typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
-    duskStartOffset, duskEndOffset; } Schedule;
+    duskStartOffset, duskEndOffset, deepSleepEnabled, deepSleepLevel, deepSleepMinutes; } Schedule;
 typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
-''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + r'''
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleDeepSleepAt") + function("SchedulePhaseAt") + r'''
 static SchedulePhase phaseAt(const Schedule* sc, const SolarDay* days, double minutes) {
     SchedulePhase phase;
     ScheduleDaylightAt(sc, days, minutes, &phase);
@@ -227,6 +294,19 @@ int main(void) {
     assert(phaseAt(&sc, days, 0) == SCHEDULE_PHASE_DAY);
     days[2].polar = -1;
     assert(phaseAt(&sc, days, 720) == SCHEDULE_PHASE_NIGHT);
+    /* Deep sleep: its fade, then the plateau until the dawn ramp. */
+    sc = (Schedule){100, 20, -30, 30, -30, 30, 1, 5, 1410};
+    for (int i = 0; i < 5; i++) days[i] = (SolarDay){360, 1080, 720, 0};
+    assert(SchedulePhaseAt(&sc, days, 1400) == SCHEDULE_PHASE_NIGHT);
+    assert(SchedulePhaseAt(&sc, days, 1410) == SCHEDULE_PHASE_NIGHT);   /* fade starts here */
+    assert(SchedulePhaseAt(&sc, days, 1412) == SCHEDULE_PHASE_SLEEP_FADE);
+    assert(SchedulePhaseAt(&sc, days, 1415) == SCHEDULE_PHASE_DEEP_SLEEP);
+    assert(SchedulePhaseAt(&sc, days, 200) == SCHEDULE_PHASE_DEEP_SLEEP);
+    assert(SchedulePhaseAt(&sc, days, 330.5) == SCHEDULE_PHASE_DAWN);
+    assert(SchedulePhaseAt(&sc, days, 720) == SCHEDULE_PHASE_DAY);
+    assert(SchedulePhaseAt(&sc, days, 1200) == SCHEDULE_PHASE_NIGHT);
+    sc.deepSleepEnabled = 0;
+    assert(SchedulePhaseAt(&sc, days, 200) == SCHEDULE_PHASE_NIGHT);
 }
 ''')
 
@@ -299,13 +379,19 @@ int main(void) {
     g_monitors[1].hidden = 1;
     UpdateTrayTooltip();
     assert(wcscmp(g_nid.szTip, L"State: Daytime\nSchedule: Active\nLeft: 75%") == 0);
-    currentPhase = SCHEDULE_PHASE_NIGHT;
+    currentPhase = SCHEDULE_PHASE_SLEEP_FADE;
     g_monitorCount = 0;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"State: Night \u2192 Deep sleep\nSchedule: Active") == 0);
+    currentPhase = SCHEDULE_PHASE_DEEP_SLEEP;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"State: Deep sleep\nSchedule: Active") == 0);
+    currentPhase = SCHEDULE_PHASE_NIGHT;
     UpdateTrayTooltip();
     assert(wcscmp(g_nid.szTip, L"State: Night\nSchedule: Active") == 0);
     /* Unchanged text is not sent to the shell again. */
     UpdateTrayTooltip();
-    assert(modifies == 5);
+    assert(modifies == 7);
     g_config.schedule.enabled = 0;
     UpdateTrayTooltip();
     assert(wcscmp(g_nid.szTip, L"Schedule: Disabled") == 0);
@@ -340,6 +426,7 @@ int main(void) {
 #define TRUE 1
 #define FALSE 0
 #define SCHEDULE_DAY_COUNT 5
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
 #define MODE_PROBING 1
 #define MODE_WAITING 2
 #define MODE_HARDWARE 3
@@ -368,8 +455,8 @@ BOOL ScheduleNow(SolarDay days[SCHEDULE_DAY_COUNT], double* minutes) {
 int ScheduleValueAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes) {
     (void)sc; (void)days; (void)minutes; return target;
 }
-double ScheduleDaylightAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes, SchedulePhase* phase) {
-    (void)sc; (void)days; (void)minutes; *phase = SCHEDULE_PHASE_DAY; return 1;
+SchedulePhase SchedulePhaseAt(const Schedule* sc, const SolarDay days[SCHEDULE_DAY_COUNT], double minutes) {
+    (void)sc; (void)days; (void)minutes; return SCHEDULE_PHASE_DAY;
 }
 const wchar_t* SchedulePhaseName(SchedulePhase phase) { (void)phase; return L""; }
 BrightnessMode MonitorMode(const Monitor* m) { return m->mode; }
@@ -710,12 +797,19 @@ for (const [tz, lat, lon] of [['Atlantic/Reykjavik',64.15,-21.94],
   process.env.TZ = tz;
   for (const month of [0,2,5,9]) {
     const days = solar.computeSolarDays(lat,lon,new Date(2026,month,21,12));
-    for (const extended of [0,1]) for (const offsets of [[-30,30,-30,30],[-360,30,-30,360],[180,360,-360,-180]]) {
+    for (const extended of [0,1]) for (const offsets of [[-30,30,-30,30],[-360,30,-30,360],[180,360,-360,-180]])
+    for (const [deepOn, deepLevel, deepMinutes] of [[0,10,1410],[1,10,1410],[1,60,90],[1,-50,840],[1,50,360]]) {
       const shape = {dayLevel:100,nightLevel:-90,dawnStartOffset:offsets[0],
-        dawnEndOffset:offsets[1],duskStartOffset:offsets[2],duskEndOffset:offsets[3]};
-      for (let minute=0; minute<=1440; minute+=7.5) {
+        dawnEndOffset:offsets[1],duskStartOffset:offsets[2],duskEndOffset:offsets[3],
+        deepSleepEnabled:deepOn,deepSleepLevel:deepLevel,deepSleepMinutes:deepMinutes};
+      const minutes = [];
+      for (let minute=0; minute<=1440; minute+=7.5) minutes.push(minute);
+      for (const step of [0.5,1.25,2.5,3.75,4.9]) minutes.push(deepMinutes + step);
+      for (const minute of minutes) {
+        // The dialog clamps the levels it passes in; the host clamps inside.
         cases.push([extended,shape,days,minute,solar.scheduleValueAt(
-          {...shape,nightLevel:extended ? -90 : 0},days,minute)]);
+          {...shape,nightLevel:extended ? -90 : 0,
+           deepSleepLevel:extended ? deepLevel : Math.max(deepLevel,0)},days,minute)]);
       }
     }
   }
@@ -726,7 +820,8 @@ console.log(JSON.stringify(cases));
         for extended, shape, days, minute, expected in cases:
             row = [extended, shape['dayLevel'], shape['nightLevel'],
                    shape['dawnStartOffset'], shape['dawnEndOffset'],
-                   shape['duskStartOffset'], shape['duskEndOffset']]
+                   shape['duskStartOffset'], shape['duskEndOffset'],
+                   shape['deepSleepEnabled'], shape['deepSleepLevel'], shape['deepSleepMinutes']]
             for day in days:
                 row += [day['sunrise'], day['sunset'], day['noon'], day['polar']]
             rows.append(' '.join(map(str, row + [minute, expected])))
@@ -738,21 +833,27 @@ console.log(JSON.stringify(cases));
 #define SCHEDULE_MIN_GAP 5
 #define SCHEDULE_DAY_RADIUS 2
 #define SCHEDULE_DAY_COUNT 5
+#define SCHEDULE_DEEP_SLEEP_RAMP 5
 typedef struct { int dayLevel, nightLevel, dawnStartOffset, dawnEndOffset,
-    duskStartOffset, duskEndOffset; } Schedule;
+    duskStartOffset, duskEndOffset, deepSleepEnabled, deepSleepLevel, deepSleepMinutes; } Schedule;
 typedef struct { int sunrise, sunset, noon, polar; } SolarDay;
 struct { int allowBelowMinimum; } g_config;
-''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleValueAt") + r'''
+''' + enumeration("SchedulePhase") + function("ScheduleAnchors") + function("SmoothStep") + function("ScheduleDaylightAt") + function("ScheduleDeepSleepAt") + function("ScheduleValueAt") + r'''
 int main(void) {
-    Schedule sc; SolarDay days[5]; double minutes; int expected;
+    Schedule sc; SolarDay days[5]; double minutes; int expected, rows = 0, deep = 0;
     while (scanf("%d", &g_config.allowBelowMinimum) == 1) {
-        assert(scanf("%d%d%d%d%d%d", &sc.dayLevel, &sc.nightLevel,
-            &sc.dawnStartOffset, &sc.dawnEndOffset, &sc.duskStartOffset, &sc.duskEndOffset) == 6);
+        assert(scanf("%d%d%d%d%d%d%d%d%d", &sc.dayLevel, &sc.nightLevel,
+            &sc.dawnStartOffset, &sc.dawnEndOffset, &sc.duskStartOffset, &sc.duskEndOffset,
+            &sc.deepSleepEnabled, &sc.deepSleepLevel, &sc.deepSleepMinutes) == 9);
         for (int i = 0; i < 5; i++)
             assert(scanf("%d%d%d%d", &days[i].sunrise, &days[i].sunset, &days[i].noon, &days[i].polar) == 4);
         assert(scanf("%lf%d", &minutes, &expected) == 2);
         assert(ScheduleValueAt(&sc, days, minutes) == expected);
+        rows++;
+        if (ScheduleDeepSleepAt(&sc, days, minutes) > 0) deep++;
     }
+    /* Deep sleep actually took part in a good share of the comparisons. */
+    assert(rows > 90000 && deep > rows / 10);
 }
 ''', '\n'.join(rows))
 

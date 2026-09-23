@@ -35,8 +35,8 @@ else, and an optional schedule that follows the sun for your location.
 Hover the icon for a tooltip listing every monitor and its current
 brightness, headed by a **Schedule** line (*Disabled*, *Active*, or *Paused*
 after a manual change) and, while the schedule is enabled, a **State** line
-(*Daytime*, *Night*, or the transition in progress, *Daytime → Night* or
-*Night → Daytime*). Right-click it for **Configure** and **Exit**, plus **Increase
+(*Daytime*, *Night*, *Deep sleep*, or the transition in progress,
+*Daytime → Night*, *Night → Daytime* or *Night → Deep sleep*). Right-click it for **Configure** and **Exit**, plus **Increase
 brightness** / **Decrease brightness** and any preset levels you have listed
 once you have chosen which monitor the menu controls (see *Tray menu
 brightness control*), and **Resume schedule** while a manual change has
@@ -145,6 +145,15 @@ midnight. **Reset curve** restores the defaults (half an hour on either
 side of sunrise and sunset). Where the sun does not rise or set on a given
 day, the night or daytime level simply applies all day.
 
+**Deep sleep** is optional: at a time of day you choose (23:30 by default)
+the selected monitors fade over five minutes to a deep sleep level of their
+own, usually darker than the night level (it can be brighter too), and stay
+there until the next morning's transition, which then brightens them
+straight from the deep sleep level. Unlike the four points above, the deep
+sleep time is a fixed clock time. On the graph, deep sleep shows as a
+shaded band with a line and a point of its own; drag the point to change
+the time. Where the sun does not rise, deep sleep lasts until midday.
+
 The schedule is evaluated every 30 seconds and writes to a monitor only when
 the rounded percentage changes. Solar times are cached for the current date,
 location, and Windows time-zone settings; clock/settings changes and resume
@@ -155,7 +164,8 @@ and unchanged schedule ticks do not queue tooltip updates.
 The tray icon's tooltip shows where the
 schedule currently is: **State: Daytime** or **State: Night** on the two
 plateaus, **State: Daytime → Night** while dusk is dimming the monitors and
-**State: Night → Daytime** while dawn is brightening them, and a **Schedule**
+**State: Night → Daytime** while dawn is brightening them, **State: Night →
+Deep sleep** during the fade and **State: Deep sleep** after it, and a **Schedule**
 line that reads **Disabled**, **Active**, or **Paused**. If you change a
 scheduled monitor's brightness by hand (its slider, **All monitors**, or
 the tray menu), the schedule pauses for every monitor it controls until
@@ -262,6 +272,7 @@ brightness section applies immediately; the settings below it are saved with
 | Adjust brightness automatically with the sun | Enables the sun-based schedule described in [Automatic Brightness](#automatic-brightness). Requires a latitude and longitude. Saved with **Save**. Disabled by default. |
 | Latitude / Longitude | Your location in decimal degrees (north and east positive), used to compute sunrise and sunset. |
 | Daytime / Night brightness | The levels the schedule applies during the day and at night. |
+| Deep sleep | Optional: a **Deep sleep time** and **Deep sleep brightness**. From that time of day the level fades over five minutes to the deep sleep brightness and stays there until the morning transition. Disabled by default; 23:30 and 10% when first turned on. |
 | Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
 | Apply to | Which monitors follow the schedule. Newly enabled schedules select every visible monitor. |
 | Cycle reset time | Time of day at which a schedule paused by a manual change takes over again. 04:00 by default. |

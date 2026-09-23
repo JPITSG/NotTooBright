@@ -5,8 +5,10 @@ import {
   type SolarDay,
   MAX_OFFSET,
   MIN_GAP,
+  DEEP_SLEEP_RAMP,
   computeSolarDays,
   DAY_RADIUS,
+  deepSleepSpans,
   scheduleAnchors,
   scheduleValueAt,
   formatMinutes,
@@ -45,7 +47,13 @@ const PAD = { left: 34, right: 12, top: 24, bottom: 22 };
 const PLOT_W = VIEW_W - PAD.left - PAD.right;
 const PLOT_H = VIEW_H - PAD.top - PAD.bottom;
 const PLOT_BOTTOM = PAD.top + PLOT_H;
-const HANDLE_NAMES = ["Dawn starts", "Full brightness", "Evening starts", "Night level"];
+const HANDLE_NAMES = ["Dawn starts", "Full brightness", "Evening starts", "Night level", "Deep sleep"];
+// The fifth handle moves the deep sleep time; the others the sun anchors.
+const DEEP_HANDLE = 4;
+// Deep sleep's colours: a faint indigo night band, a deeper line and handle.
+const DEEP_FILL = "#eef2ff";
+const DEEP_STROKE = "#6366f1";
+const DEEP_TEXT = "#4338ca";
 
 interface SunCurveProps {
   shape: CurveShape;
@@ -53,9 +61,10 @@ interface SunCurveProps {
   now: Date;
   minLevel: number;
   onOffsetsChange: (offsets: Partial<CurveShape>) => void;
+  onDeepSleepMinutesChange: (minutes: number) => void;
 }
 
-function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps) {
+function SunCurve({ shape, days, now, minLevel, onOffsetsChange, onDeepSleepMinutesChange }: SunCurveProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [dragging, setDragging] = useState<number | null>(null);
   const [hovered, setHovered] = useState<number | null>(null);
@@ -66,12 +75,23 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
     PAD.top + ((100 - clamp(level, minLevel, 100)) / (100 - minLevel)) * PLOT_H;
 
   const anchors = scheduleAnchors(shape, day);
-  const anchorLevels = [shape.nightLevel, shape.dayLevel, shape.dayLevel, shape.nightLevel];
+  // On the curve itself: with deep sleep the dawn ramp starts from its level.
+  const anchorLevels = anchors.map((anchor) => scheduleValueAt(shape, days, anchor));
 
-  const points: string[] = [];
-  for (let m = 0; m <= 1440; m += 5) {
-    points.push(`${x(m).toFixed(1)},${y(scheduleValueAt(shape, days, m)).toFixed(1)}`);
+  const samples = new Set<number>();
+  for (let m = 0; m <= 1440; m += 5) samples.add(m);
+  if (shape.deepSleepEnabled) {
+    // The fade lasts five minutes; sample it every minute so it keeps its
+    // shape, yesterday's too when it runs past midnight.
+    for (let m = 0; m <= DEEP_SLEEP_RAMP; m++) {
+      for (const at of [shape.deepSleepMinutes + m, shape.deepSleepMinutes + m - 1440]) {
+        if (at > 0 && at < 1440) samples.add(at);
+      }
+    }
   }
+  const points = Array.from(samples)
+    .sort((a, b) => a - b)
+    .map((m) => `${x(m).toFixed(1)},${y(scheduleValueAt(shape, days, m)).toFixed(1)}`);
   const linePath = `M${points.join("L")}`;
   const areaPath = `${linePath}L${x(1440).toFixed(1)},${PLOT_BOTTOM}L${x(0).toFixed(1)},${PLOT_BOTTOM}Z`;
 
@@ -94,6 +114,11 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
 
   function moveDrag(e: ReactPointerEvent) {
     if (dragging === null) return;
+    if (dragging === DEEP_HANDLE) {
+      const minute = clamp(minuteFromPointer(e), 0, 1435);
+      if (minute !== shape.deepSleepMinutes) onDeepSleepMinutesChange(minute);
+      return;
+    }
     const event = dragging < 2 ? day.sunrise : day.sunset;
     let minute = clamp(minuteFromPointer(e), event - MAX_OFFSET, event + MAX_OFFSET);
     if (dragging > 0) minute = Math.max(minute, anchors[dragging - 1] + MIN_GAP);
@@ -117,6 +142,13 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
   if (minLevel < 0) levelTicks.splice(1, 1, 50, 0);
   const sunriseX = x(day.sunrise);
   const sunsetX = x(day.sunset);
+  const deepSpans = deepSleepSpans(shape, days);
+  const deepLabel = deepSpans.reduce<[number, number] | null>(
+    (widest, span) => (!widest || span[1] - span[0] > widest[1] - widest[0] ? span : widest),
+    null
+  );
+  const deepX = x(shape.deepSleepMinutes);
+  const deepY = y(scheduleValueAt(shape, days, shape.deepSleepMinutes + DEEP_SLEEP_RAMP));
 
   return (
     <svg
@@ -139,6 +171,10 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
       </defs>
 
       <rect x={PAD.left} y={PAD.top} width={PLOT_W} height={PLOT_H} fill="#f8fafc" />
+      {/* Under the daylight shading: deep sleep only shows at night. */}
+      {deepSpans.map(([from, to]) => (
+        <rect key={from} x={x(from)} y={PAD.top} width={Math.max(0, x(to) - x(from))} height={PLOT_H} fill={DEEP_FILL} />
+      ))}
       {day.polar === 1 && (
         <rect x={PAD.left} y={PAD.top} width={PLOT_W} height={PLOT_H} fill="#fef3c7" opacity="0.9" />
       )}
@@ -148,6 +184,17 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
           <rect x={sunriseX} y={PAD.top} width={Math.max(0, sunsetX - sunriseX)} height={PLOT_H} fill="#fef3c7" opacity="0.9" />
           <rect x={sunsetX} y={PAD.top} width={Math.max(0, x(anchors[3]) - sunsetX)} height={PLOT_H} fill="url(#ntb-dusk)" />
         </>
+      )}
+      {deepLabel && x(deepLabel[1]) - x(deepLabel[0]) >= 56 && (
+        <text
+          x={(x(deepLabel[0]) + x(deepLabel[1])) / 2}
+          y={PAD.top + 12}
+          fontSize="9"
+          fill={DEEP_STROKE}
+          textAnchor="middle"
+        >
+          Deep sleep
+        </text>
       )}
 
       {levelTicks.map((level) => (
@@ -178,6 +225,10 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
             Sunset {formatMinutes(day.sunset)}
           </text>
         </>
+      )}
+
+      {shape.deepSleepEnabled && (
+        <line x1={deepX} x2={deepX} y1={PAD.top} y2={PLOT_BOTTOM} stroke={DEEP_STROKE} strokeWidth="1" strokeDasharray="3 3" />
       )}
 
       <path d={areaPath} fill="#171717" opacity="0.08" />
@@ -230,6 +281,35 @@ function SunCurve({ shape, days, now, minLevel, onOffsetsChange }: SunCurveProps
             </g>
           );
         })}
+
+      {shape.deepSleepEnabled && (
+        <g>
+          {active === DEEP_HANDLE && (
+            <text
+              x={deepX}
+              y={deepY - 12}
+              fontSize="9"
+              fill={DEEP_TEXT}
+              fontWeight="500"
+              textAnchor={deepX < PAD.left + 70 ? "start" : deepX > VIEW_W - 90 ? "end" : "middle"}
+            >
+              {HANDLE_NAMES[DEEP_HANDLE]} {formatMinutes(shape.deepSleepMinutes)}
+            </text>
+          )}
+          <circle
+            cx={deepX}
+            cy={deepY}
+            r={active === DEEP_HANDLE ? 7 : 5.5}
+            fill={dragging === DEEP_HANDLE ? DEEP_STROKE : "#ffffff"}
+            stroke={DEEP_STROKE}
+            strokeWidth="1.6"
+            style={{ cursor: "ew-resize" }}
+            onPointerDown={(e) => startDrag(DEEP_HANDLE, e)}
+            onPointerEnter={() => setHovered(DEEP_HANDLE)}
+            onPointerLeave={() => setHovered(null)}
+          />
+        </g>
+      )}
     </svg>
   );
 }
@@ -262,6 +342,9 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
     dawnEndOffset: settings.dawnEndOffset,
     duskStartOffset: settings.duskStartOffset,
     duskEndOffset: settings.duskEndOffset,
+    deepSleepEnabled: settings.deepSleepEnabled,
+    deepSleepLevel: clamp(settings.deepSleepLevel, minLevel, 100),
+    deepSleepMinutes: settings.deepSleepMinutes,
   };
   const anchors = day ? scheduleAnchors(shape, day) : null;
 
@@ -284,7 +367,14 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
     update({ scheduledKeys: Array.from(set) });
   }
 
-  const resetTime = `${String(Math.floor(settings.cycleResetMinutes / 60)).padStart(2, "0")}:${String(settings.cycleResetMinutes % 60).padStart(2, "0")}`;
+  const resetTime = formatMinutes(settings.cycleResetMinutes);
+  const deepSleepTime = formatMinutes(settings.deepSleepMinutes);
+
+  // "HH:MM" from a time input, or null while it is incomplete.
+  function parseTime(text: string) {
+    const [h, m] = text.split(":").map(Number);
+    return Number.isFinite(h) && Number.isFinite(m) ? clamp(h * 60 + m, 0, 1439) : null;
+  }
 
   return (
     <div className="space-y-3">
@@ -373,6 +463,64 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
                 onChange={(e) => update({ nightLevel: Number(e.target.value) })}
               />
             </div>
+            <div className="space-y-1.5 pt-1">
+              <div className="flex items-start gap-2">
+                <Checkbox
+                  id="deepSleep"
+                  className="mt-0.5"
+                  checked={settings.deepSleepEnabled}
+                  onChange={(e) => update({ deepSleepEnabled: e.target.checked })}
+                />
+                <div className="space-y-0.5">
+                  <Label htmlFor="deepSleep" className="cursor-pointer text-xs">
+                    Deep sleep
+                  </Label>
+                  <p className="text-neutral-500 text-[11px] leading-snug">
+                    At a set time every night, fades over five minutes to a
+                    deep sleep level of its own and stays there until the
+                    morning transition.
+                  </p>
+                </div>
+              </div>
+              {settings.deepSleepEnabled && (
+                <div className="ml-6 flex items-start gap-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="deepSleepTime" className="text-xs">
+                      Deep sleep time
+                    </Label>
+                    <Input
+                      id="deepSleepTime"
+                      type="time"
+                      className="w-28"
+                      value={deepSleepTime}
+                      onChange={(e) => {
+                        const minutes = parseTime(e.target.value);
+                        if (minutes !== null) update({ deepSleepMinutes: minutes });
+                      }}
+                    />
+                  </div>
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="deepSleepLevel" className="text-xs">
+                        Deep sleep brightness
+                      </Label>
+                      <span className="w-10 text-right text-xs tabular-nums">{shape.deepSleepLevel}%</span>
+                    </div>
+                    {/* As tall as the time field beside it, so the two line up. */}
+                    <div className="flex h-8 items-center">
+                      <Slider
+                        id="deepSleepLevel"
+                        min={minLevel}
+                        max={100}
+                        step={1}
+                        value={shape.deepSleepLevel}
+                        onChange={(e) => update({ deepSleepLevel: Number(e.target.value) })}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="space-y-1.5 rounded-md border border-neutral-200 px-2 pt-2 pb-1.5">
@@ -384,21 +532,33 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
                   now={now}
                   minLevel={minLevel}
                   onOffsetsChange={(offsets) => update(offsets)}
+                  onDeepSleepMinutesChange={(deepSleepMinutes) => update({ deepSleepMinutes })}
                 />
                 <div className="flex items-start justify-between gap-2 px-1">
                   <p className="text-neutral-500 text-[11px] leading-snug">
                     {day.polar === 1
                       ? "The sun does not set today, so the daytime level applies all day."
                       : day.polar === -1
-                        ? "The sun does not rise today, so the night level applies all day."
-                        : anchors && (
+                        ? shape.deepSleepEnabled
+                          ? `The sun does not rise today, so the night level applies, with deep sleep from ${deepSleepTime} until midday.`
+                          : "The sun does not rise today, so the night level applies all day."
+                        : anchors &&
+                          (shape.deepSleepEnabled ? (
+                            <>
+                              Brightens {formatMinutes(anchors[0])}–{formatMinutes(anchors[1])}, dims{" "}
+                              {formatMinutes(anchors[2])}–{formatMinutes(anchors[3])} and sleeps deeper
+                              from {deepSleepTime} today. Drag the points to change when this happens;
+                              the four sun points follow sunrise and sunset through the seasons, deep
+                              sleep keeps its time of day.
+                            </>
+                          ) : (
                             <>
                               Brightens {formatMinutes(anchors[0])}–{formatMinutes(anchors[1])}, dims{" "}
                               {formatMinutes(anchors[2])}–{formatMinutes(anchors[3])} today. Drag the
                               four points to change when the transitions happen; they stay tied to
                               sunrise and sunset as the seasons change.
                             </>
-                          )}
+                          ))}
                   </p>
                   <Button
                     variant="ghost"
@@ -460,10 +620,8 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
                 className="w-28"
                 value={resetTime}
                 onChange={(e) => {
-                  const [h, m] = e.target.value.split(":").map(Number);
-                  if (Number.isFinite(h) && Number.isFinite(m)) {
-                    update({ cycleResetMinutes: clamp(h * 60 + m, 0, 1439) });
-                  }
+                  const minutes = parseTime(e.target.value);
+                  if (minutes !== null) update({ cycleResetMinutes: minutes });
                 }}
               />
             </div>
