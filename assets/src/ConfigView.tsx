@@ -305,6 +305,9 @@ export default function ConfigView({
   const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
     config.autoCheckForUpdates ?? true
   );
+  const [startWithWindows, setStartWithWindows] = useState(
+    config.startWithWindows ?? false
+  );
   const [pauseInRemoteSession, setPauseInRemoteSession] = useState(
     config.pauseInRemoteSession ?? true
   );
@@ -512,6 +515,7 @@ export default function ConfigView({
     saveSettings(
       debugLog,
       autoCheckForUpdates,
+      startWithWindows,
       pauseInRemoteSession,
       brightnessKeys,
       trayTarget,
@@ -749,6 +753,23 @@ export default function ConfigView({
             Leaves the monitors exactly as they are while this session is
             viewed remotely and picks up again at the computer. Turn off only
             if this Windows session is always used through Remote Desktop.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="startWithWindows"
+          className="mt-0.5"
+          checked={startWithWindows}
+          onChange={(e) => setStartWithWindows(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="startWithWindows" className="cursor-pointer">
+            Start with Windows
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Launches in the tray when you sign in to Windows.
           </p>
         </div>
       </div>

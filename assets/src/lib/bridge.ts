@@ -54,6 +54,9 @@ export interface ConfigData {
   allowBelowMinimum: boolean;
   debugLog: boolean;
   autoCheckForUpdates: boolean;
+  // Whether this user's Run entry launches this copy of the executable at
+  // sign-in; read from the entry itself each time the dialog opens.
+  startWithWindows: boolean;
   // Leave the monitors alone while the session is viewed through Remote
   // Desktop (the default); remoteSession says whether that is the case now.
   pauseInRemoteSession: boolean;
@@ -285,6 +288,7 @@ export function dismissUpdateConfirmation() {
 export function saveSettings(
   debugLog: boolean,
   autoCheckForUpdates: boolean,
+  startWithWindows: boolean,
   pauseInRemoteSession: boolean,
   brightnessKeys: boolean,
   trayTarget: string,
@@ -296,6 +300,7 @@ export function saveSettings(
     action: "saveSettings",
     debugLog,
     autoCheckForUpdates,
+    startWithWindows,
     pauseInRemoteSession,
     brightnessKeys,
     trayTarget,

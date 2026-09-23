@@ -268,6 +268,7 @@ brightness section applies immediately; the settings below it are saved with
 | Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
 | Use the keyboard's brightness keys | The keyboard's Brightness Up/Down keys step every external monitor by 10%; see [Keyboard Brightness Keys](#keyboard-brightness-keys). Saved with **Save**. Disabled by default. |
 | Pause while connected through Remote Desktop | Leaves the monitors alone while the session is viewed remotely; see [Remote Desktop](#remote-desktop). Saved with **Save**. Enabled by default. |
+| Start with Windows | Launches Not Too Bright in the tray when you sign in to Windows, through a per-user startup entry (no administrator rights needed). An entry disabled in Task Manager's startup apps shows as off; turning the option on re-enables it. Saved with **Save**. Disabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Update (button) | Checks the repository for a newer build right now and shows the result; see [Updates](#updates). |
 | Enable debug logging | Appends timestamped diagnostic events to `%LOCALAPPDATA%\NotTooBright\debug.log` (rotated at ~1 MB): Windows version and settings, every adapter and monitor Windows reports, EDID identity, each DDC/CI call with its result, error code and duration (including the monitor's capabilities string when a probe fails), each call to Windows' brightness control for a built-in display and every level Windows reports for it, mode changes, applied values, overlay changes, and dialog actions. Attach it when reporting a monitor that is not controlled. Disabled by default. |
@@ -283,12 +284,14 @@ next to the executable, so it can run from any folder.
 |----------|----------|
 | `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, the brightness keys option, the Remote Desktop pause, update checking and the ignored update version, debug logging |
 | `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, original brightness |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `NotTooBright` | The **Start with Windows** entry (the quoted path of the executable), only while that option is on |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |
 | `%TEMP%\NotTooBright-download-*.exe`, `%TEMP%\NotTooBright-updater-*.exe` | Staged update and the short-lived updater copy; removed when an update finishes |
 
 Deleting the `HKCU\SOFTWARE\JPIT\NotTooBright` key returns the application to
-its factory state.
+its factory state; turn **Start with Windows** off first (or delete its `Run`
+value) if the application should no longer start at sign-in.
 
 ## Limitations
 

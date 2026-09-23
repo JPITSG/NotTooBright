@@ -23,7 +23,7 @@
  * Other parts:
  *   - System tray icon with a context menu (Configure / Exit)
  *   - WebView2-hosted configuration dialog (React UI embedded as a resource)
- *   - Registry-persisted settings
+ *   - Registry-persisted settings, optional start with Windows
  *   - Optional debug log in %LOCALAPPDATA%\NotTooBright\debug.log
  *
  * Cross-compiled with MinGW-w64. The WebView2 COM interfaces are declared
@@ -121,6 +121,11 @@
 #define REG_VALUE_PAUSE_REMOTE L"PauseInRemoteSession"
 #define REG_VALUE_BRIGHTNESS_KEYS L"BrightnessKeys"
 #define REG_VALUE_IGNORED_UPDATE_VERSION L"IgnoredUpdateVersion"
+/* Start with Windows: this user's Run entry for the executable, named
+ * APP_NAME, and the marker Task Manager and Settings use to disable it. */
+#define STARTUP_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define STARTUP_APPROVED_RUN_KEY \
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
 #define ID_TIMER_AUTO_UPDATE 8
 #define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
 
@@ -1197,6 +1202,71 @@ static void SaveMonitorSettings(const Monitor* m) {
     RegSetValueExW(hKey, REG_VALUE_MON_NAME, 0, REG_SZ, (const BYTE*)m->name,
                    (DWORD)((wcslen(m->name) + 1) * sizeof(wchar_t)));
     RegCloseKey(hKey);
+}
+
+/* ── Start with Windows ──────────────────────────────────────────────────── */
+
+/* Ported from ../c_APIMonitor; keep the two in step. A per-user Run entry
+ * launches this executable at sign-in. Task Manager and Settings can
+ * disable that entry without deleting it (odd first byte of its
+ * StartupApproved value), so a disabled entry counts as off. The option is
+ * the entry itself, not a setting of our own: the dialog shows whether one
+ * is registered for this copy of the executable. */
+
+static BOOL GetStartupCommand(wchar_t* command, size_t commandCch) {
+    wchar_t path[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return FALSE;
+    return swprintf_s(command, commandCch, L"\"%s\"", path) > 0;
+}
+
+static BOOL IsStartWithWindowsEnabled(void) {
+    wchar_t expected[MAX_PATH + 2];
+    wchar_t actual[MAX_PATH + 2];
+    DWORD size = sizeof(actual);
+    if (!GetStartupCommand(expected, sizeof(expected) / sizeof(wchar_t)) ||
+        RegGetValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, APP_NAME,
+                     RRF_RT_REG_SZ, NULL, actual, &size) != ERROR_SUCCESS ||
+        _wcsicmp(actual, expected) != 0) {
+        return FALSE;
+    }
+
+    BYTE approved[64];
+    size = sizeof(approved);
+    if (RegGetValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY, APP_NAME,
+                     RRF_RT_REG_BINARY, NULL, approved, &size) != ERROR_SUCCESS ||
+        size == 0) {
+        return TRUE; /* No marker (or Windows 7, which has none) means enabled. */
+    }
+    return (approved[0] & 1) == 0;
+}
+
+static LONG SetStartWithWindows(BOOL enable) {
+    LONG result;
+    if (enable) {
+        wchar_t command[MAX_PATH + 2];
+        HKEY key;
+        if (!GetStartupCommand(command, sizeof(command) / sizeof(wchar_t))) {
+            return ERROR_BAD_PATHNAME;
+        }
+        result = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, NULL,
+                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL,
+                                 &key, NULL);
+        if (result != ERROR_SUCCESS) return result;
+        result = RegSetValueExW(key, APP_NAME, 0, REG_SZ, (const BYTE*)command,
+                                (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+    } else {
+        result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_RUN_KEY, APP_NAME);
+        if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+    }
+    if (result != ERROR_SUCCESS) return result;
+
+    /* Drop any disabled marker so turning the option on takes effect and
+     * turning it off leaves nothing behind. */
+    result = RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY,
+                                APP_NAME);
+    return result == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : result;
 }
 
 /* ── JSON helpers ────────────────────────────────────────────────────────── */
@@ -5646,7 +5716,8 @@ static void webview_push_init_config(void) {
     if (script) {
         int written = swprintf_s(script, cap,
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
-            L"\"autoCheckForUpdates\":%s,\"pauseInRemoteSession\":%s,\"remoteSession\":%s,"
+            L"\"autoCheckForUpdates\":%s,\"startWithWindows\":%s,"
+            L"\"pauseInRemoteSession\":%s,\"remoteSession\":%s,"
             L"\"brightnessKeys\":%s,"
             L"\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
             L"\"trayTarget\":\"%s\",\"trayPresets\":\"%s\","
@@ -5658,6 +5729,7 @@ static void webview_push_init_config(void) {
             g_config.allowBelowMinimum ? L"true" : L"false",
             g_config.debugLogEnabled ? L"true" : L"false",
             g_config.autoCheckForUpdates ? L"true" : L"false",
+            IsStartWithWindowsEnabled() ? L"true" : L"false",
             g_config.pauseInRemoteSession ? L"true" : L"false",
             g_remoteSession ? L"true" : L"false",
             g_config.brightnessKeys ? L"true" : L"false",
@@ -5929,6 +6001,20 @@ static BOOL MonitorKeyInList(const wchar_t* key, const char* list) {
     return FALSE;
 }
 
+/* The Start with Windows checkbox of a saveSettings message. Only a changed
+ * choice touches the Run entry, so an entry for another copy of the
+ * executable is left alone unless the user turns this on. */
+static void SaveStartWithWindows(const char* msg) {
+    BOOL before = IsStartWithWindowsEnabled();
+    BOOL wanted = json_get_bool(msg, "startWithWindows", before);
+    if (wanted == before) return;
+    LONG result = SetStartWithWindows(wanted);
+    if (result != ERROR_SUCCESS) {
+        DebugPrint(L"[WARNING] Could not %s start with Windows (error %ld)\n",
+                   wanted ? L"enable" : L"disable", (long)result);
+    }
+}
+
 /* Reads the schedule part of a saveSettings message. Saving the schedule
  * counts as a deliberate change, so any paused monitors resume. */
 static void SaveScheduleFromMessage(const char* msg) {
@@ -6182,10 +6268,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 L"can write to HKEY_CURRENT_USER.",
                 APP_DISPLAY_NAME_WSTRING, MB_ICONWARNING | MB_OK);
         }
+        SaveStartWithWindows(msg);
         FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 256);
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, pauseInRemoteSession=%d, brightnessKeys=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
-                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, g_config.pauseInRemoteSession,
-                   g_config.brightnessKeys, g_config.trayTarget, presetText);
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, startWithWindows=%d, pauseInRemoteSession=%d, brightnessKeys=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
+                   g_config.debugLogEnabled, g_config.autoCheckForUpdates, IsStartWithWindowsEnabled(),
+                   g_config.pauseInRemoteSession, g_config.brightnessKeys, g_config.trayTarget, presetText);
         /* Turning the pause off from inside a remote session resumes at once. */
         UpdateRemoteSessionState();
         if (brightnessKeysBefore != g_config.brightnessKeys) UpdateBrightnessKeyReaders();
@@ -6845,8 +6932,9 @@ static void LogEnvironment(void) {
                (unsigned long)sessionId, metric, (unsigned long)glassId, glassKnown ? L"" : L" (unknown)",
                remote ? L"remote" : L"local", g_config.pauseInRemoteSession);
     const Schedule* sc = &g_config.schedule;
-    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
-               g_config.allowBelowMinimum, g_config.debugLogEnabled, g_config.brightnessKeys, sc->enabled, sc->hasLocation,
+    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d startWithWindows=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d reset=%02d:%02d\n",
+               g_config.allowBelowMinimum, g_config.debugLogEnabled, g_config.brightnessKeys,
+               IsStartWithWindowsEnabled(), sc->enabled, sc->hasLocation,
                sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
                sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset, sc->duskEndOffset,
                sc->cycleResetMinutes / 60, sc->cycleResetMinutes % 60);

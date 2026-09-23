@@ -27,11 +27,12 @@ test('Save sends stable keys and limits changes to monitors shown in the dialog'
   const { saveSettings } = loadTs('assets/src/lib/bridge.ts', {
     window: { chrome: { webview: { postMessage: (text) => { message = JSON.parse(text); } } } },
   });
-  saveSettings(false, false, true, false, '', [], { scheduledKeys: ['a', 'gone', 'hidden'] }, [
+  saveSettings(false, false, true, true, false, '', [], { scheduledKeys: ['a', 'gone', 'hidden'] }, [
     monitor('a', 9), monitor('b', 10, false), monitor('hidden', 11, true, true),
   ]);
   assert.equal(message.scheduledKeys, 'a');
   assert.equal(message.scheduleMonitorKeys, 'a,b');
+  assert.equal(message.startWithWindows, true);
   assert.equal(message.pauseInRemoteSession, true);
   assert.equal(message.brightnessKeys, false);
 });
