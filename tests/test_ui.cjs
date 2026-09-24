@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { loadTs } = require('./load_ts.cjs');
 
-const { reconcileScheduleSelection } = loadTs('assets/src/lib/scheduleSelection.ts');
+const { hasScheduleChanges, reconcileScheduleSelection } = loadTs('assets/src/lib/scheduleSelection.ts');
 const monitor = (key, uid, scheduled = true, hidden = false) => ({ key, uid, scheduled, hidden });
 
 test('reconnecting with a new UID preserves both selected and deselected choices', () => {
@@ -20,6 +20,51 @@ test('newly shown monitors inherit saved selections; hidden monitors stay exclud
     monitor('a', 1), monitor('b', 2, false), monitor('c', 3, true, true),
   ]);
   assert.equal(JSON.stringify(selection), '["a"]');
+});
+
+test('schedule edits require Save, including disabled settings; reverting clears them', () => {
+  const saved = { enabled: false, latitude: '', longitude: '', dayLevel: 100, nightLevel: 30,
+    dawnStartOffset: -30, dawnEndOffset: 30, duskStartOffset: -30, duskEndOffset: 30,
+    cycleResetMinutes: 240, deepSleepEnabled: false, deepSleepLevel: 10,
+    deepSleepMinutes: 1410, scheduledKeys: ['a', 'b'] };
+  const monitors = [monitor('a', 1), monitor('b', 2)];
+  for (const [key, value] of Object.entries(saved)) {
+    const changed = { ...saved, [key]: typeof value === 'boolean' ? !value :
+      typeof value === 'number' ? value + 1 : typeof value === 'string' ? '1' : ['b'] };
+    assert.equal(hasScheduleChanges(changed, saved, monitors), true, key);
+    changed[key] = value;
+    assert.equal(hasScheduleChanges(changed, saved, monitors), false, key);
+  }
+});
+
+test('monitor churn and persisted live changes do not create unsaved schedule edits', () => {
+  const current = { enabled: true, scheduledKeys: ['a', 'b', 'gone', 'hidden'] };
+  const saved = { enabled: true, scheduledKeys: ['b', 'a'] };
+  const monitors = [monitor('b', 21), monitor('a', 22), monitor('hidden', 3, false, true)];
+  assert.equal(hasScheduleChanges(current, saved, monitors), false);
+  const live = monitors.map(m => ({ ...m, value: 40, forceSoftware: true, pausedUntil: '04:00' }));
+  assert.equal(hasScheduleChanges(current, saved, live), false);
+  assert.equal(hasScheduleChanges({ ...current, scheduledKeys: ['b'] }, saved, live), true);
+  const newMonitor = monitor('new', 23);
+  const selection = reconcileScheduleSelection(current.scheduledKeys, new Set(['a', 'b']), [...live, newMonitor]);
+  assert.equal(hasScheduleChanges({ ...current, scheduledKeys: selection },
+    { ...saved, scheduledKeys: [...saved.scheduledKeys, 'new'] }, [...live, newMonitor]), false);
+});
+
+test('native close requests reach the latest listener and stop after unmount', () => {
+  const window = {};
+  const { onCloseRequested } = loadTs('assets/src/lib/bridge.ts', { window });
+  window.onCloseRequested();
+  let first = 0, current = 0;
+  const removeFirst = onCloseRequested(() => first++);
+  window.onCloseRequested();
+  const removeCurrent = onCloseRequested(() => current++);
+  removeFirst();
+  window.onCloseRequested();
+  removeCurrent();
+  window.onCloseRequested();
+  assert.equal(first, 1);
+  assert.equal(current, 1);
 });
 
 test('Save sends stable keys and limits changes to monitors shown in the dialog', () => {

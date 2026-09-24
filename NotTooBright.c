@@ -749,6 +749,7 @@ static int g_ddcSetCount = 0;
 
 /* Self update state. */
 static BOOL g_configViewReady = FALSE;
+static BOOL g_configCloseApproved = FALSE;
 static BOOL g_updateConfirmationPending = FALSE;
 static volatile LONG g_updateCheckPending = FALSE;
 static volatile LONG g_updateCheckAutomatic = FALSE;
@@ -6835,8 +6836,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         /* Turning the pause off from inside a remote session resumes at once. */
         UpdateRemoteSessionState();
         if (brightnessKeysBefore != g_config.brightnessKeys) UpdateBrightnessKeyReaders();
+        g_configCloseApproved = TRUE;
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
+        // The configuration UI sends this only after checking for unsaved edits.
+        g_configCloseApproved = TRUE;
         PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "resize") == 0) {
         int contentHeight = 0, contentWidth = 0;
@@ -6850,6 +6854,17 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
 }
 
 /* ── Config dialog window ────────────────────────────────────────────────── */
+
+static BOOL RequestConfigClose(void) {
+    if (!g_configViewReady || !g_cfgWebView ||
+        g_configCloseApproved || g_updateInstallReady) {
+        return FALSE;
+    }
+    // X, Alt+F4 and the system menu all arrive here through WM_CLOSE.
+    // Keep the window alive until the UI saves or explicitly approves closing.
+    webview_cfg_execute_script(L"window.onCloseRequested()");
+    return TRUE;
+}
 
 static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     LRESULT frameResult;
@@ -6913,6 +6928,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             break;
 
         case WM_CLOSE:
+            if (RequestConfigClose()) return 0;
             g_cfgWindowShown = FALSE;
             KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             if (g_cfgController) {
@@ -6951,6 +6967,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             g_cfgHwnd = NULL;
             g_cfgWindowShown = FALSE;
             g_configViewReady = FALSE;
+            g_configCloseApproved = FALSE;
             KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             /* The updater now owns the staged file and waits for this
              * process to exit; shut down cleanly through the tray path. */
@@ -7017,6 +7034,7 @@ static void ShowConfigDialog(void) {
     FixedFrameInit(g_cfgHwnd, &g_cfgFrameSize);
     g_cfgWindowShown = FALSE;
     g_configViewReady = FALSE;
+    g_configCloseApproved = FALSE;
     g_cfgShowFallbackTries = 0;
     SetTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK, CFG_SHOW_FALLBACK_DELAY_MS, NULL);
 

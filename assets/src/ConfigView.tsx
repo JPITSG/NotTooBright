@@ -1,5 +1,5 @@
-import { reconcileScheduleSelection } from "./lib/scheduleSelection";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { hasScheduleChanges, reconcileScheduleSelection } from "./lib/scheduleSelection";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   type ConfigData,
   type MonitorData,
@@ -12,6 +12,7 @@ import {
   parseTrayPresets,
   saveSettings,
   closeDialog,
+  onCloseRequested,
   checkForUpdate,
   cancelUpdateCheck,
   configReady,
@@ -30,6 +31,7 @@ import {
   resumeSchedule,
   setDesiredContentWidth,
 } from "./lib/bridge";
+import ConfigAlert from "./components/ConfigAlert";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
 import { Input } from "./components/ui/input";
@@ -438,6 +440,46 @@ export default function ConfigView({
     for (const monitor of visible) seen.add(monitor.key);
   }, [monitors]);
   const [scheduleError, setScheduleError] = useState("");
+  const [closePrompt, setClosePrompt] = useState(false);
+  // Brightness, software-only mode, hiding and the extended range are
+  // already persisted by the host. Only settings that need Save count here.
+  const hasChanges =
+    debugLog !== (config.debugLog ?? false) ||
+    autoCheckForUpdates !== (config.autoCheckForUpdates ?? true) ||
+    startWithWindows !== (config.startWithWindows ?? false) ||
+    pauseInRemoteSession !== (config.pauseInRemoteSession ?? true) ||
+    brightnessKeys !== (config.brightnessKeys ?? false) ||
+    trayTarget !== (config.trayTarget ?? TRAY_TARGET_NONE) ||
+    trayPresets !== (config.trayPresets ?? "").split(",").filter(Boolean).join(", ") ||
+    hasScheduleChanges(
+      { ...schedule, scheduledKeys: reconcileScheduleSelection(
+        schedule.scheduledKeys, seenScheduleKeys.current, monitors
+      ) },
+      initialSchedule(config, monitors),
+      monitors
+    );
+
+  const handleRequestClose = useCallback(() => {
+    if (hasChanges) {
+      setClosePrompt(true);
+    } else {
+      closeDialog();
+    }
+  }, [hasChanges]);
+
+  // Install before configReady, and keep native close requests in sync with edits.
+  useLayoutEffect(() => onCloseRequested(handleRequestClose), [handleRequestClose]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !closePrompt && !updateAlert) {
+        event.preventDefault();
+        handleRequestClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [closePrompt, updateAlert, handleRequestClose]);
   const throttledSend = useThrottledSender();
   // The schedule section is tall; on a wide enough screen the dialog shows
   // it beside the monitors instead of below them.
@@ -507,12 +549,15 @@ export default function ConfigView({
         setScheduleError(
           "Enter a latitude between -90 and 90 and a longitude between -180 and 180."
         );
+        setClosePrompt(false);
+        requestAnimationFrame(() => document.getElementById(lat === null ? "latitude" : "longitude")?.focus());
         return;
       }
     }
     setScheduleError("");
     if (showTrayPresets && trayPresetsParsed.error) {
-      trayPresetsRef.current?.focus();
+      setClosePrompt(false);
+      requestAnimationFrame(() => trayPresetsRef.current?.focus());
       return;
     }
     saveSettings(
@@ -542,7 +587,9 @@ export default function ConfigView({
   );
 
   return (
+    <>
     <div
+      inert={closePrompt || !!updateAlert}
       className="p-4 space-y-3"
       style={twoColumn ? { width: TWO_COLUMN_WIDTH, maxWidth: "100%" } : undefined}
     >
@@ -848,7 +895,7 @@ export default function ConfigView({
             variant="outline"
             size="sm"
             className="min-w-[5rem]"
-            onClick={closeDialog}
+            onClick={handleRequestClose}
           >
             Cancel
           </Button>
@@ -858,101 +905,109 @@ export default function ConfigView({
         </div>
       </div>
 
-      {updateAlert && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="update-alert-title"
-            aria-describedby="update-alert-message"
-            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
-          >
-            <div className="space-y-1">
-              <h2 id="update-alert-title" className="text-sm font-semibold">
-                {updateAlert.title}
-              </h2>
-              <p
-                id="update-alert-message"
-                className="text-xs leading-relaxed text-neutral-600"
-              >
-                {updateAlert.message}
-              </p>
+    </div>
+
+      {closePrompt ? (
+        <ConfigAlert
+          key="save"
+          id="save-alert"
+          title="Unsaved changes"
+          message="Save changes before closing?"
+          onEscape={() => setClosePrompt(false)}
+        >
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setClosePrompt(false)}>
+              Keep editing
+            </Button>
+            <Button variant="outline" size="sm" onClick={closeDialog}>
+              Discard
+            </Button>
+            <Button size="sm" onClick={handleSave}>
+              Save
+            </Button>
+          </div>
+        </ConfigAlert>
+      ) : updateAlert && (
+        <ConfigAlert
+          key="update"
+          id="update-alert"
+          title={updateAlert.title}
+          message={updateAlert.message}
+        >
+          {updateAlert.currentVersion && updateAlert.remoteVersion && (
+            <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+              <dt className="text-neutral-500">Current version</dt>
+              <dd className="font-medium tabular-nums text-neutral-900">
+                {updateAlert.currentVersion}
+              </dd>
+              <dt className="text-neutral-500">Remote version</dt>
+              <dd className="font-medium tabular-nums text-neutral-900">
+                {updateAlert.remoteVersion}
+              </dd>
+            </dl>
+          )}
+          {(updateAlert.status === "newer" ||
+            updateAlert.status === "same") && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="reopenSettings"
+                checked={reopenSettings}
+                disabled={updateChecking}
+                onChange={(e) => setReopenSettings(e.target.checked)}
+              />
+              <Label htmlFor="reopenSettings" className="cursor-pointer">
+                Reopen settings after update
+              </Label>
             </div>
-            {updateAlert.currentVersion && updateAlert.remoteVersion && (
-              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
-                <dt className="text-neutral-500">Current version</dt>
-                <dd className="font-medium tabular-nums text-neutral-900">
-                  {updateAlert.currentVersion}
-                </dd>
-                <dt className="text-neutral-500">Remote version</dt>
-                <dd className="font-medium tabular-nums text-neutral-900">
-                  {updateAlert.remoteVersion}
-                </dd>
-              </dl>
+          )}
+          <div className="flex justify-end gap-2">
+            {updateAlert.status === "newer" && updateAlert.automatic && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={updateChecking}
+                onClick={handleIgnoreUpdateVersion}
+              >
+                Ignore this version
+              </Button>
             )}
             {(updateAlert.status === "newer" ||
               updateAlert.status === "same") && (
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="reopenSettings"
-                  checked={reopenSettings}
-                  disabled={updateChecking}
-                  onChange={(e) => setReopenSettings(e.target.checked)}
-                />
-                <Label htmlFor="reopenSettings" className="cursor-pointer">
-                  Reopen settings after update
-                </Label>
-              </div>
-            )}
-            <div className="flex justify-end gap-2">
-              {updateAlert.status === "newer" && updateAlert.automatic && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={updateChecking}
-                  onClick={handleIgnoreUpdateVersion}
-                >
-                  Ignore this version
-                </Button>
-              )}
-              {(updateAlert.status === "newer" ||
-                updateAlert.status === "same") && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  autoFocus
-                  disabled={updateChecking}
-                  onClick={handleDismissUpdate}
-                >
-                  Cancel
-                </Button>
-              )}
               <Button
+                variant="outline"
                 size="sm"
-                autoFocus={
-                  updateAlert.status !== "newer" &&
-                  updateAlert.status !== "same"
-                }
+                autoFocus
                 disabled={updateChecking}
-                onClick={
-                  updateAlert.status === "newer" ||
-                  updateAlert.status === "same"
-                    ? handleInstallUpdate
-                    : handleDismissUpdate
-                }
+                onClick={handleDismissUpdate}
               >
-                {updateChecking
-                  ? "Starting..."
-                  : updateAlert.status === "same"
-                    ? "Force update"
-                    : updateAlert.status === "newer"
-                      ? "Update"
-                      : "OK"}
+                Cancel
               </Button>
-            </div>
+            )}
+            <Button
+              size="sm"
+              autoFocus={
+                updateAlert.status !== "newer" &&
+                updateAlert.status !== "same"
+              }
+              disabled={updateChecking}
+              onClick={
+                updateAlert.status === "newer" ||
+                updateAlert.status === "same"
+                  ? handleInstallUpdate
+                  : handleDismissUpdate
+              }
+            >
+              {updateChecking
+                ? "Starting..."
+                : updateAlert.status === "same"
+                  ? "Force update"
+                  : updateAlert.status === "newer"
+                    ? "Update"
+                    : "OK"}
+            </Button>
           </div>
-        </div>
+        </ConfigAlert>
       )}
-    </div>
+    </>
   );
 }

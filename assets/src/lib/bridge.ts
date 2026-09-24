@@ -179,6 +179,18 @@ let remoteSessionCallback: RemoteSessionCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 let locationResultCallback: ((result: LocationResult) => void) | null = null;
+let closeRequestedCallback: (() => void) | null = null;
+
+window.onCloseRequested = () => {
+  closeRequestedCallback?.();
+};
+
+export function onCloseRequested(cb: () => void) {
+  closeRequestedCallback = cb;
+  return () => {
+    if (closeRequestedCallback === cb) closeRequestedCallback = null;
+  };
+}
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;
@@ -401,6 +413,7 @@ export function reportSize(height: number) {
 
 declare global {
   interface Window {
+    onCloseRequested: () => void;
     chrome: {
       webview: {
         postMessage(message: string): void;

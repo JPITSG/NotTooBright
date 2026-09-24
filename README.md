@@ -275,6 +275,11 @@ only a Close button. The
 brightness section applies immediately; the settings below it are saved with
 **Save**.
 
+Closing with unsaved settings (Cancel, the Close button, Alt+F4 or Escape)
+asks **Save changes before closing?** over a dark overlay. Choose **Keep
+editing**, **Discard**, or **Save**. Brightness changes that apply immediately
+are already remembered and do not trigger this prompt.
+
 | Control | Description |
 |---------|-------------|
 | All monitors | Sets every monitor to the same value (shown only with more than one monitor). |
