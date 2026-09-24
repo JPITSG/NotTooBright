@@ -66,6 +66,8 @@ export interface ConfigData {
   // Desktop (the default); remoteSession says whether that is the case now.
   pauseInRemoteSession: boolean;
   remoteSession: boolean;
+  // A "Detect from IP" lookup is still running (the dialog was reopened).
+  locationDetecting: boolean;
   // The keyboard's Brightness Up/Down keys step every monitor by 10%
   // (built-in displays are left to Windows, which moves them itself).
   brightnessKeys: boolean;
@@ -155,6 +157,18 @@ export interface UpdateProgress {
   kilobytesPerSecond: number;
 }
 
+// Answer to "Detect from IP". The host asks four free services at once and
+// takes the first answer; a found location is reused for an hour (cached).
+export interface LocationResult {
+  status: "ok" | "failed" | "timeout" | "cancelled";
+  latitude: number;
+  longitude: number;
+  place: string; // "City, CC", may be empty
+  source: string; // the service that answered
+  cached: boolean;
+  nextLookup: string; // "HH:MM" when a new lookup is allowed
+}
+
 type InitCallback = (data: InitData) => void;
 type MonitorsCallback = (monitors: MonitorData[]) => void;
 type RemoteSessionCallback = (remote: boolean) => void;
@@ -164,6 +178,7 @@ let monitorsCallback: MonitorsCallback | null = null;
 let remoteSessionCallback: RemoteSessionCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
+let locationResultCallback: ((result: LocationResult) => void) | null = null;
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;
@@ -213,6 +228,27 @@ export function onRemoteSession(cb: RemoteSessionCallback) {
 ) => {
   if (updateProgressCallback) updateProgressCallback(progress);
 };
+
+(window as unknown as Record<string, unknown>).onLocationResult = (
+  result: LocationResult
+) => {
+  if (locationResultCallback) locationResultCallback(result);
+};
+
+export function onLocationResult(cb: (result: LocationResult) => void) {
+  locationResultCallback = cb;
+  return () => {
+    if (locationResultCallback === cb) locationResultCallback = null;
+  };
+}
+
+export function detectLocation() {
+  post({ action: "detectLocation" });
+}
+
+export function cancelLocationDetection() {
+  post({ action: "cancelLocation" });
+}
 
 export function onUpdateResult(cb: (result: UpdateResult) => void) {
   updateResultCallback = cb;

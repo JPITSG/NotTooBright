@@ -300,6 +300,7 @@ int main(void) {
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <wchar.h>
 #define TRUE 1
 #define FALSE 0
 #define DebugPrint(...) ((void)0)
@@ -314,7 +315,8 @@ enum { PBT_APMRESUMEAUTOMATIC=200, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE,
     DBT_DEVNODES_CHANGED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK };
 ''' + defines("ID_TIMER_REFRESH_MONITORS", "ID_TIMER_OVERLAY_TOPMOST", "ID_TIMER_PERSIST",
               "ID_TIMER_SCHEDULE", "ID_TIMER_DDC_RETRY", "ID_TIMER_AUTO_UPDATE",
-              "ID_TIMER_TOOLTIP", "ID_TIMER_KEY_DEVICES", "ID_TIMER_PANEL", "SCHEDULE_INTERVAL_MS",
+              "ID_TIMER_TOOLTIP", "ID_TIMER_KEY_DEVICES", "ID_TIMER_PANEL", "ID_TIMER_LOCATION",
+              "SCHEDULE_INTERVAL_MS",
               "REFRESH_MONITORS_DEBOUNCE_MS", "REFRESH_MONITORS_RESUME_DELAY_MS",
               "PANEL_SETTLE_MS", "PANEL_QUIET_MS") + r'''
 struct { BOOL autoCheckForUpdates; struct { BOOL enabled, hasLocation; } schedule; } g_config;
@@ -335,6 +337,8 @@ void NotePowerCondition(LONG* last, LONG value, const wchar_t* what) {
     (void)what; powerConditions++; lastCondition = last; lastConditionValue = value;
 }
 void ServicePanels(void) { panelServices++; }
+int locationTimeouts;
+void EndLocationLookup(const wchar_t* status) { assert(wcscmp(status, L"timeout") == 0); locationTimeouts++; }
 BOOL g_overlayTimerRunning, g_ddcRetryPending;
 HWND g_hwnd = (HWND)1;
 int evaluations, refreshes, keyRestarts, sessionChecks, scheduleTimer, raised;
@@ -419,6 +423,8 @@ int main(void) {
     assert(quietTransitions == 4 && refreshes == 4);
     Dispatch(g_hwnd, WM_TIMER, ID_TIMER_PANEL, 0);
     assert(panelServices == 1);
+    Dispatch(g_hwnd, WM_TIMER, ID_TIMER_LOCATION, 0);
+    assert(locationTimeouts == 1);
     Dispatch(g_hwnd, WM_TIMER, ID_TIMER_SCHEDULE, 0);
     assert(evaluations == 123);
     /* A queued overlay timer cannot do work after it was disabled. */

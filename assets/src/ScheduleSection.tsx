@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { type MonitorData, type ScheduleSettings } from "./lib/bridge";
+import {
+  type LocationResult,
+  type MonitorData,
+  type ScheduleSettings,
+  cancelLocationDetection,
+  detectLocation,
+  onLocationResult,
+} from "./lib/bridge";
 import {
   type CurveShape,
   type SolarDay,
@@ -37,6 +44,29 @@ export function parseCoordinate(text: string, limit: number): number | null {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+// Four decimals (about 10 m) is far finer than an IP location anyway.
+function formatCoordinate(value: number) {
+  return String(Number(value.toFixed(4)));
+}
+
+// The line beside "Detect from IP" for an answer from the host.
+function describeLocation(result: LocationResult): { text: string; error: boolean } {
+  const where = result.place ? `${result.place} (${result.source})` : `via ${result.source}`;
+  switch (result.status) {
+    case "ok":
+      return {
+        text: result.cached ? `${where}, cached until ${result.nextLookup}.` : `Found ${where}.`,
+        error: false,
+      };
+    case "timeout":
+      return { text: "No answer within 10 s. Enter it by hand.", error: true };
+    case "cancelled":
+      return { text: "Cancelled.", error: false };
+    default:
+      return { text: "No service answered. Enter it by hand.", error: true };
+  }
 }
 
 // ── Graph ──────────────────────────────────────────────────────────────────
@@ -322,9 +352,52 @@ interface Props {
   monitors: MonitorData[];
   minLevel: number;
   error: string;
+  locationDetecting: boolean;
 }
 
-export default function ScheduleSection({ settings, onChange, monitors, minLevel, error }: Props) {
+export default function ScheduleSection({
+  settings,
+  onChange,
+  monitors,
+  minLevel,
+  error,
+  locationDetecting,
+}: Props) {
+  const [detecting, setDetecting] = useState(locationDetecting);
+  const [locationNote, setLocationNote] = useState<{ text: string; error: boolean } | null>(null);
+  // The answer arrives later; it must fill in the settings as they are then.
+  const latest = useRef({ settings, onChange });
+  latest.current = { settings, onChange };
+  useEffect(
+    () =>
+      onLocationResult((result) => {
+        if (result.status === "cancelled") return; // shown when the button was pressed
+        setDetecting(false);
+        setLocationNote(describeLocation(result));
+        if (result.status === "ok") {
+          const { settings: current, onChange: change } = latest.current;
+          change({
+            ...current,
+            latitude: formatCoordinate(result.latitude),
+            longitude: formatCoordinate(result.longitude),
+          });
+        }
+      }),
+    []
+  );
+
+  function toggleDetection() {
+    if (detecting) {
+      cancelLocationDetection();
+      setDetecting(false);
+      setLocationNote({ text: "Cancelled.", error: false });
+    } else {
+      setDetecting(true);
+      setLocationNote({ text: "Asking four services…", error: false });
+      detectLocation();
+    }
+  }
+
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     const id = window.setInterval(() => setNow(new Date()), 30000);
@@ -423,6 +496,29 @@ export default function ScheduleSection({ settings, onChange, monitors, minLevel
                 className={error && longitude === null ? "border-red-500" : ""}
               />
             </div>
+          </div>
+          <div className="flex items-center gap-2 -mt-1">
+            <Button
+              variant={detecting ? "destructive" : "outline"}
+              size="sm"
+              className="min-w-[7.5rem] shrink-0"
+              title={
+                detecting
+                  ? "Stop detecting"
+                  : "Asks ipapi.co, GeoJS, ipinfo.io and ip-api.com at once; the first answer wins"
+              }
+              onClick={toggleDetection}
+            >
+              {detecting ? "Detecting..." : "Detect from IP"}
+            </Button>
+            <p
+              className={`min-w-0 text-[11px] leading-snug ${
+                locationNote?.error ? "text-red-600" : "text-neutral-500"
+              }`}
+              aria-live="polite"
+            >
+              {locationNote?.text ?? "Approximate, from your IP address."}
+            </p>
           </div>
           <p className="text-neutral-500 text-[11px] leading-snug -mt-1">
             Decimal degrees; north and east are positive. Any map service shows

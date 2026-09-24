@@ -62,6 +62,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <math.h>
 #include <limits.h>
 #include "resource.h"
@@ -110,6 +111,13 @@
 #define REG_VALUE_SCHEDULE_DEEP_SLEEP L"ScheduleDeepSleepEnabled"
 #define REG_VALUE_SCHEDULE_DEEP_LEVEL L"ScheduleDeepSleepLevel"
 #define REG_VALUE_SCHEDULE_DEEP_TIME L"ScheduleDeepSleepMinutes"   /* minutes after midnight */
+/* The last location found from the IP address (see "Location from the IP
+ * address"), kept so the services are asked at most once an hour. */
+#define REG_VALUE_LOCATION_TIME L"IpLocationTime"            /* REG_QWORD, UTC FILETIME */
+#define REG_VALUE_LOCATION_LATITUDE L"IpLocationLatitude"    /* REG_SZ, decimal degrees */
+#define REG_VALUE_LOCATION_LONGITUDE L"IpLocationLongitude"
+#define REG_VALUE_LOCATION_PLACE L"IpLocationPlace"
+#define REG_VALUE_LOCATION_SOURCE L"IpLocationSource"
 #define REG_VALUE_MON_NAME L"Name"
 
 /* Self update: the repository's release binary is downloaded, its embedded
@@ -142,6 +150,7 @@
 #define WM_APP_UPDATE_PROGRESS (WM_APP + 5)
 #define WM_APP_BRIGHTNESS_KEY (WM_APP + 6)   /* wParam: +1 up / -1 down, from a reader thread */
 #define WM_APP_PANEL_BRIGHTNESS (WM_APP + 7) /* lParam: PanelBrightnessEvent* (receiver frees) */
+#define WM_APP_LOCATION_RESULT (WM_APP + 8)  /* lParam: LocationResult* (receiver frees) */
 #define ID_TRAY_MENU_CONFIGURE 1
 #define ID_TRAY_MENU_EXIT 2
 #define ID_TRAY_MENU_BRIGHTER 3
@@ -256,6 +265,14 @@
 #define SCHEDULE_DEFAULT_DEEP_LEVEL 10
 #define SCHEDULE_DEFAULT_DEEP_MINUTES (23 * 60 + 30)
 #define SCHEDULE_DEEP_SLEEP_RAMP 5
+/* Location from the IP address: all services at once, the first valid
+ * answer wins, nobody gets more than LOCATION_TIMEOUT_MS. An answer is
+ * reused for LOCATION_CACHE_MINUTES instead of asking again. */
+#define ID_TIMER_LOCATION 11
+#define LOCATION_TIMEOUT_MS 10000
+#define LOCATION_CACHE_MINUTES 60
+#define LOCATION_MAX_BYTES 16384
+#define LOCATION_PLACE_CHARS 96
 /* Transition anchors are minutes relative to sunrise (dawn) and sunset
  * (dusk); the defaults cover roughly civil twilight. */
 #define SCHEDULE_DEFAULT_DAWN_START (-30)
@@ -1315,6 +1332,54 @@ static BOOL json_get_string(const char *json, const char *key, char *out, size_t
                 case 'n':  out[i++] = '\n'; break;
                 case 'r':  out[i++] = '\r'; break;
                 case 't':  out[i++] = '\t'; break;
+                case 'u': {
+                    /* \uXXXX, or a surrogate pair of them, as UTF-8. */
+                    unsigned code = 0;
+                    int digits = 0;
+                    while (digits < 4 && isxdigit((unsigned char)p[1 + digits])) {
+                        char c = p[1 + digits];
+                        code = code * 16 + (unsigned)(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+                        digits++;
+                    }
+                    if (digits < 4) {
+                        out[i++] = *p;
+                        break;
+                    }
+                    p += 4;
+                    if (code >= 0xD800 && code <= 0xDBFF && p[1] == '\\' && p[2] == 'u') {
+                        unsigned low = 0;
+                        int lowDigits = 0;
+                        while (lowDigits < 4 && isxdigit((unsigned char)p[3 + lowDigits])) {
+                            char c = p[3 + lowDigits];
+                            low = low * 16 + (unsigned)(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+                            lowDigits++;
+                        }
+                        if (lowDigits == 4 && low >= 0xDC00 && low <= 0xDFFF) {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            p += 6;
+                        }
+                    }
+                    char utf8[4];
+                    size_t n = 0;
+                    if (code < 0x80) {
+                        utf8[n++] = (char)code;
+                    } else if (code < 0x800) {
+                        utf8[n++] = (char)(0xC0 | (code >> 6));
+                        utf8[n++] = (char)(0x80 | (code & 0x3F));
+                    } else if (code < 0x10000) {
+                        utf8[n++] = (char)(0xE0 | (code >> 12));
+                        utf8[n++] = (char)(0x80 | ((code >> 6) & 0x3F));
+                        utf8[n++] = (char)(0x80 | (code & 0x3F));
+                    } else {
+                        utf8[n++] = (char)(0xF0 | (code >> 18));
+                        utf8[n++] = (char)(0x80 | ((code >> 12) & 0x3F));
+                        utf8[n++] = (char)(0x80 | ((code >> 6) & 0x3F));
+                        utf8[n++] = (char)(0x80 | (code & 0x3F));
+                    }
+                    if (i + n > outLen - 1) break;
+                    for (size_t k = 0; k < n; k++) out[i++] = utf8[k];
+                    break;
+                }
                 default:   out[i++] = *p;   break;
             }
         } else {
@@ -4230,6 +4295,339 @@ static void UpdateScheduleTimer(void) {
     }
 }
 
+/* ── Location from the IP address ────────────────────────────────────────── */
+
+/* The dialog's "Detect from IP" button fills in the schedule's latitude and
+ * longitude. Four free services that need no key are asked at once, one
+ * thread each; the first valid answer wins and the others are ignored when
+ * they arrive. Nothing is contacted unless the button is pressed. A found
+ * location is kept (in memory and the registry) for LOCATION_CACHE_MINUTES,
+ * and the button answers from it meanwhile, so the free, rate-limited
+ * services are asked at most once an hour. Logged under [LOCATION]. */
+
+typedef struct {
+    const wchar_t* name;
+    const wchar_t* url;
+    const char* latitude;      /* JSON key; "lat,lon" in one string when longitude is NULL */
+    const char* longitude;
+    const char* country;       /* JSON key of the country shown after the city */
+} LocationService;
+
+static const LocationService kLocationServices[] = {
+    { L"ipapi.co", L"https://ipapi.co/json/", "latitude", "longitude", "country_code" },
+    { L"GeoJS", L"https://get.geojs.io/v1/ip/geo.json", "latitude", "longitude", "country_code" },
+    { L"ipinfo.io", L"https://ipinfo.io/json", "loc", NULL, "country" },
+    /* Plain HTTP only: its HTTPS endpoint needs a paid key. */
+    { L"ip-api.com", L"http://ip-api.com/json/", "lat", "lon", "countryCode" },
+};
+#define LOCATION_SERVICE_COUNT ((int)(sizeof(kLocationServices) / sizeof(kLocationServices[0])))
+
+/* One service's answer, posted from its thread to the main window. */
+typedef struct {
+    LONG request;              /* which button press it belongs to */
+    int service;
+    BOOL ok;
+    double latitude;
+    double longitude;
+    wchar_t place[LOCATION_PLACE_CHARS];
+    DWORD httpStatus;
+    DWORD error;
+    DWORD elapsedMs;
+} LocationResult;
+
+typedef struct {
+    BOOL valid;
+    ULONGLONG time;            /* UTC FILETIME of the answer */
+    double latitude;
+    double longitude;
+    wchar_t place[LOCATION_PLACE_CHARS];
+    wchar_t source[32];
+} LocationCache;
+
+static LocationCache g_locationCache;
+static LONG g_locationRequest = 0;      /* bumped per lookup; stale answers are dropped */
+static BOOL g_locationBusy = FALSE;
+static int g_locationFailures = 0;
+
+/* A number, or a number in a string (GeoJS sends "52.2297"). */
+static BOOL json_get_number(const char* json, const char* key, double* out) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char* p = strstr(json, search);
+    if (!p) return FALSE;
+    p += strlen(search);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') p++;
+    if (*p == '"') p++;
+    char* end = NULL;
+    double value = strtod(p, &end);
+    if (end == p) return FALSE;
+    *out = value;
+    return TRUE;
+}
+
+/* The position and a "City, CC" place from one service's answer. Failures
+ * come back in-band (ip-api.com "status":"fail", ipapi.co "error":true, no
+ * coordinates either way), and 0,0 means "unknown", so only a real
+ * position counts. */
+static BOOL ParseLocationAnswer(const LocationService* service, const char* json,
+                                double* latitude, double* longitude,
+                                wchar_t* place, size_t placeCount) {
+    double lat = 0, lon = 0;
+    BOOL ok;
+    if (service->longitude) {
+        ok = json_get_number(json, service->latitude, &lat) &&
+             json_get_number(json, service->longitude, &lon);
+    } else {
+        char pair[64] = {0};
+        char* end = NULL;
+        ok = json_get_string(json, service->latitude, pair, sizeof(pair));
+        if (ok) {
+            lat = strtod(pair, &end);
+            ok = end != pair && *end == ',';
+            if (ok) {
+                char* start = end + 1;
+                lon = strtod(start, &end);
+                ok = end != start;
+            }
+        }
+    }
+    if (!ok || lat < -90 || lat > 90 || lon < -180 || lon > 180 || (lat == 0 && lon == 0)) {
+        return FALSE;
+    }
+    *latitude = lat;
+    *longitude = lon;
+    char city[64] = {0}, country[64] = {0}, text[160];
+    json_get_string(json, "city", city, sizeof(city));
+    json_get_string(json, service->country, country, sizeof(country));
+    snprintf(text, sizeof(text), "%s%s%s", city, city[0] && country[0] ? ", " : "", country);
+    place[0] = L'\0';
+    if (MultiByteToWideChar(CP_UTF8, 0, text, -1, place, (int)placeCount) == 0) place[0] = L'\0';
+    return TRUE;
+}
+
+/* GET one service's answer (at most LOCATION_MAX_BYTES), every phase
+ * limited to LOCATION_TIMEOUT_MS. The caller frees *body. */
+static BOOL FetchLocationAnswer(const wchar_t* url, char** body, DWORD* httpStatus, DWORD* error) {
+    HINTERNET session = NULL, connection = NULL, request = NULL;
+    BOOL ok = FALSE;
+    *body = NULL;
+    *httpStatus = 0;
+    *error = 0;
+    wchar_t host[128] = L"", path[256] = L"";
+    URL_COMPONENTS parts = {0};
+    parts.dwStructSize = sizeof(parts);
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = sizeof(host) / sizeof(wchar_t);
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = sizeof(path) / sizeof(wchar_t);
+    if (!WinHttpCrackUrl(url, 0, 0, &parts)) goto done;
+    session = WinHttpOpen(L"NotTooBright/" APP_VERSION_WSTRING, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) goto done;
+    WinHttpSetTimeouts(session, LOCATION_TIMEOUT_MS, LOCATION_TIMEOUT_MS,
+                       LOCATION_TIMEOUT_MS, LOCATION_TIMEOUT_MS);
+    connection = WinHttpConnect(session, host, parts.nPort, 0);
+    if (!connection) goto done;
+    request = WinHttpOpenRequest(connection, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 WINHTTP_FLAG_REFRESH |
+                                 (parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0));
+    if (!request ||
+        !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request, NULL)) {
+        goto done;
+    }
+    DWORD size = sizeof(*httpStatus);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, httpStatus, &size, WINHTTP_NO_HEADER_INDEX) ||
+        *httpStatus != 200) {
+        SetLastError(ERROR_WINHTTP_INVALID_SERVER_RESPONSE);
+        goto done;
+    }
+    char* buffer = (char*)malloc(LOCATION_MAX_BYTES + 1);
+    if (!buffer) goto done;
+    DWORD length = 0;
+    for (;;) {
+        DWORD read = 0;
+        if (!WinHttpReadData(request, buffer + length, LOCATION_MAX_BYTES - length, &read)) {
+            free(buffer);
+            goto done;
+        }
+        if (read == 0 || (length += read) >= LOCATION_MAX_BYTES) break;
+    }
+    buffer[length] = '\0';
+    *body = buffer;
+    ok = TRUE;
+done:
+    if (!ok && !*error) *error = GetLastError();
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    if (session) WinHttpCloseHandle(session);
+    return ok;
+}
+
+static DWORD WINAPI LocationThread(LPVOID param) {
+    LocationResult* r = (LocationResult*)param;
+    const LocationService* service = &kLocationServices[r->service];
+    ULONGLONG start = GetTickCount64();
+    char* body = NULL;
+    if (FetchLocationAnswer(service->url, &body, &r->httpStatus, &r->error)) {
+        r->ok = ParseLocationAnswer(service, body, &r->latitude, &r->longitude,
+                                    r->place, LOCATION_PLACE_CHARS);
+        if (!r->ok) r->error = ERROR_INVALID_DATA;
+    }
+    free(body);
+    r->elapsedMs = (DWORD)(GetTickCount64() - start);
+    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_LOCATION_RESULT, 0, (LPARAM)r)) free(r);
+    return 0;
+}
+
+#define LOCATION_CACHE_FILETIME ((ULONGLONG)LOCATION_CACHE_MINUTES * 60 * 10000000)
+
+/* An answer from the last hour is reused (a clock moved back counts too). */
+static BOOL LocationCacheFresh(const LocationCache* cache, ULONGLONG now) {
+    return cache->valid && now < cache->time + LOCATION_CACHE_FILETIME &&
+           now + LOCATION_CACHE_FILETIME > cache->time;
+}
+
+static void LoadLocationCache(void) {
+    HKEY hKey;
+    ZeroMemory(&g_locationCache, sizeof(g_locationCache));
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
+    LocationCache* c = &g_locationCache;
+    DWORD type = 0, size = sizeof(c->place) - sizeof(wchar_t);
+    c->valid = ReadRegistryQword(hKey, REG_VALUE_LOCATION_TIME, &c->time) && c->time &&
+               ReadRegistryDouble(hKey, REG_VALUE_LOCATION_LATITUDE, &c->latitude) &&
+               ReadRegistryDouble(hKey, REG_VALUE_LOCATION_LONGITUDE, &c->longitude) &&
+               IsValidLatitude(c->latitude) && IsValidLongitude(c->longitude);
+    if (RegQueryValueExW(hKey, REG_VALUE_LOCATION_PLACE, NULL, &type, (LPBYTE)c->place, &size) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        c->place[0] = L'\0';
+    }
+    size = sizeof(c->source) - sizeof(wchar_t);
+    if (RegQueryValueExW(hKey, REG_VALUE_LOCATION_SOURCE, NULL, &type, (LPBYTE)c->source, &size) != ERROR_SUCCESS ||
+        type != REG_SZ) {
+        c->source[0] = L'\0';
+    }
+    RegCloseKey(hKey);
+}
+
+static void SaveLocationCache(void) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL, REG_OPTION_NON_VOLATILE,
+                        KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
+        return;
+    }
+    const LocationCache* c = &g_locationCache;
+    WriteRegistryQword(hKey, REG_VALUE_LOCATION_TIME, c->time);
+    WriteRegistryDouble(hKey, REG_VALUE_LOCATION_LATITUDE, c->latitude);
+    WriteRegistryDouble(hKey, REG_VALUE_LOCATION_LONGITUDE, c->longitude);
+    RegSetValueExW(hKey, REG_VALUE_LOCATION_PLACE, 0, REG_SZ, (const BYTE*)c->place,
+                   (DWORD)((wcslen(c->place) + 1) * sizeof(wchar_t)));
+    RegSetValueExW(hKey, REG_VALUE_LOCATION_SOURCE, 0, REG_SZ, (const BYTE*)c->source,
+                   (DWORD)((wcslen(c->source) + 1) * sizeof(wchar_t)));
+    RegCloseKey(hKey);
+}
+
+/* window.onLocationResult: "ok" (with the cached answer and when a new
+ * lookup is allowed), "failed", "timeout" or "cancelled". */
+static void PushLocationResult(const wchar_t* status, BOOL cached) {
+    if (!g_cfgWebView) return;
+    const LocationCache* c = &g_locationCache;
+    BOOL ok = wcscmp(status, L"ok") == 0;
+    wchar_t place[LOCATION_PLACE_CHARS * 2], source[64], next[16] = L"", script[512];
+    json_escape_wstring(ok ? c->place : L"", place, LOCATION_PLACE_CHARS * 2);
+    json_escape_wstring(ok ? c->source : L"", source, 64);
+    if (ok) FormatLocalTimeOfDay(c->time + LOCATION_CACHE_FILETIME, next, 16);
+    int written = swprintf_s(script, 512,
+        L"window.onLocationResult && window.onLocationResult({\"status\":\"%s\",\"latitude\":%.6f,"
+        L"\"longitude\":%.6f,\"place\":\"%s\",\"source\":\"%s\",\"cached\":%s,\"nextLookup\":\"%s\"})",
+        status, ok ? c->latitude : 0.0, ok ? c->longitude : 0.0, place, source,
+        cached ? L"true" : L"false", next);
+    if (written > 0) webview_cfg_execute_script(script);
+}
+
+/* The button: the cached answer when there is a recent one, otherwise every
+ * service at once. */
+static void DetectLocation(void) {
+    if (g_locationBusy) return;
+    if (LocationCacheFresh(&g_locationCache, NowFileTime())) {
+        DebugPrint(L"[LOCATION] Answering from the cache (%s, %s)\n", g_locationCache.place,
+                   g_locationCache.source);
+        PushLocationResult(L"ok", TRUE);
+        return;
+    }
+    g_locationRequest++;
+    g_locationBusy = TRUE;
+    g_locationFailures = 0;
+    int started = 0;
+    for (int i = 0; i < LOCATION_SERVICE_COUNT; i++) {
+        LocationResult* r = (LocationResult*)calloc(1, sizeof(*r));
+        HANDLE thread = NULL;
+        if (r) {
+            r->request = g_locationRequest;
+            r->service = i;
+            thread = CreateThread(NULL, 0, LocationThread, r, 0, NULL);
+        }
+        if (thread) {
+            CloseHandle(thread);
+            started++;
+        } else {
+            free(r);
+            g_locationFailures++;
+        }
+    }
+    DebugPrint(L"[LOCATION] Lookup %ld: asking %d service(s)\n", (long)g_locationRequest, started);
+    if (!started) {
+        g_locationBusy = FALSE;
+        PushLocationResult(L"failed", FALSE);
+        return;
+    }
+    if (g_hwnd) SetTimer(g_hwnd, ID_TIMER_LOCATION, LOCATION_TIMEOUT_MS, NULL);
+}
+
+/* Ends the lookup in progress without an answer ("timeout", "cancelled");
+ * answers still on their way are dropped. */
+static void EndLocationLookup(const wchar_t* status) {
+    if (!g_locationBusy) return;
+    g_locationBusy = FALSE;
+    g_locationRequest++;
+    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_LOCATION);
+    DebugPrint(L"[LOCATION] Lookup ended: %s\n", status);
+    PushLocationResult(status, FALSE);
+}
+
+static void HandleLocationResult(LocationResult* r) {
+    const LocationService* service = &kLocationServices[r->service];
+    if (r->request != g_locationRequest || !g_locationBusy) {
+        DebugPrint(L"[LOCATION] %s answered after the lookup ended (%s, %lu ms); ignored\n",
+                   service->name, r->ok ? L"ok" : L"failed", (unsigned long)r->elapsedMs);
+    } else if (r->ok) {
+        DebugPrint(L"[LOCATION] %s answered first: %.4f, %.4f (%s), %lu ms\n", service->name,
+                   r->latitude, r->longitude, r->place, (unsigned long)r->elapsedMs);
+        g_locationBusy = FALSE;
+        if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_LOCATION);
+        LocationCache* c = &g_locationCache;
+        c->valid = TRUE;
+        c->time = NowFileTime();
+        c->latitude = r->latitude;
+        c->longitude = r->longitude;
+        wcscpy_s(c->place, LOCATION_PLACE_CHARS, r->place);
+        wcscpy_s(c->source, sizeof(c->source) / sizeof(wchar_t), service->name);
+        SaveLocationCache();
+        PushLocationResult(L"ok", FALSE);
+    } else {
+        DebugPrint(L"[LOCATION] %s failed: HTTP %lu, error %lu, %lu ms\n", service->name,
+                   (unsigned long)r->httpStatus, (unsigned long)r->error, (unsigned long)r->elapsedMs);
+        if (++g_locationFailures >= LOCATION_SERVICE_COUNT) {
+            g_locationBusy = FALSE;
+            if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_LOCATION);
+            PushLocationResult(L"failed", FALSE);
+        }
+    }
+    free(r);
+}
+
 /* ── Self update (ported from SystrayLauncher) ───────────────────────────── */
 
 // --- Self update -----------------------------------------------------------
@@ -5867,7 +6265,7 @@ static void webview_push_init_config(void) {
             L"window.onInit({\"config\":{\"allowBelowMinimum\":%s,\"debugLog\":%s,"
             L"\"autoCheckForUpdates\":%s,\"startWithWindows\":%s,"
             L"\"pauseInRemoteSession\":%s,\"remoteSession\":%s,"
-            L"\"brightnessKeys\":%s,"
+            L"\"brightnessKeys\":%s,\"locationDetecting\":%s,"
             L"\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
             L"\"trayTarget\":\"%s\",\"trayPresets\":\"%s\","
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
@@ -5883,6 +6281,7 @@ static void webview_push_init_config(void) {
             g_config.pauseInRemoteSession ? L"true" : L"false",
             g_remoteSession ? L"true" : L"false",
             g_config.brightnessKeys ? L"true" : L"false",
+            g_locationBusy ? L"true" : L"false",
             updateCheckPending ? L"true" : L"false",
             g_updateNoticeTask ? L"true" : L"false",
             eTrayTarget, presetText,
@@ -6396,6 +6795,10 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         for (int i = 0; i < g_monitorCount; i++) g_monitors[i].panelChecked = FALSE;
         UnhideAllMonitors();
         RefreshMonitors();
+    } else if (strcmp(action, "detectLocation") == 0) {
+        DetectLocation();
+    } else if (strcmp(action, "cancelLocation") == 0) {
+        EndLocationLookup(L"cancelled");
     } else if (strcmp(action, "resumeSchedule") == 0) {
         ResumeSchedule();
     } else if (strcmp(action, "saveSettings") == 0) {
@@ -6916,6 +7319,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             ApplyBrightnessKey((int)(INT_PTR)wParam);
             return 0;
 
+        case WM_APP_LOCATION_RESULT:
+            HandleLocationResult((LocationResult*)lParam);
+            return 0;
+
         case WM_APP_PANEL_BRIGHTNESS:
             HandlePanelBrightness((PanelBrightnessEvent*)lParam);
             return 0;
@@ -6953,6 +7360,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case ID_TIMER_KEY_DEVICES:
                     KillTimer(hwnd, ID_TIMER_KEY_DEVICES);
                     UpdateBrightnessKeyReaders();
+                    return 0;
+                case ID_TIMER_LOCATION:
+                    KillTimer(hwnd, ID_TIMER_LOCATION);
+                    EndLocationLookup(L"timeout");
                     return 0;
                 case ID_TIMER_PANEL:
                     KillTimer(hwnd, ID_TIMER_PANEL);
@@ -7151,6 +7562,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     LoadConfigFromRegistry(&g_config);
+    LoadLocationCache();
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
     DebugPrint(L"[INFO] " APP_DISPLAY_NAME_WSTRING L" " APP_VERSION_WSTRING L" starting\n");
     LogEnvironment();
@@ -7248,6 +7660,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_TOOLTIP);
     KillTimer(g_hwnd, ID_TIMER_KEY_DEVICES);
     KillTimer(g_hwnd, ID_TIMER_PANEL);
+    KillTimer(g_hwnd, ID_TIMER_LOCATION);
     CloseBrightnessKeyReaders();
     StopPanelWatch();
     PersistDirtyMonitors();

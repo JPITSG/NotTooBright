@@ -133,6 +133,20 @@ sunrise and dimmed to the night level after sunset, every day of the year,
 using sunrise and sunset times computed for your location and the current
 date.
 
+**Detect from IP** fills in the latitude and longitude for you:
+
+- It asks four free services at once (ipapi.co, GeoJS, ipinfo.io,
+  ip-api.com); the first answer wins.
+- Each gets 10 seconds. Click the button again to cancel.
+- An answer is reused for an hour instead of asking again.
+- The result is approximate (usually your provider's city), which is fine
+  for sunrise and sunset.
+- Nothing is sent unless you press the button. ip-api.com is plain HTTP
+  and free for non-commercial use only.
+
+If every service is blocked (some DNS filters block them), type the values
+in by hand.
+
 The graph shows today's curve: the shaded band is daylight, the dashed
 lines mark sunrise and sunset, and the blue marker is the current moment.
 The four points shape the transitions - when the morning ramp starts and
@@ -271,6 +285,7 @@ brightness section applies immediately; the settings below it are saved with
 | Allow dimming below the hardware minimum | Extends hardware-controlled sliders below 0% into software dimming (down to -90%). Applies immediately. Disabled by default. |
 | Adjust brightness automatically with the sun | Enables the sun-based schedule described in [Automatic Brightness](#automatic-brightness). Requires a latitude and longitude. Saved with **Save**. Disabled by default. |
 | Latitude / Longitude | Your location in decimal degrees (north and east positive), used to compute sunrise and sunset. |
+| Detect from IP | Fills in the latitude and longitude from your IP address; see [Automatic Brightness](#automatic-brightness). |
 | Daytime / Night brightness | The levels the schedule applies during the day and at night. |
 | Deep sleep | Optional: a **Deep sleep time** and **Deep sleep brightness**. From that time of day the level fades over five minutes to the deep sleep brightness and stays there until the morning transition. Disabled by default; 23:30 and 10% when first turned on. |
 | Today's curve | Graph of the resulting brightness over today; drag the four points to move the dawn and dusk transitions. |
@@ -300,6 +315,9 @@ next to the executable, so it can run from any folder.
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |
 | `%TEMP%\NotTooBright\`, `%TEMP%\NotTooBright.WebView2\` | The extracted WebView2 loader and the dialog's browser profile; safe to delete |
 | `%TEMP%\NotTooBright-download-*.exe`, `%TEMP%\NotTooBright-updater-*.exe` | Staged update and the short-lived updater copy; removed when an update finishes |
+
+The last **Detect from IP** answer (`IpLocation*` values under the same key)
+is kept so the services are asked at most once an hour.
 
 Deleting the `HKCU\SOFTWARE\JPIT\NotTooBright` key returns the application to
 its factory state; turn **Start with Windows** off first (or delete its `Run`

@@ -537,6 +537,7 @@ export default function ConfigView({
       monitors={visibleMonitors}
       minLevel={minLevel}
       error={scheduleError}
+      locationDetecting={config.locationDetecting ?? false}
     />
   );
 
