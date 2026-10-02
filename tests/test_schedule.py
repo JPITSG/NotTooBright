@@ -340,7 +340,7 @@ int MonitorMode(const Monitor* m) { return m->mode; }
 BOOL SchedulePhaseNow(SchedulePhase* phase) { *phase = currentPhase; return g_config.schedule.enabled; }
 ULONGLONG NowFileTime(void) { return 0; }
 BOOL IsSchedulePaused(ULONGLONG now) { (void)now; return paused; }
-void Shell_NotifyIconW(int op, NOTIFYICONDATAW* nid) { assert(op == NIM_MODIFY && nid->uFlags == NIF_TIP); modifies++; }
+void PublishTrayIcon(void) { modifies++; }
 void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
 void wcscat_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscat(out, in); }
 void wcsncpy_s(wchar_t* out, size_t count, const wchar_t* in, size_t n) {

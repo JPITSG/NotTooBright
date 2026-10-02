@@ -22,9 +22,10 @@ else, and an optional schedule that follows the sun for your location.
 - **Below the minimum** - Optionally continue below 0% on hardware monitors by adding software dimming on top of the lowest backlight setting
 - **Hide what you do not want touched** - Remove a monitor from the app entirely until the next rescan; its original brightness is restored first
 - **Never black, never in screenshots** - Software dimming stops at 10% and its overlay is excluded from screen capture and screen sharing
-- **Zero install** - One 620 KB executable, no runtime to install, settings in your user registry, nothing written next to the exe
+- **Zero install** - One small executable, no runtime to install, settings in your user registry, nothing written next to the exe
 - **Self update** - Checks this repository for a newer build, shows both version numbers, and replaces itself in place after a standard UAC prompt; automatic checks can be turned off
 - **Survives everything** - Settings follow the monitor (by EDID) and are re-applied after sleep, after displays are switched back on, and after display changes
+- Tray icon registration retries while Explorer is starting and recovers automatically after an Explorer restart, preserving the current icon and tooltip; retries stop as soon as registration succeeds
 
 ## Getting Started
 
@@ -397,6 +398,13 @@ build is reproducible: the same sources produce a byte-identical executable.
 | `version.h` | Single source of truth for the application version |
 | `assets/` | Configuration UI (React, Vite, Tailwind), the icon, the screenshot, and `WebView2Loader.dll` |
 | `releases/` | Build output (`NotTooBright.exe`) |
+
+## Tray recovery checks
+
+Tray startup/recovery regression checks: `python3 tests/test_tray_registration.py`.
+These simulate delayed Explorer readiness, taskbar recreation, current icon/tooltip
+recovery, and shutdown with a retry already queued; a live sign-in/restart smoke
+test requires Windows.
 
 ## License
 

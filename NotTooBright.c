@@ -141,6 +141,9 @@
 #define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
 
 #define TRAY_ICON_ID 100
+#define ID_TIMER_TRAY_RETRY 12
+#define TRAY_RETRY_MS 2000
+
 #define WM_TRAYICON (WM_APP + 1)
 /* Posted by the DDC/CI worker thread. */
 #define WM_APP_DDC_PROBED (WM_APP + 2)      /* lParam: DdcProbeResult* (receiver frees) */
@@ -693,6 +696,12 @@ static HINSTANCE g_hInstance = NULL;
 static HWND g_hwnd = NULL;              /* hidden top-level message window */
 static HANDLE g_hMutex = NULL;
 static NOTIFYICONDATAW g_nid;
+static BOOL g_trayActive = FALSE;
+static BOOL g_trayRegistered = FALSE;
+static BOOL g_trayRetryPending = FALSE;
+static void PublishTrayIcon(void);
+static void StopTrayRegistration(void);
+static void RegisterTaskbarMessage(HWND hwnd);
 static UINT g_WM_TASKBARCREATED = 0;
 static Configuration g_config;
 static volatile LONG g_debugLogEnabled = FALSE;
@@ -7072,6 +7081,55 @@ static void ShowConfigDialog(void) {
 
 /* ── Tray icon ───────────────────────────────────────────────────────────── */
 
+/* All registration state belongs to the window thread. Keep the latest icon
+ * and tooltip even while Explorer is absent; retry only until it accepts them. */
+static void PublishTrayIcon(void) {
+    if (!g_trayActive || !g_nid.hWnd) return;
+    NOTIFYICONDATAW data = g_nid;
+    /* Tooltip/icon-only updates must never turn a later ADD into a partial one. */
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    BOOL wasRegistered = g_trayRegistered;
+    DWORD command = wasRegistered ? NIM_MODIFY : NIM_ADD;
+    BOOL accepted = Shell_NotifyIconW(command, &data);
+    /* A rebuilt taskbar can either retain or discard our old identity. */
+    if (!accepted) {
+        accepted = Shell_NotifyIconW(wasRegistered ? NIM_ADD : NIM_MODIFY, &data);
+    }
+    g_trayRegistered = accepted;
+    if (accepted) {
+        if (!wasRegistered) DebugPrint(L"[TRAY] Tray icon registered\n");
+        KillTimer(g_nid.hWnd, ID_TIMER_TRAY_RETRY);
+        g_trayRetryPending = FALSE;
+    } else if (!g_trayRetryPending) {
+        DebugPrint(L"[TRAY] Tray registration failed; retrying when Explorer is ready\n");
+        g_trayRetryPending = SetTimer(g_nid.hWnd, ID_TIMER_TRAY_RETRY,
+                                      TRAY_RETRY_MS, NULL) != 0;
+        if (!g_trayRetryPending) DebugPrint(L"[TRAY] Could not start tray registration retry timer\n");
+    }
+}
+
+static void StopTrayRegistration(void) {
+    BOOL wasActive = g_trayActive;
+    /* KillTimer does not remove an already queued WM_TIMER. */
+    g_trayActive = FALSE;
+    g_trayRegistered = FALSE;
+    g_trayRetryPending = FALSE;
+    if (g_nid.hWnd) {
+        KillTimer(g_nid.hWnd, ID_TIMER_TRAY_RETRY);
+        if (wasActive) Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    }
+}
+
+static void RegisterTaskbarMessage(HWND hwnd) {
+    g_WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+    /* An elevated app must also receive the unelevated shell's broadcast.
+     * Resolve dynamically for SDKs targeting Windows Vista. */
+    typedef BOOL (WINAPI *FilterFn)(HWND, UINT, DWORD, void*);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    FilterFn allow = user32 ? (FilterFn)(void*)GetProcAddress(user32, "ChangeWindowMessageFilterEx") : NULL;
+    if (g_WM_TASKBARCREATED && allow) allow(hwnd, g_WM_TASKBARCREATED, 1 /* MSGFLT_ALLOW */, NULL);
+}
+
 static void CreateTrayIcon(HWND hwnd) {
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(NOTIFYICONDATAW);
@@ -7091,8 +7149,8 @@ static void CreateTrayIcon(HWND hwnd) {
     }
 
     wcscpy_s(g_nid.szTip, sizeof(g_nid.szTip) / sizeof(wchar_t), APP_DISPLAY_NAME_WSTRING);
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
-    DebugPrint(L"[INFO] Tray icon created (%dx%d)\n", iconSize, iconSize);
+    g_trayActive = TRUE;
+    PublishTrayIcon();
 }
 
 static void ScheduleTooltipUpdate(void) {
@@ -7140,9 +7198,7 @@ static void UpdateTrayTooltip(void) {
     }
     if (wcscmp(tip, g_nid.szTip) == 0) return;
     wcscpy_s(g_nid.szTip, cap, tip);
-    NOTIFYICONDATAW nid = g_nid;
-    nid.uFlags = NIF_TIP;
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    PublishTrayIcon();
 }
 
 /* The monitor the tray menu's brightness items act on; NULL with allVisible
@@ -7192,19 +7248,20 @@ static void ApplyTrayMenuValue(int value, BOOL relative) {
 
 static void RemoveTrayIcon(void) {
     if (!g_nid.hWnd) return;
-    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    StopTrayRegistration();
     if (g_nid.hIcon) {
         DestroyIcon(g_nid.hIcon);
         g_nid.hIcon = NULL;
     }
 }
 
-/* Explorer restarted (TaskbarCreated) or the DPI changed: re-add the icon. */
+/* Reload the icon artwork after a DPI change. */
 static void RefreshTrayIcon(void) {
     HWND hwnd = g_nid.hWnd;
-    if (!hwnd) return;
+    if (!hwnd || !g_trayActive) return;
     RemoveTrayIcon();
     CreateTrayIcon(hwnd);
+    UpdateTrayTooltip();
     DebugPrint(L"[INFO] Tray icon refreshed\n");
 }
 
@@ -7263,6 +7320,15 @@ static void ShowContextMenu(HWND hwnd) {
 /* ── Main (hidden) window ────────────────────────────────────────────────── */
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (g_WM_TASKBARCREATED != 0 && uMsg == g_WM_TASKBARCREATED) {
+        g_trayRegistered = FALSE;
+        PublishTrayIcon();
+        return 0;
+    }
+    if (uMsg == WM_TIMER && wParam == ID_TIMER_TRAY_RETRY) {
+        if (g_trayRetryPending) PublishTrayIcon();
+        return 0;
+    }
     switch (uMsg) {
         case WM_TRAYICON:
             switch (lParam) {
@@ -7299,6 +7365,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     ResumeSchedule();
                     return 0;
                 case ID_TRAY_MENU_EXIT:
+                    StopTrayRegistration();
                     DebugPrint(L"[INFO] Exit selected from the tray menu\n");
                     if (g_cfgHwnd) SendMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
                     RemoveTrayIcon();
@@ -7473,15 +7540,16 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             RefreshTrayIcon();
             return 0;
 
+        case WM_DESTROY:
+            StopTrayRegistration();
+            PostQuitMessage(0);
+            return 0;
+
         case WM_CLOSE:
             /* The hidden window is never closed by the user; keep running. */
             return 0;
 
         default:
-            if (g_WM_TASKBARCREATED != 0 && uMsg == g_WM_TASKBARCREATED) {
-                RefreshTrayIcon();
-                return 0;
-            }
             break;
     }
     return DefWindowProcW(hwnd, uMsg, wParam, lParam);
@@ -7618,18 +7686,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    /* Register for Explorer restart notifications. If this process happens
-     * to run elevated, allow the (unelevated) shell's broadcast through UIPI. */
-    g_WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
-    if (g_WM_TASKBARCREATED != 0) {
-        typedef BOOL (WINAPI *ChangeWindowMessageFilterExFn)(HWND, UINT, DWORD, PCHANGEFILTERSTRUCT);
-        ChangeWindowMessageFilterExFn changeWindowMessageFilterEx =
-            (ChangeWindowMessageFilterExFn)(void*)GetProcAddress(
-                GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx");
-        if (changeWindowMessageFilterEx) {
-            changeWindowMessageFilterEx(g_hwnd, g_WM_TASKBARCREATED, MSGFLT_ALLOW, NULL);
-        }
-    }
+    RegisterTaskbarMessage(g_hwnd);
 
     CreateTrayIcon(g_hwnd);
 
