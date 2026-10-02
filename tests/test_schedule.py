@@ -332,14 +332,17 @@ typedef struct { int hidden, hasValue, value, mode; wchar_t name[128]; } Monitor
 ''' + enumeration("SchedulePhase") + r'''
 NOTIFYICONDATAW g_nid = { (HWND)1 };
 Monitor g_monitors[4];
-struct { struct { BOOL enabled; } schedule; } g_config;
+struct { struct { BOOL enabled; } schedule; ULONGLONG keepAwakeUntil; } g_config;
 int g_monitorCount, modifies, paused;
 BOOL g_remoteSession;
 SchedulePhase currentPhase;
 int MonitorMode(const Monitor* m) { return m->mode; }
 BOOL SchedulePhaseNow(SchedulePhase* phase) { *phase = currentPhase; return g_config.schedule.enabled; }
-ULONGLONG NowFileTime(void) { return 0; }
+ULONGLONG NowFileTime(void) { return 100; }
 BOOL IsSchedulePaused(ULONGLONG now) { (void)now; return paused; }
+void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count) {
+    (void)count; assert(ft == g_config.keepAwakeUntil); wcscpy(out, L"16:42");
+}
 void PublishTrayIcon(void) { modifies++; }
 void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
 void wcscat_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscat(out, in); }
@@ -359,7 +362,7 @@ int swprintf_s(wchar_t* out, size_t count, const wchar_t* format, ...) {
     va_end(args);
     return written;
 }
-''' + function("SchedulePhaseName") + function("UpdateTrayTooltip") + r'''
+''' + function("SchedulePhaseName") + function("IsKeepingAwake") + function("UpdateTrayTooltip") + r'''
 int main(void) {
     g_monitorCount = 2;
     g_monitors[0] = (Monitor){0, 1, 75, MODE_HARDWARE, L"Left"};
@@ -415,6 +418,32 @@ int main(void) {
     UpdateTrayTooltip();
     assert(wcslen(g_nid.szTip) < 128);
     assert(wcsstr(g_nid.szTip, L"aaa...: 50%") && wcsstr(g_nid.szTip, L"\n...") && !wcsstr(g_nid.szTip, L"ccc"));
+    /* While the monitors are kept awake, its end time follows the schedule
+     * line; the line goes once the time is up. */
+    g_config.schedule.enabled = 0;
+    g_monitorCount = 1;
+    g_monitors[0] = (Monitor){0, 1, 75, MODE_HARDWARE, L"Left"};
+    g_config.keepAwakeUntil = 200;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"Schedule: Disabled\nKeep awake: until 16:42\nLeft: 75%") == 0);
+    g_config.keepAwakeUntil = 100;
+    UpdateTrayTooltip();
+    assert(wcscmp(g_nid.szTip, L"Schedule: Disabled\nLeft: 75%") == 0);
+    /* Every status line at once still fits, and the monitor list is cut. */
+    g_remoteSession = 1;
+    g_config.schedule.enabled = 1;
+    paused = 1;
+    currentPhase = SCHEDULE_PHASE_SLEEP_FADE;
+    g_config.keepAwakeUntil = 200;
+    g_monitorCount = 4;
+    for (int i = 0; i < 4; i++) {
+        g_monitors[i] = (Monitor){0, 1, 50, MODE_HARDWARE, L""};
+        for (int j = 0; j < 45; j++) g_monitors[i].name[j] = L'a' + i;
+    }
+    UpdateTrayTooltip();
+    assert(wcslen(g_nid.szTip) < 128);
+    assert(wcscmp(g_nid.szTip, L"Remote Desktop session: paused\nState: Night → Deep sleep\n"
+                               L"Schedule: Paused\nKeep awake: until 16:42\n...") == 0);
 }
 ''')
 
@@ -522,6 +551,7 @@ int main(void) {
         run_c(r'''
 #include <assert.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <wchar.h>
 #define TRUE 1
@@ -530,6 +560,8 @@ int main(void) {
 #define MF_SEPARATOR 0x800
 #define MF_ENABLED 0
 #define MF_GRAYED 1
+#define MF_UNCHECKED 0
+#define MF_CHECKED 8
 #define MF_BYCOMMAND 0
 #define TPM_BOTTOMALIGN 0
 #define TPM_LEFTALIGN 0
@@ -539,29 +571,46 @@ int main(void) {
 #define ID_TRAY_MENU_BRIGHTER 3
 #define ID_TRAY_MENU_DIMMER 4
 #define ID_TRAY_MENU_RESUME_SCHEDULE 5
+#define ID_TRAY_MENU_KEEP_AWAKE 6
 #define ID_TRAY_MENU_PRESET_FIRST 1000
 #define TRAY_MAX_PRESETS 8
 #define PostMessageW(h, m, w, l) ((void)0)
 #define DestroyMenu(m) ((void)0)
-#define swprintf_s(...) ((void)0)
 typedef int BOOL;
 typedef unsigned UINT;
 typedef unsigned long long ULONGLONG;
 typedef void *HWND, *HMENU;
 typedef struct { long x, y; } POINT;
 typedef struct { wchar_t name[128]; } Monitor;
-struct { wchar_t trayTarget[128]; int trayPresets[TRAY_MAX_PRESETS]; int trayPresetCount; } g_config;
+struct { wchar_t trayTarget[128]; int trayPresets[TRAY_MAX_PRESETS]; int trayPresetCount;
+    int keepAwakeMinutes; ULONGLONG keepAwakeUntil; } g_config;
 int paused, items, defaults;
-UINT ids[16], greyed[16];
+UINT ids[16], greyed[16], checked[16];
+wchar_t keepAwakeText[96];
 BOOL g_remoteSession;
+/* The Windows CRT reads %s as a wide string in wide formats; glibc needs %ls. */
+int swprintf_s(wchar_t* out, size_t count, const wchar_t* format, ...) {
+    wchar_t fixed[256]; size_t n = 0;
+    for (const wchar_t* p = format; *p; p++) {
+        if (p[0] == L'%' && p[1] == L's') { fixed[n++] = L'%'; fixed[n++] = L'l'; fixed[n++] = L's'; p++; }
+        else fixed[n++] = *p;
+    }
+    fixed[n] = 0;
+    va_list args; va_start(args, format);
+    int written = vswprintf(out, count, fixed, args);
+    va_end(args);
+    return written;
+}
 void GetCursorPos(POINT* pt) { pt->x = pt->y = 0; }
 HMENU CreatePopupMenu(void) { return (HMENU)1; }
 BOOL AppendMenuW(HMENU menu, UINT flags, UINT id, const wchar_t* text) {
     (void)menu;
     greyed[items] = flags & MF_GRAYED;
+    checked[items] = flags & MF_CHECKED;
     if (flags & MF_SEPARATOR) { ids[items++] = 0; return TRUE; }
     if (id == ID_TRAY_MENU_RESUME_SCHEDULE) assert(wcscmp(text, L"Resume schedule") == 0);
     if (id == ID_TRAY_MENU_CONFIGURE) assert(wcscmp(text, L"Configure") == 0);
+    if (id == ID_TRAY_MENU_KEEP_AWAKE) wcscpy(keepAwakeText, text);
     ids[items++] = id;
     return TRUE;
 }
@@ -576,36 +625,61 @@ BOOL TrackPopupMenu(HMENU m, UINT f, int x, int y, int r, HWND h, const void* rc
 Monitor* TrayTargetMonitor(BOOL* allVisible) { *allVisible = TRUE; return NULL; }
 int VisibleMonitorCount(void) { return 1; }
 BOOL IsSchedulePaused(ULONGLONG now) { (void)now; return paused; }
-ULONGLONG NowFileTime(void) { return 0; }
+ULONGLONG NowFileTime(void) { return 100; }
+void FormatLocalTimeOfDay(ULONGLONG ft, wchar_t* out, size_t count) {
+    (void)count; assert(ft == g_config.keepAwakeUntil); wcscpy(out, L"16:42");
+}
 void wcscpy_s(wchar_t* out, size_t count, const wchar_t* in) { (void)count; wcscpy(out, in); }
-''' + function("ShowContextMenu") + r'''
+''' + function("FormatKeepAwakeDuration") + function("IsKeepingAwake") + function("ShowContextMenu") + r'''
 int main(void) {
+    g_config.keepAwakeMinutes = 120;
     ShowContextMenu((HWND)1);
-    assert(items == 3 && ids[0] == ID_TRAY_MENU_CONFIGURE && ids[1] == 0 && ids[2] == ID_TRAY_MENU_EXIT);
+    assert(items == 4 && ids[0] == ID_TRAY_MENU_KEEP_AWAKE && ids[1] == ID_TRAY_MENU_CONFIGURE);
+    assert(ids[2] == 0 && ids[3] == ID_TRAY_MENU_EXIT);
+    /* Keep monitors awake names the duration chosen in the dialog. */
+    assert(wcscmp(keepAwakeText, L"Keep monitors awake for 2 hours") == 0 && !checked[0] && !greyed[0]);
     /* Configure is no longer the bold default item. */
     assert(defaults == 0);
     paused = 1;
     items = 0;
     ShowContextMenu((HWND)1);
-    assert(items == 4 && ids[0] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[1] == ID_TRAY_MENU_CONFIGURE);
-    assert(ids[2] == 0 && ids[3] == ID_TRAY_MENU_EXIT && defaults == 0);
-    /* With brightness items above, Resume stays in Configure's group; the
-     * presets are plain items between the two steps, without a bullet. */
+    assert(items == 5 && ids[0] == ID_TRAY_MENU_KEEP_AWAKE && ids[1] == ID_TRAY_MENU_RESUME_SCHEDULE);
+    assert(ids[2] == ID_TRAY_MENU_CONFIGURE && ids[3] == 0 && ids[4] == ID_TRAY_MENU_EXIT && defaults == 0);
+    /* With brightness items above, Keep awake and Resume stay in Configure's
+     * group; the presets are plain items between the two steps, without a
+     * bullet. */
     wcscpy(g_config.trayTarget, L"*");
     g_config.trayPresets[0] = 100;
     g_config.trayPresets[1] = 50;
     g_config.trayPresetCount = 2;
     items = 0;
     ShowContextMenu((HWND)1);
-    assert(items == 9 && ids[0] == ID_TRAY_MENU_BRIGHTER && ids[1] == ID_TRAY_MENU_PRESET_FIRST);
+    assert(items == 10 && ids[0] == ID_TRAY_MENU_BRIGHTER && ids[1] == ID_TRAY_MENU_PRESET_FIRST);
     assert(ids[2] == ID_TRAY_MENU_PRESET_FIRST + 1 && ids[3] == ID_TRAY_MENU_DIMMER && ids[4] == 0);
-    assert(ids[5] == ID_TRAY_MENU_RESUME_SCHEDULE && ids[6] == ID_TRAY_MENU_CONFIGURE && ids[7] == 0 && ids[8] == ID_TRAY_MENU_EXIT);
+    assert(ids[5] == ID_TRAY_MENU_KEEP_AWAKE && ids[6] == ID_TRAY_MENU_RESUME_SCHEDULE);
+    assert(ids[7] == ID_TRAY_MENU_CONFIGURE && ids[8] == 0 && ids[9] == ID_TRAY_MENU_EXIT);
     assert(!greyed[0] && !greyed[1] && !greyed[3]);
-    /* Through Remote Desktop the brightness items stay but are greyed out. */
+    /* Through Remote Desktop the brightness items stay but are greyed out;
+     * keeping the monitors awake is not a monitor control and stays. */
     g_remoteSession = 1;
     items = 0;
     ShowContextMenu((HWND)1);
-    assert(items == 9 && greyed[0] && greyed[1] && greyed[2] && greyed[3] && !greyed[5] && !greyed[6]);
+    assert(items == 10 && greyed[0] && greyed[1] && greyed[2] && greyed[3]);
+    assert(!greyed[5] && !greyed[6] && !greyed[7]);
+    /* While it lasts the item is ticked and shows the end time. */
+    g_remoteSession = 0;
+    g_config.keepAwakeUntil = 200;
+    items = 0;
+    ShowContextMenu((HWND)1);
+    assert(ids[5] == ID_TRAY_MENU_KEEP_AWAKE && checked[5] && !greyed[5]);
+    assert(wcscmp(keepAwakeText, L"Keep monitors awake until 16:42") == 0);
+    for (int i = 0; i < items; i++) assert(i == 5 || !checked[i]);
+    /* An end time that has passed counts as off, before the timer says so. */
+    g_config.keepAwakeUntil = 100;
+    g_config.keepAwakeMinutes = 90;
+    items = 0;
+    ShowContextMenu((HWND)1);
+    assert(!checked[5] && wcscmp(keepAwakeText, L"Keep monitors awake for 1 hour 30 minutes") == 0);
 }
 ''')
 

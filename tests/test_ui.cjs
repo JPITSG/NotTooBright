@@ -72,7 +72,7 @@ test('Save sends stable keys and limits changes to monitors shown in the dialog'
   const { saveSettings } = loadTs('assets/src/lib/bridge.ts', {
     window: { chrome: { webview: { postMessage: (text) => { message = JSON.parse(text); } } } },
   });
-  saveSettings(false, false, true, true, false, '', [], { scheduledKeys: ['a', 'gone', 'hidden'] }, [
+  saveSettings(false, false, true, true, false, '', [], 240, { scheduledKeys: ['a', 'gone', 'hidden'] }, [
     monitor('a', 9), monitor('b', 10, false), monitor('hidden', 11, true, true),
   ]);
   assert.equal(message.scheduledKeys, 'a');
@@ -80,6 +80,31 @@ test('Save sends stable keys and limits changes to monitors shown in the dialog'
   assert.equal(message.startWithWindows, true);
   assert.equal(message.pauseInRemoteSession, true);
   assert.equal(message.brightnessKeys, false);
+  assert.equal(message.keepAwakeMinutes, 240);
+});
+
+test('keep awake offers two hours by default, words its choices, and follows the host', () => {
+  const messages = [];
+  const window = { chrome: { webview: { postMessage: (text) => messages.push(JSON.parse(text)) } } };
+  const bridge = loadTs('assets/src/lib/bridge.ts', { window });
+  assert.equal(bridge.KEEP_AWAKE_DEFAULT_MINUTES, 120);
+  assert.equal(JSON.stringify(bridge.KEEP_AWAKE_DURATIONS.map(bridge.formatDuration)), JSON.stringify([
+    '15 minutes', '30 minutes', '45 minutes', '1 hour', '1 hour 30 minutes', '2 hours',
+    '3 hours', '4 hours', '6 hours', '8 hours', '12 hours', '24 hours',
+  ]));
+  assert.equal(bridge.formatDuration(1), '1 minute');
+  assert.equal(bridge.formatDuration(61), '1 hour 1 minute');
+  assert.equal(bridge.formatDuration(100), '1 hour 40 minutes');
+  // The end time pushed while the dialog is open reaches the latest listener only.
+  const seen = [];
+  const remove = bridge.onKeepAwake((until) => seen.push(until));
+  window.onKeepAwake('16:42');
+  window.onKeepAwake('');
+  remove();
+  window.onKeepAwake('17:00');
+  assert.deepEqual(seen, ['16:42', '']);
+  bridge.stopKeepAwake();
+  assert.deepEqual(messages, [{ action: 'stopKeepAwake' }]);
 });
 
 const solar = loadTs('assets/src/lib/solar.ts');

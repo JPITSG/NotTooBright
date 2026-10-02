@@ -21,7 +21,8 @@
  *     display changes.
  *
  * Other parts:
- *   - System tray icon with a context menu (Configure / Exit)
+ *   - System tray icon with a context menu (brightness steps and presets,
+ *     Keep monitors awake, Resume schedule, Configure, Exit)
  *   - WebView2-hosted configuration dialog (React UI embedded as a resource)
  *   - Registry-persisted settings, optional start with Windows
  *   - Optional debug log in %LOCALAPPDATA%\NotTooBright\debug.log
@@ -159,6 +160,16 @@
 #define ID_TRAY_MENU_BRIGHTER 3
 #define ID_TRAY_MENU_DIMMER 4
 #define ID_TRAY_MENU_RESUME_SCHEDULE 5
+#define ID_TRAY_MENU_KEEP_AWAKE 6
+/* Keep monitors awake (tray menu): a power request keeps the displays on
+ * and Windows out of sleep for the duration chosen in the dialog. The end
+ * time is persisted so the restart after an update carries it over. */
+#define REG_VALUE_KEEP_AWAKE_MINUTES L"KeepAwakeMinutes"
+#define REG_VALUE_KEEP_AWAKE_UNTIL L"KeepAwakeUntil"     /* REG_QWORD, UTC FILETIME; 0 when off */
+#define KEEP_AWAKE_DEFAULT_MINUTES 120
+#define KEEP_AWAKE_MAX_MINUTES (24 * 60)
+#define KEEP_AWAKE_FILETIME_PER_MINUTE (60ULL * 10000000ULL)
+#define ID_TIMER_KEEP_AWAKE 13
 /* Step applied by the tray menu's Increase/Decrease brightness items. */
 #define TRAY_STEP_PERCENT 10
 /* Which monitor the tray menu items control: "" for none (items hidden),
@@ -522,6 +533,8 @@ typedef struct {
     wchar_t trayTarget[128];  /* "", "*", or a monitor key */
     int trayPresets[TRAY_MAX_PRESETS];  /* -SOFT_MAX_DIM..100, menu order */
     int trayPresetCount;
+    int keepAwakeMinutes;     /* how long the tray menu's Keep monitors awake lasts */
+    ULONGLONG keepAwakeUntil; /* UTC FILETIME; 0 unless the monitors are kept awake (persisted) */
     Schedule schedule;
 } Configuration;
 
@@ -718,6 +731,7 @@ static BOOL g_overlayTimerRunning = FALSE;
 static SolarCache g_solarCache;
 static int g_loggedSchedulePhase = -1;      /* last SchedulePhase written to the log */
 static BOOL g_remoteSession = FALSE;        /* paused: the session is viewed through Remote Desktop */
+static HANDLE g_keepAwakeRequest = NULL;    /* power request while the monitors are kept awake */
 
 /* Built-in displays: the change listener and the power notifications that
  * explain Windows' own adjustments, started with the first such display. */
@@ -1071,6 +1085,7 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     SetScheduleDefaults(&config->schedule);
     config->autoCheckForUpdates = TRUE;   /* default enabled */
     config->pauseInRemoteSession = TRUE;
+    config->keepAwakeMinutes = KEEP_AWAKE_DEFAULT_MINUTES;
 
     HKEY hKey;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -1098,6 +1113,8 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         dataType == REG_SZ) {
         config->trayPresetCount = ParseTrayPresets(presetText, config->trayPresets, TRAY_MAX_PRESETS);
     }
+    ReadRegistryInt(hKey, REG_VALUE_KEEP_AWAKE_MINUTES, &config->keepAwakeMinutes, 1, KEEP_AWAKE_MAX_MINUTES);
+    ReadRegistryQword(hKey, REG_VALUE_KEEP_AWAKE_UNTIL, &config->keepAwakeUntil);
 
     dataSize = sizeof(g_ignoredUpdateVersion);
     if (RegQueryValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, NULL,
@@ -1156,6 +1173,8 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     FormatTrayPresets(config->trayPresets, config->trayPresetCount, presetText, 128);
     RegSetValueExW(hKey, REG_VALUE_TRAY_PRESETS, 0, REG_SZ, (const BYTE*)presetText,
                    (DWORD)((wcslen(presetText) + 1) * sizeof(wchar_t)));
+    WriteRegistryDword(hKey, REG_VALUE_KEEP_AWAKE_MINUTES, (DWORD)config->keepAwakeMinutes);
+    WriteRegistryQword(hKey, REG_VALUE_KEEP_AWAKE_UNTIL, config->keepAwakeUntil);
     RegSetValueExW(hKey, REG_VALUE_IGNORED_UPDATE_VERSION, 0, REG_SZ,
                    (const BYTE*)g_ignoredUpdateVersion,
                    (DWORD)((wcslen(g_ignoredUpdateVersion) + 1) * sizeof(wchar_t)));
@@ -4305,6 +4324,158 @@ static void UpdateScheduleTimer(void) {
     }
 }
 
+/* ── Keep monitors awake ─────────────────────────────────────────────────── */
+
+/* The tray menu's Keep monitors awake item holds a power request (display
+ * and system required) until g_config.keepAwakeUntil, so for the duration
+ * chosen in the dialog the monitors do not turn off and Windows does not go
+ * to sleep on its own; Sleep chosen by the user, the power button and a
+ * closed lid still work. The end time is persisted: the restart after an
+ * update (or a crash, or signing out) carries it over, while choosing the
+ * item again, Stop in the dialog, or Exit ends it. It is not a monitor
+ * control, so a Remote Desktop session does not pause it. One timer runs
+ * only while it lasts. Logged under [AWAKE]. */
+
+/* "15 minutes", "1 hour", "1 hour 30 minutes", "2 hours". The dialog's
+ * formatDuration (bridge.ts) words its choices the same way. */
+static void FormatKeepAwakeDuration(int minutes, wchar_t* out, size_t count) {
+    int hours = minutes / 60, rest = minutes % 60;
+    wchar_t restText[24] = L"";
+    if (rest) swprintf_s(restText, 24, L"%d minute%s", rest, rest == 1 ? L"" : L"s");
+    if (hours) {
+        swprintf_s(out, count, L"%d hour%s%s%s", hours, hours == 1 ? L"" : L"s",
+                   rest ? L" " : L"", restText);
+    } else {
+        wcscpy_s(out, count, restText);
+    }
+}
+
+static BOOL IsKeepingAwake(ULONGLONG now) {
+    return g_config.keepAwakeUntil != 0 && g_config.keepAwakeUntil > now;
+}
+
+/* Takes the power request. Its reason, with the end time, is what
+ * powercfg /requests lists for the process. FALSE, with the error, when
+ * Windows refuses it. */
+static BOOL AcquireKeepAwakeRequest(const wchar_t* until, DWORD* error) {
+    wchar_t text[128];
+    swprintf_s(text, 128, L"Keep monitors awake until %s (" APP_DISPLAY_NAME_WSTRING L" tray menu)", until);
+    REASON_CONTEXT reason;
+    ZeroMemory(&reason, sizeof(reason));
+    reason.Version = POWER_REQUEST_CONTEXT_VERSION;
+    reason.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+    reason.Reason.SimpleReasonString = text;
+    HANDLE request = PowerCreateRequest(&reason);
+    if (request == INVALID_HANDLE_VALUE) {
+        *error = GetLastError();
+        return FALSE;
+    }
+    if (!PowerSetRequest(request, PowerRequestDisplayRequired) ||
+        !PowerSetRequest(request, PowerRequestSystemRequired)) {
+        *error = GetLastError();
+        CloseHandle(request);   /* also drops a part that was set */
+        return FALSE;
+    }
+    g_keepAwakeRequest = request;
+    return TRUE;
+}
+
+static void ReleaseKeepAwakeRequest(void) {
+    if (!g_keepAwakeRequest) return;
+    PowerClearRequest(g_keepAwakeRequest, PowerRequestDisplayRequired);
+    PowerClearRequest(g_keepAwakeRequest, PowerRequestSystemRequired);
+    CloseHandle(g_keepAwakeRequest);
+    g_keepAwakeRequest = NULL;
+}
+
+/* The dialog shows the end time, with a Stop button, while it lasts. */
+static void PushKeepAwakeToDialog(void) {
+    if (!g_cfgWebView) return;
+    wchar_t until[16] = L"";
+    if (IsKeepingAwake(NowFileTime())) FormatLocalTimeOfDay(g_config.keepAwakeUntil, until, 16);
+    wchar_t script[96];
+    swprintf_s(script, 96, L"window.onKeepAwake && window.onKeepAwake(\"%s\")", until);
+    webview_cfg_execute_script(script);
+}
+
+/* Lets the monitors sleep again: the request goes and the end time is
+ * cleared (and persisted). */
+static void StopKeepAwake(const wchar_t* why) {
+    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_KEEP_AWAKE);
+    ReleaseKeepAwakeRequest();
+    if (!g_config.keepAwakeUntil) return;
+    g_config.keepAwakeUntil = 0;
+    SaveConfigToRegistry(&g_config);
+    DebugPrint(L"[AWAKE] Monitors no longer kept awake: %s\n", why);
+    ScheduleTooltipUpdate();
+    PushKeepAwakeToDialog();
+}
+
+/* Brings the request and the timer in line with the persisted end time:
+ * held, with the timer set for the end, until then, and ended once it has
+ * passed. Runs at startup (an end time carried over from before a
+ * restart), on the timer, after the clock changed, and after a resume. An
+ * end time further ahead than the longest duration means the clock was
+ * moved back since; it is not trusted. */
+static void UpdateKeepAwake(void) {
+    ULONGLONG until = g_config.keepAwakeUntil;
+    if (!until) {
+        /* Off: make sure nothing is held. */
+        if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_KEEP_AWAKE);
+        ReleaseKeepAwakeRequest();
+        return;
+    }
+    ULONGLONG now = NowFileTime();
+    if (until <= now) {
+        StopKeepAwake(L"the time is up");
+        return;
+    }
+    if (until - now > (ULONGLONG)KEEP_AWAKE_MAX_MINUTES * KEEP_AWAKE_FILETIME_PER_MINUTE) {
+        StopKeepAwake(L"the end time is further ahead than the longest duration (the clock changed)");
+        return;
+    }
+    if (!g_keepAwakeRequest) {
+        wchar_t text[16];
+        DWORD error = 0;
+        FormatLocalTimeOfDay(until, text, 16);
+        if (!AcquireKeepAwakeRequest(text, &error)) {
+            DebugPrint(L"[AWAKE] Windows refused the power request (error %lu)\n", (unsigned long)error);
+            StopKeepAwake(L"the power request failed");
+            return;
+        }
+        DebugPrint(L"[AWAKE] Keeping the monitors awake until %s (carried over)\n", text);
+    }
+    /* Rounded up so it never fires before the end time. */
+    if (g_hwnd) SetTimer(g_hwnd, ID_TIMER_KEEP_AWAKE, (UINT)((until - now + 9999) / 10000), NULL);
+    /* The end time reads differently after a time-zone change. */
+    ScheduleTooltipUpdate();
+    PushKeepAwakeToDialog();
+}
+
+/* The tray menu item: keeps the monitors awake from now for the duration
+ * chosen in the dialog. */
+static void StartKeepAwake(void) {
+    ULONGLONG until = NowFileTime() + (ULONGLONG)g_config.keepAwakeMinutes * KEEP_AWAKE_FILETIME_PER_MINUTE;
+    wchar_t text[16], duration[48];
+    FormatLocalTimeOfDay(until, text, 16);
+    FormatKeepAwakeDuration(g_config.keepAwakeMinutes, duration, 48);
+    ReleaseKeepAwakeRequest();
+    DWORD error = 0;
+    if (!AcquireKeepAwakeRequest(text, &error)) {
+        DebugPrint(L"[AWAKE] Windows refused the power request (error %lu)\n", (unsigned long)error);
+        StopKeepAwake(L"the power request failed");
+        wchar_t message[160];
+        swprintf_s(message, 160, L"Windows did not accept the request to keep the monitors awake "
+                   L"(error %lu).", (unsigned long)error);
+        MessageBoxW(NULL, message, APP_DISPLAY_NAME_WSTRING, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    g_config.keepAwakeUntil = until;
+    SaveConfigToRegistry(&g_config);
+    DebugPrint(L"[AWAKE] Keeping the monitors awake for %s, until %s\n", duration, text);
+    UpdateKeepAwake();
+}
+
 /* ── Location from the IP address ────────────────────────────────────────── */
 
 /* The dialog's "Detect from IP" button fills in the schedule's latitude and
@@ -6261,10 +6432,12 @@ static void webview_push_init_config(void) {
 
     const Schedule* sc = &g_config.schedule;
     wchar_t eUpdateCompletedVersion[64], eTrayTarget[256], presetText[128];
+    wchar_t keepAwakeUntil[16] = L"";
     json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_WSTRING : L"",
                         eUpdateCompletedVersion, 64);
     json_escape_wstring(g_config.trayTarget, eTrayTarget, 256);
     FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 128);
+    if (IsKeepingAwake(NowFileTime())) FormatLocalTimeOfDay(g_config.keepAwakeUntil, keepAwakeUntil, 16);
     BOOL updateCheckPending =
         InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE ||
         InterlockedCompareExchangePointer((PVOID volatile*)&g_updatePostedResult, NULL, NULL) != NULL;
@@ -6278,6 +6451,7 @@ static void webview_push_init_config(void) {
             L"\"brightnessKeys\":%s,\"locationDetecting\":%s,"
             L"\"updateCheckPending\":%s,\"updatePromptPending\":%s,"
             L"\"trayTarget\":\"%s\",\"trayPresets\":\"%s\","
+            L"\"keepAwakeMinutes\":%d,\"keepAwakeUntil\":\"%s\","
             L"\"schedule\":{\"enabled\":%s,\"hasLocation\":%s,\"latitude\":%.6f,"
             L"\"longitude\":%.6f,\"dayLevel\":%d,\"nightLevel\":%d,"
             L"\"dawnStartOffset\":%d,\"dawnEndOffset\":%d,\"duskStartOffset\":%d,"
@@ -6295,6 +6469,7 @@ static void webview_push_init_config(void) {
             updateCheckPending ? L"true" : L"false",
             g_updateNoticeTask ? L"true" : L"false",
             eTrayTarget, presetText,
+            g_config.keepAwakeMinutes, keepAwakeUntil,
             sc->enabled ? L"true" : L"false", sc->hasLocation ? L"true" : L"false",
             sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
             sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset,
@@ -6811,6 +6986,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         EndLocationLookup(L"cancelled");
     } else if (strcmp(action, "resumeSchedule") == 0) {
         ResumeSchedule();
+    } else if (strcmp(action, "stopKeepAwake") == 0) {
+        StopKeepAwake(L"stopped in the configuration dialog");
     } else if (strcmp(action, "saveSettings") == 0) {
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
         g_config.autoCheckForUpdates = json_get_bool(msg, "autoCheckForUpdates", TRUE);
@@ -6828,6 +7005,12 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         json_get_string(msg, "trayPresets", presetUtf8, sizeof(presetUtf8));
         MultiByteToWideChar(CP_UTF8, 0, presetUtf8, -1, presetText, 256);
         g_config.trayPresetCount = ParseTrayPresets(presetText, g_config.trayPresets, TRAY_MAX_PRESETS);
+        /* A new duration applies the next time the item is chosen; an
+         * end time already running stays as it is. */
+        int keepAwakeMinutes = 0;
+        if (json_get_int(msg, "keepAwakeMinutes", &keepAwakeMinutes)) {
+            g_config.keepAwakeMinutes = ClampInt(keepAwakeMinutes, 1, KEEP_AWAKE_MAX_MINUTES);
+        }
         SaveScheduleFromMessage(msg);
         InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
         if (!SaveConfigToRegistry(&g_config)) {
@@ -6839,9 +7022,10 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         }
         SaveStartWithWindows(msg);
         FormatTrayPresets(g_config.trayPresets, g_config.trayPresetCount, presetText, 256);
-        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, startWithWindows=%d, pauseInRemoteSession=%d, brightnessKeys=%d, trayTarget=\"%s\", trayPresets=\"%s\")\n",
+        DebugPrint(L"[INFO] Settings saved (debugLog=%d, autoCheckForUpdates=%d, startWithWindows=%d, pauseInRemoteSession=%d, brightnessKeys=%d, trayTarget=\"%s\", trayPresets=\"%s\", keepAwakeMinutes=%d)\n",
                    g_config.debugLogEnabled, g_config.autoCheckForUpdates, IsStartWithWindowsEnabled(),
-                   g_config.pauseInRemoteSession, g_config.brightnessKeys, g_config.trayTarget, presetText);
+                   g_config.pauseInRemoteSession, g_config.brightnessKeys, g_config.trayTarget, presetText,
+                   g_config.keepAwakeMinutes);
         /* Turning the pause off from inside a remote session resumes at once. */
         UpdateRemoteSessionState();
         if (brightnessKeysBefore != g_config.brightnessKeys) UpdateBrightnessKeyReaders();
@@ -7158,7 +7342,8 @@ static void ScheduleTooltipUpdate(void) {
 }
 
 /* "State: Daytime" (or Night, or the transition in progress) while the
- * schedule is enabled, "Schedule: Disabled/Active/Paused" always, then one
+ * schedule is enabled, "Schedule: Disabled/Active/Paused" always, "Keep
+ * awake: until HH:MM" while the monitors are kept awake, then one
  * "name: NN%" line per visible monitor. szTip holds 128 characters, so
  * long names are shortened and, if the list still does not fit, the tail
  * is replaced by an ellipsis. */
@@ -7173,10 +7358,17 @@ static void UpdateTrayTooltip(void) {
         wcscat_s(tip, cap, SchedulePhaseName(phase));
         wcscat_s(tip, cap, L"\n");
     }
+    ULONGLONG now = NowFileTime();
     const wchar_t* scheduleState = !g_config.schedule.enabled ? L"Disabled"
-                                 : IsSchedulePaused(NowFileTime()) ? L"Paused" : L"Active";
+                                 : IsSchedulePaused(now) ? L"Paused" : L"Active";
     wcscat_s(tip, cap, L"Schedule: ");
     wcscat_s(tip, cap, scheduleState);
+    if (IsKeepingAwake(now)) {
+        wchar_t until[16];
+        FormatLocalTimeOfDay(g_config.keepAwakeUntil, until, 16);
+        wcscat_s(tip, cap, L"\nKeep awake: until ");
+        wcscat_s(tip, cap, until);
+    }
     for (int i = 0; i < g_monitorCount; i++) {
         const Monitor* m = &g_monitors[i];
         if (m->hidden) continue;
@@ -7297,6 +7489,22 @@ static void ShowContextMenu(HWND hwnd) {
         AppendMenuW(hMenu, MF_STRING | state, ID_TRAY_MENU_DIMMER, dimmer);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     }
+    /* Keep monitors awake: ticked, with its end time, while it lasts, and
+     * choosing it then ends it. Not a monitor control, so it stays
+     * available through Remote Desktop. */
+    wchar_t keepAwake[96];
+    UINT keepAwakeState = MF_UNCHECKED;
+    if (IsKeepingAwake(NowFileTime())) {
+        wchar_t until[16];
+        FormatLocalTimeOfDay(g_config.keepAwakeUntil, until, 16);
+        swprintf_s(keepAwake, 96, L"Keep monitors awake until %s", until);
+        keepAwakeState = MF_CHECKED;
+    } else {
+        wchar_t duration[48];
+        FormatKeepAwakeDuration(g_config.keepAwakeMinutes, duration, 48);
+        swprintf_s(keepAwake, 96, L"Keep monitors awake for %s", duration);
+    }
+    AppendMenuW(hMenu, MF_STRING | keepAwakeState, ID_TRAY_MENU_KEEP_AWAKE, keepAwake);
     /* While a manual change has paused the schedule, it can be resumed
      * from here as well as from the dialog. No bold default item: Configure
      * is deliberately shown like the others. */
@@ -7364,9 +7572,16 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     DebugPrint(L"[INFO] Resume schedule selected from the tray menu\n");
                     ResumeSchedule();
                     return 0;
+                case ID_TRAY_MENU_KEEP_AWAKE:
+                    if (IsKeepingAwake(NowFileTime())) StopKeepAwake(L"turned off in the tray menu");
+                    else StartKeepAwake();
+                    return 0;
                 case ID_TRAY_MENU_EXIT:
                     StopTrayRegistration();
                     DebugPrint(L"[INFO] Exit selected from the tray menu\n");
+                    /* Exit lets the monitors sleep again; the restart after
+                     * an update carries the end time over instead. */
+                    if (!g_updateInstallReady) StopKeepAwake(L"the application exits");
                     if (g_cfgHwnd) SendMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
                     RemoveTrayIcon();
                     PostQuitMessage(0);
@@ -7454,6 +7669,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     KillTimer(hwnd, ID_TIMER_PANEL);
                     ServicePanels();
                     return 0;
+                case ID_TIMER_KEEP_AWAKE:
+                    UpdateKeepAwake();
+                    return 0;
             }
             break;
 
@@ -7463,6 +7681,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
              * Reload on broadcasts as well as checking the cache key. */
             g_solarCache.valid = FALSE;
             EvaluateSchedule();
+            /* A new clock moves the keep-awake end time nearer or further. */
+            if (uMsg == WM_TIMECHANGE) UpdateKeepAwake();
             return 0;
 
         /* Monitors come and go, change resolution, or wake up: re-enumerate
@@ -7499,6 +7719,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 NotePanelTransition(TRUE, PANEL_QUIET_MS);
                 ScheduleMonitorRefresh(REFRESH_MONITORS_RESUME_DELAY_MS);
                 ScheduleBrightnessKeyReaderRestart();
+                UpdateKeepAwake();   /* its end time may have passed during sleep */
             } else if (wParam == PBT_POWERSETTINGCHANGE) {
                 /* Display power state: 0 off, 1 on, 2 dimmed. Monitors that
                  * were switched off need a moment before DDC/CI answers, and
@@ -7590,9 +7811,9 @@ static void LogEnvironment(void) {
                (unsigned long)sessionId, metric, (unsigned long)glassId, glassKnown ? L"" : L" (unknown)",
                remote ? L"remote" : L"local", g_config.pauseInRemoteSession);
     const Schedule* sc = &g_config.schedule;
-    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d startWithWindows=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d deepSleep=%d %d%% at %02d:%02d reset=%02d:%02d\n",
+    DebugPrint(L"[ENV] settings: allowBelowMinimum=%d debugLog=%d brightnessKeys=%d startWithWindows=%d keepAwakeMinutes=%d schedule=%d location=%d (%.4f, %.4f) day=%d night=%d dawn=%+d/%+d dusk=%+d/%+d deepSleep=%d %d%% at %02d:%02d reset=%02d:%02d\n",
                g_config.allowBelowMinimum, g_config.debugLogEnabled, g_config.brightnessKeys,
-               IsStartWithWindowsEnabled(), sc->enabled, sc->hasLocation,
+               IsStartWithWindowsEnabled(), g_config.keepAwakeMinutes, sc->enabled, sc->hasLocation,
                sc->latitude, sc->longitude, sc->dayLevel, sc->nightLevel,
                sc->dawnStartOffset, sc->dawnEndOffset, sc->duskStartOffset, sc->duskEndOffset,
                sc->deepSleepEnabled, sc->deepSleepLevel, sc->deepSleepMinutes / 60, sc->deepSleepMinutes % 60,
@@ -7702,6 +7923,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RefreshMonitors();
     UpdateScheduleTimer();
     UpdateBrightnessKeyReaders();
+    UpdateKeepAwake();   /* an end time carried over from before a restart */
 
     /* A successful replacement starts exactly once with --finish-update.
      * Reopen settings and show the confirmation only when that update's
@@ -7736,6 +7958,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     KillTimer(g_hwnd, ID_TIMER_KEY_DEVICES);
     KillTimer(g_hwnd, ID_TIMER_PANEL);
     KillTimer(g_hwnd, ID_TIMER_LOCATION);
+    KillTimer(g_hwnd, ID_TIMER_KEEP_AWAKE);
+    ReleaseKeepAwakeRequest();
     CloseBrightnessKeyReaders();
     StopPanelWatch();
     PersistDirtyMonitors();

@@ -9,6 +9,9 @@ import {
   TWO_COLUMN_WIDTH,
   TRAY_TARGET_NONE,
   TRAY_TARGET_ALL,
+  KEEP_AWAKE_DEFAULT_MINUTES,
+  KEEP_AWAKE_DURATIONS,
+  formatDuration,
   parseTrayPresets,
   saveSettings,
   closeDialog,
@@ -29,6 +32,7 @@ import {
   hideMonitor,
   refreshMonitors,
   resumeSchedule,
+  stopKeepAwake,
   setDesiredContentWidth,
 } from "./lib/bridge";
 import ConfigAlert from "./components/ConfigAlert";
@@ -47,6 +51,8 @@ interface Props {
   // Viewed through Remote Desktop: the monitors are shown as they were at
   // the console and everything that would touch them is disabled.
   remoteSession: boolean;
+  // "HH:MM" while the tray menu's Keep monitors awake is on, otherwise "".
+  keepAwakeUntil: string;
   updateCompletedVersion: string;
 }
 
@@ -300,6 +306,7 @@ export default function ConfigView({
   config,
   monitors,
   remoteSession,
+  keepAwakeUntil,
   updateCompletedVersion,
 }: Props) {
   const [values, setValues] = useState<Record<number, number>>({});
@@ -323,6 +330,12 @@ export default function ConfigView({
     (config.trayPresets ?? "").split(",").filter(Boolean).join(", ")
   );
   const trayPresetsRef = useRef<HTMLInputElement>(null);
+  const savedKeepAwakeMinutes = config.keepAwakeMinutes ?? KEEP_AWAKE_DEFAULT_MINUTES;
+  const [keepAwakeMinutes, setKeepAwakeMinutes] = useState(savedKeepAwakeMinutes);
+  // A duration set outside the dialog stays selectable among the usual ones.
+  const keepAwakeChoices = KEEP_AWAKE_DURATIONS.includes(savedKeepAwakeMinutes)
+    ? KEEP_AWAKE_DURATIONS
+    : [...KEEP_AWAKE_DURATIONS, savedKeepAwakeMinutes].sort((a, b) => a - b);
   const [updateChecking, setUpdateChecking] = useState(
     config.updateCheckPending ?? false
   );
@@ -451,6 +464,7 @@ export default function ConfigView({
     brightnessKeys !== (config.brightnessKeys ?? false) ||
     trayTarget !== (config.trayTarget ?? TRAY_TARGET_NONE) ||
     trayPresets !== (config.trayPresets ?? "").split(",").filter(Boolean).join(", ") ||
+    keepAwakeMinutes !== savedKeepAwakeMinutes ||
     hasScheduleChanges(
       { ...schedule, scheduledKeys: reconcileScheduleSelection(
         schedule.scheduledKeys, seenScheduleKeys.current, monitors
@@ -568,6 +582,7 @@ export default function ConfigView({
       brightnessKeys,
       trayTarget,
       trayPresetsParsed.values,
+      keepAwakeMinutes,
       schedule,
       monitors
     );
@@ -766,6 +781,46 @@ export default function ConfigView({
               `scheduled monitors.`
             : "Choose All monitors or one monitor to add Increase brightness, " +
               "Decrease brightness and preset levels to the tray menu."}
+        </p>
+      </div>
+
+      <div className="space-y-1 pt-1">
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="keepAwakeMinutes">Keep monitors awake for</Label>
+          {keepAwakeUntil && (
+            <div className="flex shrink-0 items-center gap-2">
+              <span
+                className="shrink-0 whitespace-nowrap rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium leading-none text-emerald-700"
+                title="The monitors stay on and Windows does not go to sleep until then"
+              >
+                On until {keepAwakeUntil}
+              </span>
+              <button
+                type="button"
+                className="text-[11px] leading-none text-neutral-500 underline hover:text-neutral-900"
+                title="Let the monitors turn off and Windows go to sleep again"
+                onClick={() => stopKeepAwake()}
+              >
+                Stop now
+              </button>
+            </div>
+          )}
+        </div>
+        <Select
+          id="keepAwakeMinutes"
+          value={keepAwakeMinutes}
+          onChange={(e) => setKeepAwakeMinutes(Number(e.target.value))}
+        >
+          {keepAwakeChoices.map((minutes) => (
+            <option key={minutes} value={minutes}>
+              {formatDuration(minutes)}
+            </option>
+          ))}
+        </Select>
+        <p className="text-neutral-500 text-[11px] leading-snug">
+          Each time Keep monitors awake is chosen in the tray menu, the
+          monitors stay on and Windows does not go to sleep for this long, or
+          until it is chosen again.
         </p>
       </div>
 

@@ -316,7 +316,7 @@ enum { PBT_APMRESUMEAUTOMATIC=200, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE,
 ''' + defines("ID_TIMER_REFRESH_MONITORS", "ID_TIMER_OVERLAY_TOPMOST", "ID_TIMER_PERSIST",
               "ID_TIMER_SCHEDULE", "ID_TIMER_DDC_RETRY", "ID_TIMER_AUTO_UPDATE",
               "ID_TIMER_TOOLTIP", "ID_TIMER_KEY_DEVICES", "ID_TIMER_PANEL", "ID_TIMER_LOCATION",
-              "SCHEDULE_INTERVAL_MS",
+              "ID_TIMER_KEEP_AWAKE", "SCHEDULE_INTERVAL_MS",
               "REFRESH_MONITORS_DEBOUNCE_MS", "REFRESH_MONITORS_RESUME_DELAY_MS",
               "PANEL_SETTLE_MS", "PANEL_QUIET_MS") + r'''
 struct { BOOL autoCheckForUpdates; struct { BOOL enabled, hasLocation; } schedule; } g_config;
@@ -341,8 +341,9 @@ int locationTimeouts;
 void EndLocationLookup(const wchar_t* status) { assert(wcscmp(status, L"timeout") == 0); locationTimeouts++; }
 BOOL g_overlayTimerRunning, g_ddcRetryPending;
 HWND g_hwnd = (HWND)1;
-int evaluations, refreshes, keyRestarts, sessionChecks, scheduleTimer, raised;
+int evaluations, refreshes, keyRestarts, sessionChecks, scheduleTimer, raised, keepAwakeChecks;
 void EvaluateSchedule(void) { evaluations++; }
+void UpdateKeepAwake(void) { keepAwakeChecks++; }
 void RefreshMonitors(void) { refreshes++; }
 void KeepOverlaysOnTop(void) { raised++; }
 void PersistDirtyMonitors(void) {}
@@ -382,12 +383,17 @@ int main(void) {
         assert(!g_solarCache.valid && scheduleTimer);
     }
     assert(evaluations == 122);
+    /* Only a clock change moves the keep-awake end time nearer or further;
+     * the frequent setting broadcasts leave it alone. */
+    assert(keepAwakeChecks == 1);
     g_solarCache.valid = TRUE;
     Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
     assert(!g_solarCache.valid && scheduleTimer && refreshes == 1 && keyRestarts == 1);
     g_solarCache.valid = TRUE;
     Dispatch(g_hwnd, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0);
     assert(!g_solarCache.valid && scheduleTimer && refreshes == 2 && keyRestarts == 2);
+    /* Its end time may have passed during sleep. */
+    assert(keepAwakeChecks == 3);
     /* After a resume Windows applies its own level to a built-in display. */
     assert(quietTransitions == 2 && lastTransitionMs == PANEL_QUIET_MS);
     POWERBROADCAST_SETTING power = {1, sizeof(DWORD), {0}};
@@ -425,8 +431,10 @@ int main(void) {
     assert(panelServices == 1);
     Dispatch(g_hwnd, WM_TIMER, ID_TIMER_LOCATION, 0);
     assert(locationTimeouts == 1);
+    Dispatch(g_hwnd, WM_TIMER, ID_TIMER_KEEP_AWAKE, 0);
+    assert(keepAwakeChecks == 4);
     Dispatch(g_hwnd, WM_TIMER, ID_TIMER_SCHEDULE, 0);
-    assert(evaluations == 123);
+    assert(evaluations == 123 && keepAwakeChecks == 4);
     /* A queued overlay timer cannot do work after it was disabled. */
     Dispatch(g_hwnd, WM_TIMER, ID_TIMER_OVERLAY_TOPMOST, 0);
     assert(raised == 0);

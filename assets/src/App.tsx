@@ -5,6 +5,7 @@ import {
   onInit,
   onMonitors,
   onRemoteSession,
+  onKeepAwake,
   getInit,
   reportSize,
 } from "./lib/bridge";
@@ -14,20 +15,24 @@ export default function App() {
   const [initData, setInitData] = useState<InitData | null>(null);
   const [monitors, setMonitors] = useState<MonitorData[]>([]);
   const [remoteSession, setRemoteSession] = useState(false);
+  const [keepAwakeUntil, setKeepAwakeUntil] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     onInit((data) => {
       setMonitors(data.monitors ?? []);
       setRemoteSession(data.config?.remoteSession ?? false);
+      setKeepAwakeUntil(data.config?.keepAwakeUntil ?? "");
       setInitData(data);
     });
     const removeMonitorsListener = onMonitors((list) => setMonitors(list));
     const removeRemoteListener = onRemoteSession((remote) => setRemoteSession(remote));
+    const removeKeepAwakeListener = onKeepAwake((until) => setKeepAwakeUntil(until));
     getInit();
     return () => {
       removeMonitorsListener();
       removeRemoteListener();
+      removeKeepAwakeListener();
     };
   }, []);
 
@@ -54,6 +59,7 @@ export default function App() {
         config={initData.config}
         monitors={monitors}
         remoteSession={remoteSession}
+        keepAwakeUntil={keepAwakeUntil}
         updateCompletedVersion={initData.updateCompletedVersion ?? ""}
       />
     </div>

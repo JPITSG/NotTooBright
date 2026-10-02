@@ -78,12 +78,30 @@ export interface ConfigData {
   trayTarget: string;
   // Preset levels listed between Increase and Decrease, "100,75,50".
   trayPresets: string;
+  // How long the tray menu's Keep monitors awake lasts, in minutes.
+  keepAwakeMinutes: number;
+  // "HH:MM" while the monitors are kept awake, otherwise "".
+  keepAwakeUntil: string;
   schedule: ScheduleData;
 }
 
 export const TRAY_TARGET_NONE = "";
 export const TRAY_TARGET_ALL = "*";
 export const TRAY_MAX_PRESETS = 20;
+
+export const KEEP_AWAKE_DEFAULT_MINUTES = 120;
+// The choices offered in the dialog; the host accepts 1 minute to 24 hours.
+export const KEEP_AWAKE_DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 1440];
+
+/** "15 minutes", "1 hour", "1 hour 30 minutes", "2 hours": worded like the
+ * tray menu item (FormatKeepAwakeDuration on the host). */
+export function formatDuration(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  const restText = rest ? `${rest} minute${rest === 1 ? "" : "s"}` : "";
+  if (!hours) return restText;
+  return `${hours} hour${hours === 1 ? "" : "s"}${rest ? ` ${restText}` : ""}`;
+}
 
 /** Parses the preset field: whole numbers from `min` to 100 separated by
  * commas (blank entries ignored, duplicates dropped, order kept). `error`
@@ -172,10 +190,12 @@ export interface LocationResult {
 type InitCallback = (data: InitData) => void;
 type MonitorsCallback = (monitors: MonitorData[]) => void;
 type RemoteSessionCallback = (remote: boolean) => void;
+type KeepAwakeCallback = (until: string) => void;
 
 let initCallback: InitCallback | null = null;
 let monitorsCallback: MonitorsCallback | null = null;
 let remoteSessionCallback: RemoteSessionCallback | null = null;
+let keepAwakeCallback: KeepAwakeCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 let locationResultCallback: ((result: LocationResult) => void) | null = null;
@@ -212,6 +232,15 @@ export function onRemoteSession(cb: RemoteSessionCallback) {
   };
 }
 
+// Keep monitors awake was turned on or off (tray menu, Stop, or the time
+// ran out) while the dialog is open: "HH:MM" while on, "" once off.
+export function onKeepAwake(cb: KeepAwakeCallback) {
+  keepAwakeCallback = cb;
+  return () => {
+    if (keepAwakeCallback === cb) keepAwakeCallback = null;
+  };
+}
+
 // Called by C via ExecuteScript
 (window as unknown as Record<string, unknown>).onInit = (data: InitData) => {
   if (initCallback) initCallback(data);
@@ -227,6 +256,10 @@ export function onRemoteSession(cb: RemoteSessionCallback) {
   remote: boolean
 ) => {
   if (remoteSessionCallback) remoteSessionCallback(remote);
+};
+
+(window as unknown as Record<string, unknown>).onKeepAwake = (until: string) => {
+  if (keepAwakeCallback) keepAwakeCallback(until);
 };
 
 (window as unknown as Record<string, unknown>).onUpdateResult = (
@@ -313,6 +346,11 @@ export function resumeSchedule() {
   post({ action: "resumeSchedule" });
 }
 
+// Lets the monitors sleep again before the time is up.
+export function stopKeepAwake() {
+  post({ action: "stopKeepAwake" });
+}
+
 export function configReady(checkAutomatically = false) {
   post({ action: "configReady", checkAutomatically });
 }
@@ -349,6 +387,7 @@ export function saveSettings(
   brightnessKeys: boolean,
   trayTarget: string,
   trayPresets: number[],
+  keepAwakeMinutes: number,
   schedule: ScheduleSettings,
   monitors: MonitorData[]
 ) {
@@ -361,6 +400,7 @@ export function saveSettings(
     brightnessKeys,
     trayTarget,
     trayPresets: trayPresets.join(","),
+    keepAwakeMinutes,
     scheduleEnabled: schedule.enabled,
     latitude: schedule.latitude,
     longitude: schedule.longitude,

@@ -21,6 +21,7 @@ else, and an optional schedule that follows the sun for your location.
 - **Manual override that makes sense** - Touch a scheduled monitor's slider and the schedule pauses until a reset time you choose
 - **Below the minimum** - Optionally continue below 0% on hardware monitors by adding software dimming on top of the lowest backlight setting
 - **Hide what you do not want touched** - Remove a monitor from the app entirely until the next rescan; its original brightness is restored first
+- **Keep monitors awake** - One click in the tray menu keeps the screens on and the computer out of sleep for as long as you choose (2 hours by default)
 - **Never black, never in screenshots** - Software dimming stops at 10% and its overlay is excluded from screen capture and screen sharing
 - **Zero install** - One small executable, no runtime to install, settings in your user registry, nothing written next to the exe
 - **Self update** - Checks this repository for a newer build, shows both version numbers, and replaces itself in place after a standard UAC prompt; automatic checks can be turned off
@@ -35,9 +36,12 @@ else, and an optional schedule that follows the sun for your location.
 
 Hover the icon for a tooltip listing every monitor and its current
 brightness, headed by a **Schedule** line (*Disabled*, *Active*, or *Paused*
-after a manual change) and, while the schedule is enabled, a **State** line
+after a manual change), a **Keep awake** line with the end time while the
+monitors are kept awake and, while the schedule is enabled, a **State** line
 (*Daytime*, *Night*, *Deep sleep*, or the transition in progress,
-*Daytime → Night*, *Night → Daytime* or *Night → Deep sleep*). Right-click it for **Configure** and **Exit**, plus **Increase
+*Daytime → Night*, *Night → Daytime* or *Night → Deep sleep*). Right-click it
+for **Keep monitors awake** (see [Keep Monitors Awake](#keep-monitors-awake)),
+**Configure** and **Exit**, plus **Increase
 brightness** / **Decrease brightness** and any preset levels you have listed
 once you have chosen which monitor the menu controls (see *Tray menu
 brightness control*), and **Resume schedule** while a manual change has
@@ -214,6 +218,25 @@ usages cannot be seen this way. With debug logging on, the `[INPUT]` lines
 show which collections were opened and every report they send, which is
 the first thing to check when a key does nothing.
 
+## Keep Monitors Awake
+
+The tray menu's **Keep monitors awake for 2 hours** item stops the monitors
+from turning off and Windows from going to sleep on its own, for as long as
+**Keep monitors awake for** in the dialog says: 15 minutes to 24 hours, 2
+hours by default. While it lasts, the item is ticked and reads **Keep monitors
+awake until 16:42**, the tooltip shows **Keep awake: until 16:42**, and the
+dialog shows **On until 16:42** with **Stop now**. Choosing the item again,
+**Stop now**, or **Exit** ends it early; once the time is up the monitors and
+the computer follow the Windows power settings again. Sleep chosen by hand,
+the power button and closing a laptop's lid still work as usual.
+
+It is a standard Windows power request, so `powercfg /requests` (from an
+administrator command prompt) lists it with its end time. The end time is
+remembered: if Not Too Bright restarts before then, after an update or at
+the next sign-in, it carries on until that time. A new duration applies the
+next time the item is chosen. Keeping the computer awake is not a monitor
+control, so a Remote Desktop session does not pause it.
+
 ## Remote Desktop
 
 When the session is viewed through Remote Desktop, Windows replaces the
@@ -299,6 +322,7 @@ are already remembered and do not trigger this prompt.
 | Cycle reset time | Time of day at which a schedule paused by a manual change takes over again. 04:00 by default. |
 | Tray menu brightness control | Chooses what the tray menu's **Increase brightness** and **Decrease brightness** items act on: **None** (the items are not shown; the default), **All monitors**, or one specific monitor. Each click moves the target by 10% from its current value; that counts as a manual change for scheduled monitors. Saved with **Save**. |
 | Preset levels | Shown once a target is chosen: comma-separated brightness levels (whole numbers from 0 to 100, or down to -90 with the extended range on) that appear as their own items between Increase and Decrease, in the order listed. Clicking one sets the target to that level. Anything that is not a valid level is refused. Saved with **Save**. |
+| Keep monitors awake for | How long the tray menu's **Keep monitors awake** item keeps the monitors on and Windows out of sleep each time it is chosen: 15 minutes to 24 hours, 2 hours by default; see [Keep Monitors Awake](#keep-monitors-awake). While it is on, **On until** with the end time and **Stop now** appear beside the label. Saved with **Save**; a new duration applies from the next time the item is chosen. |
 | Use the keyboard's brightness keys | The keyboard's Brightness Up/Down keys step every external monitor by 10%; see [Keyboard Brightness Keys](#keyboard-brightness-keys). Saved with **Save**. Disabled by default. |
 | Pause while connected through Remote Desktop | Leaves the monitors alone while the session is viewed remotely; see [Remote Desktop](#remote-desktop). Saved with **Save**. Enabled by default. |
 | Start with Windows | Launches Not Too Bright in the tray when you sign in to Windows, through a per-user startup entry (no administrator rights needed). An entry disabled in Task Manager's startup apps shows as off; turning the option on re-enables it. Saved with **Save**. Disabled by default. |
@@ -315,7 +339,7 @@ next to the executable, so it can run from any folder.
 
 | Location | Contents |
 |----------|----------|
-| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, the brightness keys option, the Remote Desktop pause, update checking and the ignored update version, debug logging |
+| `HKCU\SOFTWARE\JPIT\NotTooBright` | Global settings: the extended-range option, the schedule and its pause deadline, the tray menu target and preset levels, the keep-awake duration and end time, the brightness keys option, the Remote Desktop pause, update checking and the ignored update version, debug logging |
 | `HKCU\SOFTWARE\JPIT\NotTooBright\Monitors\<monitor id>` | Per-monitor values: brightness, software-only, hidden, scheduled, original brightness |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `NotTooBright` | The **Start with Windows** entry (the quoted path of the executable), only while that option is on |
 | `%LOCALAPPDATA%\NotTooBright\debug.log` | The debug log, only when logging is enabled |

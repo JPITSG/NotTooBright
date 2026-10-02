@@ -18,6 +18,7 @@ const puppeteer = require('puppeteer-core');
       autoCheckForUpdates: false, pauseInRemoteSession: true, brightnessKeys: false,
       updateCheckPending: false, updatePromptPending: false,
       trayTarget: '*', trayPresets: '100,75,50',
+      keepAwakeMinutes: 120, keepAwakeUntil: '',
       schedule: {enabled: true, hasLocation: true, latitude: 50, longitude: 20,
         dayLevel: 100, nightLevel: 30, dawnStartOffset: -30, dawnEndOffset: 30,
         duskStartOffset: -30, duskEndOffset: 30, cycleResetMinutes: 240,
@@ -32,10 +33,10 @@ const puppeteer = require('puppeteer-core');
       window.messages = [];
       window.chrome = {webview: {postMessage: text => window.messages.push(JSON.parse(text))}};
     });
-    const reset = async () => {
+    const reset = async (changes = {}) => {
       await page.goto('file://' + path.resolve(__dirname, '../assets/dist/index.html'));
       await page.waitForFunction(() => window.messages.some(m => m.action === 'getInit'));
-      await page.evaluate((config, monitors) => window.onInit({config, monitors}), config, monitors);
+      await page.evaluate((config, monitors) => window.onInit({config, monitors}), {...config, ...changes}, monitors);
       await page.waitForFunction(() => window.messages.some(m => m.action === 'configReady'));
     };
     const click = async (text, modal = false) => {
@@ -91,6 +92,7 @@ const puppeteer = require('puppeteer-core');
         [() => page.click(`#${id}`), () => page.click(`#${id}`)]),
       [() => page.select('#trayTarget', ''), () => page.select('#trayTarget', '*')],
       [() => changeText('#trayPresets', '100, 50'), () => changeText('#trayPresets', '100, 75, 50')],
+      [() => page.select('#keepAwakeMinutes', '240'), () => page.select('#keepAwakeMinutes', '120')],
       [() => changeText('#latitude', '51'), () => changeText('#latitude', '50')],
       [() => changeText('#longitude', '21'), () => changeText('#longitude', '20')],
       ...['dayLevel', 'nightLevel', 'deepSleepLevel'].map(id =>
@@ -128,6 +130,7 @@ const puppeteer = require('puppeteer-core');
     for (const throughPrompt of [false, true]) {
       await reset(); await page.click('#startWithWindows');
       await changeText('#trayPresets', '100, 50');
+      await page.select('#keepAwakeMinutes', '240');
       if (throughPrompt) { await nativeClose(); await prompt(); }
       await click('Save', throughPrompt);
       await page.waitForFunction(() => window.messages.some(m => m.action === 'saveSettings'));
@@ -136,6 +139,7 @@ const puppeteer = require('puppeteer-core');
       assert.equal(messages[0].action, 'saveSettings');
       assert.equal(messages[0].startWithWindows, true);
       assert.equal(messages[0].trayPresets, '100,50');
+      assert.equal(messages[0].keepAwakeMinutes, 240);
       if (saved) assert.deepEqual(messages, saved);
       saved = messages;
     }
@@ -172,6 +176,29 @@ const puppeteer = require('puppeteer-core');
     await page.waitForSelector('#schedule-monitor-11:not(:checked)');
     await nativeClose(); await prompt();
 
+    // Keep monitors awake: two hours unless saved otherwise, a saved duration
+    // outside the usual choices stays selected, and the end time the host
+    // reports (at open or while open) shows with Stop now, which is not an edit.
+    const keepAwakeBadge = () => page.evaluate(() =>
+      [...document.querySelectorAll('span')].find(el => el.textContent.startsWith('On until'))?.textContent ?? null);
+    await reset({keepAwakeMinutes: undefined});
+    assert.equal(await page.$eval('#keepAwakeMinutes', el => el.selectedOptions[0].textContent), '2 hours');
+    assert.equal(await keepAwakeBadge(), null);
+    await nativeClose(); await closed();
+    await reset({keepAwakeMinutes: 100});
+    assert.equal(await page.$eval('#keepAwakeMinutes', el => el.selectedOptions[0].textContent), '1 hour 40 minutes');
+    assert.equal(await page.$$eval('#keepAwakeMinutes option', els => els.length), 13);
+    await nativeClose(); await closed();
+    await reset({keepAwakeUntil: '16:42'});
+    assert.equal(await keepAwakeBadge(), 'On until 16:42');
+    await page.evaluate(() => window.onKeepAwake(''));
+    await page.waitForFunction(() => !document.body.innerText.includes('On until'));
+    await page.evaluate(() => window.onKeepAwake('18:05'));
+    await page.waitForFunction(() => document.body.innerText.includes('On until 18:05'));
+    await click('Stop now');
+    await page.waitForFunction(() => window.messages.some(m => m.action === 'stopKeepAwake'));
+    await nativeClose(); await closed();
+
     // An IP lookup fills unsaved coordinates without saving the form.
     await reset();
     await page.evaluate(() => window.onLocationResult({status: 'ok', latitude: 52, longitude: 21,
@@ -195,7 +222,7 @@ const puppeteer = require('puppeteer-core');
     assert.equal(await page.$eval('#debugLog', el => el.checked), true);
     assert.deepEqual(await actions(), []);
     assert.deepEqual(errors, []);
-    console.log('Unsaved settings, close routes, save/discard, keyboard, validation, live changes, monitor churn, and update overlap checks passed');
+    console.log('Unsaved settings, close routes, save/discard, keyboard, validation, live changes, keep awake, monitor churn, and update overlap checks passed');
   } finally {
     await browser.close();
   }
